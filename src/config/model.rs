@@ -334,6 +334,10 @@ pub struct KeysConfig {
     pub previous_workspace: BindingConfig,
     /// Select the next workspace. Unset by default.
     pub next_workspace: BindingConfig,
+    /// Move the active workspace one position earlier in the sidebar. Unset by default.
+    pub swap_previous_workspace: BindingConfig,
+    /// Move the active workspace one position later in the sidebar. Unset by default.
+    pub swap_next_workspace: BindingConfig,
     /// Focus the previous agent shown in the agent panel. Unset by default.
     pub previous_agent: BindingConfig,
     /// Focus the next agent shown in the agent panel. Unset by default.
@@ -350,6 +354,10 @@ pub struct KeysConfig {
     pub previous_tab: BindingConfig,
     /// Select the next tab. Default: "prefix+n".
     pub next_tab: BindingConfig,
+    /// Move the active tab one position to the left in the tab bar. Unset by default.
+    pub swap_previous_tab: BindingConfig,
+    /// Move the active tab one position to the right in the tab bar. Unset by default.
+    pub swap_next_tab: BindingConfig,
     /// Switch to tab 1-9. Default: "prefix+1..9".
     pub switch_tab: BindingConfig,
     /// Switch to workspace 1-9 from prefix mode. Unset by default.

@@ -305,6 +305,8 @@ pub struct Keybinds {
     pub open_notification_target: ActionKeybinds,
     pub previous_workspace: ActionKeybinds,
     pub next_workspace: ActionKeybinds,
+    pub swap_previous_workspace: ActionKeybinds,
+    pub swap_next_workspace: ActionKeybinds,
     pub previous_agent: ActionKeybinds,
     pub next_agent: ActionKeybinds,
     pub focus_agent: Vec<IndexedKeybind>,
@@ -312,6 +314,8 @@ pub struct Keybinds {
     pub rename_tab: ActionKeybinds,
     pub previous_tab: ActionKeybinds,
     pub next_tab: ActionKeybinds,
+    pub swap_previous_tab: ActionKeybinds,
+    pub swap_next_tab: ActionKeybinds,
     pub switch_tab: Vec<IndexedKeybind>,
     pub switch_workspace: Vec<IndexedKeybind>,
     pub close_tab: ActionKeybinds,
@@ -467,6 +471,8 @@ impl Config {
             open_notification_target: empty_action!(),
             previous_workspace: empty_action!(),
             next_workspace: empty_action!(),
+            swap_previous_workspace: empty_action!(),
+            swap_next_workspace: empty_action!(),
             previous_agent: empty_action!(),
             next_agent: empty_action!(),
             focus_agent: Vec::new(),
@@ -474,6 +480,8 @@ impl Config {
             rename_tab: empty_action!(),
             previous_tab: empty_action!(),
             next_tab: empty_action!(),
+            swap_previous_tab: empty_action!(),
+            swap_next_tab: empty_action!(),
             switch_tab: Vec::new(),
             switch_workspace: Vec::new(),
             close_tab: empty_action!(),
@@ -593,6 +601,8 @@ impl Config {
             );
             apply_action!(keybinds.previous_workspace, previous_workspace, source);
             apply_action!(keybinds.next_workspace, next_workspace, source);
+            apply_action!(keybinds.swap_previous_workspace, swap_previous_workspace, source);
+            apply_action!(keybinds.swap_next_workspace, swap_next_workspace, source);
             apply_action!(keybinds.previous_agent, previous_agent, source);
             apply_action!(keybinds.next_agent, next_agent, source);
             apply_indexed!(
@@ -605,6 +615,8 @@ impl Config {
             apply_action!(keybinds.rename_tab, rename_tab, source);
             apply_action!(keybinds.previous_tab, previous_tab, source);
             apply_action!(keybinds.next_tab, next_tab, source);
+            apply_action!(keybinds.swap_previous_tab, swap_previous_tab, source);
+            apply_action!(keybinds.swap_next_tab, swap_next_tab, source);
             apply_indexed!(
                 keybinds.switch_tab,
                 switch_tab,

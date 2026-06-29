@@ -579,12 +579,16 @@ pub(crate) enum NavigateAction {
     WorkspacePicker,
     PreviousWorkspace,
     NextWorkspace,
+    SwapPreviousWorkspace,
+    SwapNextWorkspace,
     PreviousAgent,
     NextAgent,
     NewTab,
     RenameTab,
     PreviousTab,
     NextTab,
+    SwapPreviousTab,
+    SwapNextTab,
     CloseTab,
     RenamePane,
     FocusPaneLeft,
@@ -683,12 +687,16 @@ fn action_for_key(
         (&kb.close_workspace, NavigateAction::CloseWorkspace),
         (&kb.previous_workspace, NavigateAction::PreviousWorkspace),
         (&kb.next_workspace, NavigateAction::NextWorkspace),
+        (&kb.swap_previous_workspace, NavigateAction::SwapPreviousWorkspace),
+        (&kb.swap_next_workspace, NavigateAction::SwapNextWorkspace),
         (&kb.previous_agent, NavigateAction::PreviousAgent),
         (&kb.next_agent, NavigateAction::NextAgent),
         (&kb.new_tab, NavigateAction::NewTab),
         (&kb.rename_tab, NavigateAction::RenameTab),
         (&kb.previous_tab, NavigateAction::PreviousTab),
         (&kb.next_tab, NavigateAction::NextTab),
+        (&kb.swap_previous_tab, NavigateAction::SwapPreviousTab),
+        (&kb.swap_next_tab, NavigateAction::SwapNextTab),
         (&kb.close_tab, NavigateAction::CloseTab),
         (&kb.rename_pane, NavigateAction::RenamePane),
         (&kb.edit_scrollback, NavigateAction::EditScrollback),
@@ -833,6 +841,22 @@ pub(super) fn execute_navigate_action_in_context(
             state.next_workspace();
             leave_navigate_mode(state);
         }
+        NavigateAction::SwapPreviousWorkspace => {
+            if let Some(idx) = state.active {
+                if idx > 0 {
+                    state.move_workspace(idx, idx.saturating_sub(1));
+                }
+            }
+            leave_navigate_mode(state);
+        }
+        NavigateAction::SwapNextWorkspace => {
+            if let Some(idx) = state.active {
+                if idx + 1 < state.workspaces.len() {
+                    state.move_workspace(idx, idx + 2);
+                }
+            }
+            leave_navigate_mode(state);
+        }
         NavigateAction::PreviousAgent => {
             state.previous_agent();
             leave_navigate_mode(state);
@@ -858,6 +882,30 @@ pub(super) fn execute_navigate_action_in_context(
         }
         NavigateAction::NextTab => {
             state.next_tab();
+            leave_navigate_mode(state);
+        }
+        NavigateAction::SwapPreviousTab => {
+            let tab_idx = state
+                .active
+                .and_then(|i| state.workspaces.get(i))
+                .map(|ws| ws.active_tab);
+            if let Some(tab_idx) = tab_idx {
+                if tab_idx > 0 {
+                    state.move_tab(tab_idx, tab_idx.saturating_sub(1));
+                }
+            }
+            leave_navigate_mode(state);
+        }
+        NavigateAction::SwapNextTab => {
+            let tab_info = state
+                .active
+                .and_then(|i| state.workspaces.get(i))
+                .map(|ws| (ws.active_tab, ws.tabs.len()));
+            if let Some((tab_idx, tab_count)) = tab_info {
+                if tab_idx + 1 < tab_count {
+                    state.move_tab(tab_idx, tab_idx + 2);
+                }
+            }
             leave_navigate_mode(state);
         }
         NavigateAction::CloseTab => {
