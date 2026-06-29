@@ -68,9 +68,10 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
-        with:
-          version: 0.15.2
+        run: |
+          curl -fsSL https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz -o /tmp/zig.tar.xz
+          tar -xf /tmp/zig.tar.xz -C /tmp
+          echo "/tmp/zig-x86_64-linux-0.15.2" >> $GITHUB_PATH
 
       - name: Prefer official Ubuntu mirrors over Azure
         run: |
@@ -148,9 +149,10 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
-        with:
-          version: 0.15.2
+        run: |
+          curl -fsSL https://ziglang.org/download/0.15.2/zig-aarch64-macos-0.15.2.tar.xz -o /tmp/zig.tar.xz
+          tar -xf /tmp/zig.tar.xz -C /tmp
+          echo "/tmp/zig-aarch64-macos-0.15.2" >> $GITHUB_PATH
 
       - name: Install macOS build tools
         run: brew install cmake ninja
@@ -200,9 +202,11 @@ jobs:
           targets: x86_64-pc-windows-msvc
 
       - name: Install Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
-        with:
-          version: 0.15.2
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://ziglang.org/download/0.15.2/zig-x86_64-windows-0.15.2.zip" -OutFile "$env:TEMP\zig.zip"
+          Expand-Archive -Path "$env:TEMP\zig.zip" -DestinationPath "$env:TEMP"
+          echo "$env:TEMP\zig-x86_64-windows-0.15.2" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Remove Zig caches
         shell: pwsh
