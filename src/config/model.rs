@@ -462,6 +462,10 @@ pub(crate) struct KeysConfigOverlay {
     #[serde(skip_serializing_if = "Option::is_none")]
     next_workspace: Option<BindingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    swap_previous_workspace: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    swap_next_workspace: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     previous_agent: Option<BindingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     next_agent: Option<BindingConfig>,
@@ -477,6 +481,10 @@ pub(crate) struct KeysConfigOverlay {
     previous_tab: Option<BindingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     next_tab: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    swap_previous_tab: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    swap_next_tab: Option<BindingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     switch_tab: Option<BindingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -568,6 +576,8 @@ impl<'de> Deserialize<'de> for KeysConfig {
         apply_field!(open_notification_target);
         apply_field!(previous_workspace);
         apply_field!(next_workspace);
+        apply_field!(swap_previous_workspace);
+        apply_field!(swap_next_workspace);
         apply_field!(previous_agent);
         apply_field!(next_agent);
         apply_field!(focus_agent);
@@ -576,6 +586,8 @@ impl<'de> Deserialize<'de> for KeysConfig {
         apply_field!(rename_tab);
         apply_field!(previous_tab);
         apply_field!(next_tab);
+        apply_field!(swap_previous_tab);
+        apply_field!(swap_next_tab);
         apply_field!(switch_tab);
         apply_field!(switch_workspace);
         apply_field!(close_tab);
@@ -666,6 +678,8 @@ impl KeysConfig {
         copy_effective_action_field!(open_notification_target, keybinds.open_notification_target);
         copy_effective_action_field!(previous_workspace, keybinds.previous_workspace);
         copy_effective_action_field!(next_workspace, keybinds.next_workspace);
+        copy_effective_action_field!(swap_previous_workspace, keybinds.swap_previous_workspace);
+        copy_effective_action_field!(swap_next_workspace, keybinds.swap_next_workspace);
         copy_effective_action_field!(previous_agent, keybinds.previous_agent);
         copy_effective_action_field!(next_agent, keybinds.next_agent);
         copy_effective_indexed_field!(focus_agent, keybinds.focus_agent);
@@ -674,6 +688,8 @@ impl KeysConfig {
         copy_effective_action_field!(rename_tab, keybinds.rename_tab);
         copy_effective_action_field!(previous_tab, keybinds.previous_tab);
         copy_effective_action_field!(next_tab, keybinds.next_tab);
+        copy_effective_action_field!(swap_previous_tab, keybinds.swap_previous_tab);
+        copy_effective_action_field!(swap_next_tab, keybinds.swap_next_tab);
         copy_effective_indexed_field!(switch_tab, keybinds.switch_tab);
         copy_effective_indexed_field!(switch_workspace, keybinds.switch_workspace);
         copy_effective_action_field!(close_tab, keybinds.close_tab);

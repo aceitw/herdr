@@ -687,7 +687,10 @@ fn action_for_key(
         (&kb.close_workspace, NavigateAction::CloseWorkspace),
         (&kb.previous_workspace, NavigateAction::PreviousWorkspace),
         (&kb.next_workspace, NavigateAction::NextWorkspace),
-        (&kb.swap_previous_workspace, NavigateAction::SwapPreviousWorkspace),
+        (
+            &kb.swap_previous_workspace,
+            NavigateAction::SwapPreviousWorkspace,
+        ),
         (&kb.swap_next_workspace, NavigateAction::SwapNextWorkspace),
         (&kb.previous_agent, NavigateAction::PreviousAgent),
         (&kb.next_agent, NavigateAction::NextAgent),
@@ -1891,6 +1894,75 @@ last_pane = "prefix+tab"
             .await;
 
         assert_eq!(app.state.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn prefix_swap_workspace_reorders_active_workspace() {
+        let config: Config = toml::from_str(
+            r#"
+[keys]
+swap_previous_workspace = "prefix+alt+up"
+"#,
+        )
+        .unwrap();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+        app.state.workspaces = vec![
+            Workspace::test_new("one"),
+            Workspace::test_new("two"),
+            Workspace::test_new("three"),
+        ];
+        app.state.active = Some(1);
+        app.state.selected = 1;
+        app.state.mode = Mode::Prefix;
+        let active_id = app.state.workspaces[1].id.clone();
+
+        app.handle_prefix_key(TerminalKey::new(KeyCode::Up, KeyModifiers::ALT));
+
+        let names: Vec<_> = app
+            .state
+            .workspaces
+            .iter()
+            .map(|ws| ws.display_name())
+            .collect();
+        assert_eq!(names, vec!["two", "one", "three"]);
+        assert_eq!(app.state.active, Some(0));
+        assert_eq!(app.state.workspaces[0].id, active_id);
+        assert_eq!(app.state.mode, Mode::Terminal);
+        assert!(app.state.copy_mode.is_none());
+    }
+
+    #[test]
+    fn prefix_swap_tab_reorders_active_tab() {
+        let config: Config = toml::from_str(
+            r#"
+[keys]
+swap_next_tab = "prefix+alt+right"
+"#,
+        )
+        .unwrap();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+        let mut ws = Workspace::test_new("test");
+        ws.test_add_tab(Some("two"));
+        ws.test_add_tab(Some("three"));
+        ws.active_tab = 1;
+        let active_root = ws.tabs[1].root_pane;
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Prefix;
+
+        app.handle_prefix_key(TerminalKey::new(KeyCode::Right, KeyModifiers::ALT));
+
+        let labels: Vec<_> = (0..app.state.workspaces[0].tabs.len())
+            .map(|tab_idx| app.state.workspaces[0].tab_display_name(tab_idx).unwrap())
+            .collect();
+        assert_eq!(labels, vec!["1", "three", "two"]);
+        assert_eq!(app.state.workspaces[0].active_tab, 2);
+        assert_eq!(app.state.workspaces[0].tabs[2].root_pane, active_root);
+        assert_eq!(app.state.mode, Mode::Terminal);
+        assert!(app.state.copy_mode.is_none());
     }
 
     #[tokio::test]

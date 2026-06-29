@@ -4,6 +4,11 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: tag to release (e.g. v0.7.1)
+        required: true
 
 permissions:
   contents: write
@@ -119,8 +124,9 @@ jobs:
 
       - name: Update latest.json
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          BASE="https://github.com/aceitw/herdr/releases/download/${GITHUB_REF_NAME}"
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          BASE="https://github.com/aceitw/herdr/releases/download/${TAG}"
           python3 - <<EOF
           import json
           with open('latest.json') as f:
@@ -138,7 +144,8 @@ jobs:
 
       - name: Commit latest.json
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add latest.json

@@ -29,7 +29,24 @@ jobs:
 
       - name: Validate commit subjects
         if: github.event_name == 'push'
-        run: python3 scripts/conventional_commits.py --range "${{ github.event.before }}..${{ github.event.after }}"
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+          COMMITS_JSON: ${{ toJson(github.event.commits) }}
+        run: |
+          set -euo pipefail
+          ZERO_SHA=0000000000000000000000000000000000000000
+
+          if [ "$BEFORE" != "$ZERO_SHA" ] && ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            git fetch --no-tags --depth=1 origin "$BEFORE" || true
+          fi
+
+          if [ "$BEFORE" = "$ZERO_SHA" ] || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            echo "Previous push base is unavailable; validating commit subjects from the push payload."
+            python3 scripts/conventional_commits.py --push-event-commits-json "$COMMITS_JSON"
+          else
+            python3 scripts/conventional_commits.py --range "$BEFORE..$AFTER"
+          fi
 
       - name: Validate PR title
         if: github.event_name == 'pull_request'

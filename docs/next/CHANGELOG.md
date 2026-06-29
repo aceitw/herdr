@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Fixed
+- Configured `swap_previous_workspace`, `swap_next_workspace`, `swap_previous_tab`, and `swap_next_tab` keybindings now load correctly and reorder the active workspace or tab from prefix mode.
+
 ## [0.7.1] - 2026-06-24
 
 ### Added

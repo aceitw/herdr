@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import subprocess
 from pathlib import Path
@@ -27,6 +28,17 @@ def git_subjects(rev_range: str) -> list[str]:
     return [line.strip() for line in output.splitlines() if line.strip()]
 
 
+def push_event_subjects(commits_json: str) -> list[str]:
+    commits = json.loads(commits_json)
+    subjects: list[str] = []
+    for commit in commits:
+        message = commit.get("message", "")
+        subject = next((line.strip() for line in message.splitlines() if line.strip()), "")
+        if subject:
+            subjects.append(subject)
+    return subjects
+
+
 def valid_subject(subject: str) -> bool:
     match = SUBJECT_RE.match(subject)
     return bool(match and match.group("kind") in ALLOWED_TYPES)
@@ -44,12 +56,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Validate conventional commit subjects")
     parser.add_argument("subjects", nargs="*")
     parser.add_argument("--range", dest="rev_range")
+    parser.add_argument("--push-event-commits-json")
     parser.add_argument("--message-file")
     args = parser.parse_args()
 
     subjects = list(args.subjects)
     if args.rev_range:
         subjects.extend(git_subjects(args.rev_range))
+    if args.push_event_commits_json:
+        subjects.extend(push_event_subjects(args.push_event_commits_json))
     if args.message_file:
         subject = commit_message_subject(Path(args.message_file))
         if subject:

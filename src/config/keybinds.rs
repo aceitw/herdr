@@ -601,7 +601,11 @@ impl Config {
             );
             apply_action!(keybinds.previous_workspace, previous_workspace, source);
             apply_action!(keybinds.next_workspace, next_workspace, source);
-            apply_action!(keybinds.swap_previous_workspace, swap_previous_workspace, source);
+            apply_action!(
+                keybinds.swap_previous_workspace,
+                swap_previous_workspace,
+                source
+            );
             apply_action!(keybinds.swap_next_workspace, swap_next_workspace, source);
             apply_action!(keybinds.previous_agent, previous_agent, source);
             apply_action!(keybinds.next_agent, next_agent, source);
@@ -1551,6 +1555,41 @@ next_tab = "prefix+n"
     fn back_and_forth_keybinds_are_unset_by_default() {
         let kb = Config::default().keybinds();
         assert!(kb.last_pane.bindings.is_empty());
+    }
+
+    #[test]
+    fn swap_workspace_and_tab_keybinds_parse_from_config() {
+        let config: Config = toml::from_str(
+            r#"
+[keys]
+swap_previous_workspace = "prefix+alt+up"
+swap_next_workspace = "prefix+alt+down"
+swap_previous_tab = "prefix+alt+left"
+swap_next_tab = "prefix+alt+right"
+"#,
+        )
+        .unwrap();
+
+        let diagnostics = config.collect_diagnostics();
+        let kb = config.keybinds();
+
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(
+            binding_triggers(&kb.swap_previous_workspace),
+            vec![BindingTrigger::Prefix((KeyCode::Up, KeyModifiers::ALT))]
+        );
+        assert_eq!(
+            binding_triggers(&kb.swap_next_workspace),
+            vec![BindingTrigger::Prefix((KeyCode::Down, KeyModifiers::ALT))]
+        );
+        assert_eq!(
+            binding_triggers(&kb.swap_previous_tab),
+            vec![BindingTrigger::Prefix((KeyCode::Left, KeyModifiers::ALT))]
+        );
+        assert_eq!(
+            binding_triggers(&kb.swap_next_tab),
+            vec![BindingTrigger::Prefix((KeyCode::Right, KeyModifiers::ALT))]
+        );
     }
 
     #[test]

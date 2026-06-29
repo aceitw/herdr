@@ -163,6 +163,53 @@ zoom = "prefix+?"
     }
 
     #[test]
+    fn local_keybindings_profile_preserves_swap_workspace_and_tab_bindings() {
+        let config: Config = toml::from_str(
+            r#"
+[keys]
+swap_previous_workspace = "prefix+alt+up"
+swap_next_workspace = "prefix+alt+down"
+swap_previous_tab = "prefix+alt+left"
+swap_next_tab = "prefix+alt+right"
+"#,
+        )
+        .unwrap();
+
+        let profile = config.local_keybindings_profile_toml().unwrap();
+        let round_tripped: Config = toml::from_str(&profile).unwrap();
+        let keybinds = round_tripped.keybinds();
+
+        for field in [
+            "swap_previous_workspace = \"prefix+alt+up\"",
+            "swap_next_workspace = \"prefix+alt+down\"",
+            "swap_previous_tab = \"prefix+alt+left\"",
+            "swap_next_tab = \"prefix+alt+right\"",
+        ] {
+            assert!(profile.contains(field), "missing {field} in {profile}");
+        }
+        assert!(keybinds
+            .swap_previous_workspace
+            .bindings
+            .iter()
+            .any(|binding| binding.label == "prefix+alt+up"));
+        assert!(keybinds
+            .swap_next_workspace
+            .bindings
+            .iter()
+            .any(|binding| binding.label == "prefix+alt+down"));
+        assert!(keybinds
+            .swap_previous_tab
+            .bindings
+            .iter()
+            .any(|binding| binding.label == "prefix+alt+left"));
+        assert!(keybinds
+            .swap_next_tab
+            .bindings
+            .iter()
+            .any(|binding| binding.label == "prefix+alt+right"));
+    }
+
+    #[test]
     fn local_keybindings_profile_omits_default_displaced_by_user_prefix() {
         let config: Config = toml::from_str(
             r#"
