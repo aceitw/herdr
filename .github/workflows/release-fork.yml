@@ -1,0 +1,146 @@
+name: Release (fork)
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            name: herdr-linux-x86_64
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            name: herdr-linux-aarch64
+          - target: x86_64-apple-darwin
+            os: macos-15
+            name: herdr-macos-x86_64
+          - target: aarch64-apple-darwin
+            os: macos-15
+            name: herdr-macos-aarch64
+
+    runs-on: ${{ matrix.os }}
+    env:
+      LIBGHOSTTY_VT_OPTIMIZE: ReleaseFast
+      LIBGHOSTTY_VT_SIMD: 'true'
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Zig (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          curl -fsSL https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz -o /tmp/zig.tar.xz
+          tar -xf /tmp/zig.tar.xz -C /tmp
+          echo "/tmp/zig-x86_64-linux-0.15.2" >> $GITHUB_PATH
+
+      - name: Install Zig (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          curl -fsSL https://ziglang.org/download/0.15.2/zig-aarch64-macos-0.15.2.tar.xz -o /tmp/zig.tar.xz
+          tar -xf /tmp/zig.tar.xz -C /tmp
+          echo "/tmp/zig-aarch64-macos-0.15.2" >> $GITHUB_PATH
+
+      - name: Prefer official Ubuntu mirrors over Azure
+        if: runner.os == 'Linux'
+        run: |
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            sudo sed -i '/azure.archive.ubuntu.com/d' /etc/apt/apt-mirrors.txt
+          fi
+
+      - name: Install Linux build tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build musl-tools gcc-aarch64-linux-gnu crossbuild-essential-arm64
+
+      - name: Install macOS build tools
+        if: runner.os == 'macOS'
+        run: brew install cmake ninja
+
+      - name: Set Linux aarch64 linker
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+
+      - name: Remove Zig caches
+        run: rm -rf .zig-cache vendor/libghostty-vt/.zig-cache vendor/libghostty-vt/zig-out
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Rename binary
+        run: cp target/${{ matrix.target }}/release/herdr ${{ matrix.name }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.name }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
+        with:
+          files: |
+            herdr-linux-x86_64/herdr-linux-x86_64
+            herdr-linux-aarch64/herdr-linux-aarch64
+            herdr-macos-x86_64/herdr-macos-x86_64
+            herdr-macos-aarch64/herdr-macos-aarch64
+
+      - name: Update latest.json
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          BASE="https://github.com/aceitw/herdr/releases/download/${GITHUB_REF_NAME}"
+          python3 - <<EOF
+          import json
+          with open('website/latest.json') as f:
+              manifest = json.load(f)
+          manifest['version'] = '${VERSION}'
+          manifest['assets'] = {
+              'linux-x86_64':  '${BASE}/herdr-linux-x86_64',
+              'linux-aarch64': '${BASE}/herdr-linux-aarch64',
+              'macos-x86_64':  '${BASE}/herdr-macos-x86_64',
+              'macos-aarch64': '${BASE}/herdr-macos-aarch64',
+          }
+          with open('website/latest.json', 'w') as f:
+              json.dump(manifest, f, indent=2)
+          EOF
+
+      - name: Commit latest.json
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add website/latest.json
+          git diff --cached --quiet || git commit -m "docs: update latest.json for v${VERSION}"
+          git push origin master
