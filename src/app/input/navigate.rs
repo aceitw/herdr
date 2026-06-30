@@ -846,16 +846,32 @@ pub(super) fn execute_navigate_action_in_context(
         }
         NavigateAction::SwapPreviousWorkspace => {
             if let Some(idx) = state.active {
-                if idx > 0 {
-                    state.move_workspace(idx, idx.saturating_sub(1));
+                let len = state.workspaces.len();
+                let target = if idx > 0 {
+                    idx - 1
+                } else if state.swap_wrap && len > 1 {
+                    len - 1
+                } else {
+                    idx
+                };
+                if target != idx {
+                    state.move_workspace(idx, target);
                 }
             }
             leave_navigate_mode(state);
         }
         NavigateAction::SwapNextWorkspace => {
             if let Some(idx) = state.active {
-                if idx + 1 < state.workspaces.len() {
-                    state.move_workspace(idx, idx + 2);
+                let len = state.workspaces.len();
+                let target = if idx + 1 < len {
+                    idx + 2
+                } else if state.swap_wrap && len > 1 {
+                    0
+                } else {
+                    idx + 1
+                };
+                if target != idx + 1 {
+                    state.move_workspace(idx, target);
                 }
             }
             leave_navigate_mode(state);
@@ -888,13 +904,20 @@ pub(super) fn execute_navigate_action_in_context(
             leave_navigate_mode(state);
         }
         NavigateAction::SwapPreviousTab => {
-            let tab_idx = state
+            let tab_info = state
                 .active
                 .and_then(|i| state.workspaces.get(i))
-                .map(|ws| ws.active_tab);
-            if let Some(tab_idx) = tab_idx {
-                if tab_idx > 0 {
-                    state.move_tab(tab_idx, tab_idx.saturating_sub(1));
+                .map(|ws| (ws.active_tab, ws.tabs.len()));
+            if let Some((tab_idx, tab_count)) = tab_info {
+                let target = if tab_idx > 0 {
+                    tab_idx - 1
+                } else if state.swap_wrap && tab_count > 1 {
+                    tab_count - 1
+                } else {
+                    tab_idx
+                };
+                if target != tab_idx {
+                    state.move_tab(tab_idx, target);
                 }
             }
             leave_navigate_mode(state);
@@ -905,8 +928,15 @@ pub(super) fn execute_navigate_action_in_context(
                 .and_then(|i| state.workspaces.get(i))
                 .map(|ws| (ws.active_tab, ws.tabs.len()));
             if let Some((tab_idx, tab_count)) = tab_info {
-                if tab_idx + 1 < tab_count {
-                    state.move_tab(tab_idx, tab_idx + 2);
+                let target = if tab_idx + 1 < tab_count {
+                    tab_idx + 2
+                } else if state.swap_wrap && tab_count > 1 {
+                    0
+                } else {
+                    tab_idx + 1
+                };
+                if target != tab_idx + 1 {
+                    state.move_tab(tab_idx, target);
                 }
             }
             leave_navigate_mode(state);
@@ -1963,6 +1993,63 @@ swap_next_tab = "prefix+alt+right"
         assert_eq!(app.state.workspaces[0].tabs[2].root_pane, active_root);
         assert_eq!(app.state.mode, Mode::Terminal);
         assert!(app.state.copy_mode.is_none());
+    }
+
+    #[test]
+    fn swap_wrap_wraps_workspace_from_first_to_last() {
+        let config: Config = toml::from_str(
+            r#"
+[keys]
+swap_previous_workspace = "prefix+alt+up"
+swap_wrap = true
+"#,
+        )
+        .unwrap();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+        app.state.workspaces = vec![
+            Workspace::test_new("one"),
+            Workspace::test_new("two"),
+            Workspace::test_new("three"),
+        ];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Prefix;
+        let active_id = app.state.workspaces[0].id.clone();
+
+        app.handle_prefix_key(TerminalKey::new(KeyCode::Up, KeyModifiers::ALT));
+
+        let names: Vec<_> = app.state.workspaces.iter().map(|ws| ws.display_name()).collect();
+        assert_eq!(names, vec!["two", "three", "one"]);
+        assert_eq!(app.state.active, Some(2));
+        assert_eq!(app.state.workspaces[2].id, active_id);
+    }
+
+    #[test]
+    fn swap_no_wrap_stops_workspace_at_boundary() {
+        let config: Config = toml::from_str(
+            r#"
+[keys]
+swap_previous_workspace = "prefix+alt+up"
+swap_wrap = false
+"#,
+        )
+        .unwrap();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+        app.state.workspaces = vec![
+            Workspace::test_new("one"),
+            Workspace::test_new("two"),
+        ];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Prefix;
+
+        app.handle_prefix_key(TerminalKey::new(KeyCode::Up, KeyModifiers::ALT));
+
+        let names: Vec<_> = app.state.workspaces.iter().map(|ws| ws.display_name()).collect();
+        assert_eq!(names, vec!["one", "two"]);
+        assert_eq!(app.state.active, Some(0));
     }
 
     #[tokio::test]

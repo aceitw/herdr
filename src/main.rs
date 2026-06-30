@@ -192,6 +192,7 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # next_tab = "prefix+n"
 # swap_previous_tab = "" # optional, unset by default; move active tab left in tab bar
 # swap_next_tab = ""     # optional, unset by default; move active tab right in tab bar
+# swap_wrap = true       # when true (default), swapping past the first/last position wraps around; set false to stop at the boundary
 # switch_tab = "prefix+1..9"
 # switch_workspace = ""   # optional indexed binding, e.g. "prefix+shift+1..9"
 # close_tab = "prefix+shift+x"
