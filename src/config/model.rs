@@ -358,6 +358,11 @@ pub struct KeysConfig {
     pub swap_previous_tab: BindingConfig,
     /// Move the active tab one position to the right in the tab bar. Unset by default.
     pub swap_next_tab: BindingConfig,
+    /// Wrap around when swapping a workspace or tab past the first or last position.
+    /// When true (default), swapping the first workspace/tab backward moves it to the last
+    /// position, and swapping the last forward moves it to the first — matching tmux
+    /// swap-window -t behaviour with wrap. Set to false to stop at the boundary instead.
+    pub swap_wrap: bool,
     /// Switch to tab 1-9. Default: "prefix+1..9".
     pub switch_tab: BindingConfig,
     /// Switch to workspace 1-9 from prefix mode. Unset by default.
@@ -486,6 +491,8 @@ pub(crate) struct KeysConfigOverlay {
     #[serde(skip_serializing_if = "Option::is_none")]
     swap_next_tab: Option<BindingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    swap_wrap: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     switch_tab: Option<BindingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     switch_workspace: Option<BindingConfig>,
@@ -588,6 +595,7 @@ impl<'de> Deserialize<'de> for KeysConfig {
         apply_field!(next_tab);
         apply_field!(swap_previous_tab);
         apply_field!(swap_next_tab);
+        apply_field!(swap_wrap);
         apply_field!(switch_tab);
         apply_field!(switch_workspace);
         apply_field!(close_tab);
@@ -690,6 +698,7 @@ impl KeysConfig {
         copy_effective_action_field!(next_tab, keybinds.next_tab);
         copy_effective_action_field!(swap_previous_tab, keybinds.swap_previous_tab);
         copy_effective_action_field!(swap_next_tab, keybinds.swap_next_tab);
+        copy_user_field!(swap_wrap);
         copy_effective_indexed_field!(switch_tab, keybinds.switch_tab);
         copy_effective_indexed_field!(switch_workspace, keybinds.switch_workspace);
         copy_effective_action_field!(close_tab, keybinds.close_tab);
@@ -945,6 +954,7 @@ impl Default for KeysConfig {
             next_tab: BindingConfig::one("prefix+n"),
             swap_previous_tab: BindingConfig::empty(),
             swap_next_tab: BindingConfig::empty(),
+            swap_wrap: true,
             switch_tab: BindingConfig::one("prefix+1..9"),
             switch_workspace: BindingConfig::empty(),
             close_tab: BindingConfig::one("prefix+shift+x"),
