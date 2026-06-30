@@ -2019,7 +2019,12 @@ swap_wrap = true
 
         app.handle_prefix_key(TerminalKey::new(KeyCode::Up, KeyModifiers::ALT));
 
-        let names: Vec<_> = app.state.workspaces.iter().map(|ws| ws.display_name()).collect();
+        let names: Vec<_> = app
+            .state
+            .workspaces
+            .iter()
+            .map(|ws| ws.display_name())
+            .collect();
         assert_eq!(names, vec!["two", "three", "one"]);
         assert_eq!(app.state.active, Some(2));
         assert_eq!(app.state.workspaces[2].id, active_id);
@@ -2037,17 +2042,19 @@ swap_wrap = false
         .unwrap();
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
-        app.state.workspaces = vec![
-            Workspace::test_new("one"),
-            Workspace::test_new("two"),
-        ];
+        app.state.workspaces = vec![Workspace::test_new("one"), Workspace::test_new("two")];
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Prefix;
 
         app.handle_prefix_key(TerminalKey::new(KeyCode::Up, KeyModifiers::ALT));
 
-        let names: Vec<_> = app.state.workspaces.iter().map(|ws| ws.display_name()).collect();
+        let names: Vec<_> = app
+            .state
+            .workspaces
+            .iter()
+            .map(|ws| ws.display_name())
+            .collect();
         assert_eq!(names, vec!["one", "two"]);
         assert_eq!(app.state.active, Some(0));
     }
