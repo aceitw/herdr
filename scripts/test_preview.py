@@ -172,6 +172,19 @@ class ConventionalCommitTests(unittest.TestCase):
                 "fix(update): switch channel",
             )
 
+    def test_push_event_subjects_use_first_non_empty_message_line(self):
+        self.assertEqual(
+            conventional_commits.push_event_subjects(
+                """
+                [
+                  {"message": "\\nfix: load swap keybindings\\n\\nbody"},
+                  {"message": "docs: update preview"}
+                ]
+                """
+            ),
+            ["fix: load swap keybindings", "docs: update preview"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

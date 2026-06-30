@@ -37,12 +37,10 @@ jobs:
           set -euo pipefail
           ZERO_SHA=0000000000000000000000000000000000000000
 
-          if [ "$BEFORE" != "$ZERO_SHA" ] && ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
-            git fetch --no-tags --depth=1 origin "$BEFORE" || true
-          fi
-
-          if [ "$BEFORE" = "$ZERO_SHA" ] || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
-            echo "Previous push base is unavailable; validating commit subjects from the push payload."
+          if [ "$BEFORE" = "$ZERO_SHA" ] \
+            || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null \
+            || ! git merge-base --is-ancestor "$BEFORE" "$AFTER" 2>/dev/null; then
+            echo "Previous push base is unavailable or not an ancestor; validating commit subjects from the push payload."
             python3 scripts/conventional_commits.py --push-event-commits-json "$COMMITS_JSON"
           else
             python3 scripts/conventional_commits.py --range "$BEFORE..$AFTER"
