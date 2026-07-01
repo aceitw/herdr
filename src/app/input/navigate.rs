@@ -847,15 +847,10 @@ pub(super) fn execute_navigate_action_in_context(
         NavigateAction::SwapPreviousWorkspace => {
             if let Some(idx) = state.active {
                 let len = state.workspaces.len();
-                let target = if idx > 0 {
-                    idx - 1
+                if idx > 0 {
+                    state.move_workspace(idx, idx - 1);
                 } else if state.swap_wrap && len > 1 {
-                    len - 1
-                } else {
-                    idx
-                };
-                if target != idx {
-                    state.move_workspace(idx, target);
+                    state.move_workspace(idx, len);
                 }
             }
             leave_navigate_mode(state);
@@ -863,15 +858,10 @@ pub(super) fn execute_navigate_action_in_context(
         NavigateAction::SwapNextWorkspace => {
             if let Some(idx) = state.active {
                 let len = state.workspaces.len();
-                let target = if idx + 1 < len {
-                    idx + 2
+                if idx + 1 < len {
+                    state.move_workspace(idx, idx + 2);
                 } else if state.swap_wrap && len > 1 {
-                    0
-                } else {
-                    idx + 1
-                };
-                if target != idx + 1 {
-                    state.move_workspace(idx, target);
+                    state.move_workspace(idx, 0);
                 }
             }
             leave_navigate_mode(state);
@@ -909,15 +899,10 @@ pub(super) fn execute_navigate_action_in_context(
                 .and_then(|i| state.workspaces.get(i))
                 .map(|ws| (ws.active_tab, ws.tabs.len()));
             if let Some((tab_idx, tab_count)) = tab_info {
-                let target = if tab_idx > 0 {
-                    tab_idx - 1
+                if tab_idx > 0 {
+                    state.move_tab(tab_idx, tab_idx - 1);
                 } else if state.swap_wrap && tab_count > 1 {
-                    tab_count - 1
-                } else {
-                    tab_idx
-                };
-                if target != tab_idx {
-                    state.move_tab(tab_idx, target);
+                    state.move_tab(tab_idx, tab_count);
                 }
             }
             leave_navigate_mode(state);
@@ -928,15 +913,10 @@ pub(super) fn execute_navigate_action_in_context(
                 .and_then(|i| state.workspaces.get(i))
                 .map(|ws| (ws.active_tab, ws.tabs.len()));
             if let Some((tab_idx, tab_count)) = tab_info {
-                let target = if tab_idx + 1 < tab_count {
-                    tab_idx + 2
+                if tab_idx + 1 < tab_count {
+                    state.move_tab(tab_idx, tab_idx + 2);
                 } else if state.swap_wrap && tab_count > 1 {
-                    0
-                } else {
-                    tab_idx + 1
-                };
-                if target != tab_idx + 1 {
-                    state.move_tab(tab_idx, target);
+                    state.move_tab(tab_idx, 0);
                 }
             }
             leave_navigate_mode(state);
