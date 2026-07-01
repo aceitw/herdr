@@ -607,6 +607,8 @@ pub(crate) enum NavigateAction {
     Zoom,
     EnterResizeMode,
     ToggleSidebar,
+    WidenSidebar,
+    NarrowSidebar,
     CyclePaneNext,
     CyclePanePrevious,
     LastPane,
@@ -721,6 +723,8 @@ fn action_for_key(
         (&kb.zoom, NavigateAction::Zoom),
         (&kb.resize_mode, NavigateAction::EnterResizeMode),
         (&kb.toggle_sidebar, NavigateAction::ToggleSidebar),
+        (&kb.widen_sidebar, NavigateAction::WidenSidebar),
+        (&kb.narrow_sidebar, NavigateAction::NarrowSidebar),
         (&kb.reload_config, NavigateAction::ReloadConfig),
         (
             &kb.open_notification_target,
@@ -977,6 +981,28 @@ pub(super) fn execute_navigate_action_in_context(
         NavigateAction::EnterResizeMode => state.mode = Mode::Resize,
         NavigateAction::ToggleSidebar => {
             state.sidebar_collapsed = !state.sidebar_collapsed;
+            leave_navigate_mode(state);
+        }
+        NavigateAction::WidenSidebar => {
+            if !state.sidebar_collapsed {
+                state.sidebar_width = state
+                    .sidebar_width
+                    .saturating_add(state.sidebar_resize_step)
+                    .clamp(state.sidebar_min_width, state.sidebar_max_width);
+                state.sidebar_width_source = crate::app::state::SidebarWidthSource::Manual;
+                state.mark_session_dirty();
+            }
+            leave_navigate_mode(state);
+        }
+        NavigateAction::NarrowSidebar => {
+            if !state.sidebar_collapsed {
+                state.sidebar_width = state
+                    .sidebar_width
+                    .saturating_sub(state.sidebar_resize_step)
+                    .clamp(state.sidebar_min_width, state.sidebar_max_width);
+                state.sidebar_width_source = crate::app::state::SidebarWidthSource::Manual;
+                state.mark_session_dirty();
+            }
             leave_navigate_mode(state);
         }
         NavigateAction::CyclePaneNext => {
