@@ -829,11 +829,14 @@ fn render_workspace_list(
 
     let list_bottom = area.y + area.height.saturating_sub(1);
     if area.height > 0 {
+        let header_bg = app.sidebar_header_bg;
+        let header_style = Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD);
+        let header_style = match header_bg {
+            Some(bg) => header_style.bg(bg),
+            None => header_style,
+        };
         frame.render_widget(
-            Paragraph::new(Line::from(vec![Span::styled(
-                " spaces",
-                Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
-            )])),
+            Paragraph::new(Line::from(vec![Span::styled(" spaces", header_style)])),
             Rect::new(area.x, area.y, area.width, 1),
         );
     }

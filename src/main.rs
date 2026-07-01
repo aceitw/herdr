@@ -254,6 +254,9 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Column increment for widen_sidebar / narrow_sidebar keybinds
 # sidebar_resize_step = 2
 
+# Background color for the "spaces" header row. Accepts hex (#rrggbb), named colors, or rgb(r,g,b).
+# sidebar_header_bg = "#1e1e2e"
+
 # Terminal width at or below which Herdr uses the mobile single-column layout.
 # Increase this for foldables, tablets, or wide phone terminals.
 # mobile_width_threshold = 64

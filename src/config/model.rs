@@ -808,6 +808,9 @@ pub struct UiConfig {
     pub sidebar_max_width: u16,
     /// Column increment for widen_sidebar / narrow_sidebar keybinds. Default: 2.
     pub sidebar_resize_step: u16,
+    /// Optional background color for the "spaces" header row in the sidebar.
+    /// Accepts hex (#rrggbb), named colors, or rgb(r,g,b). Unset by default.
+    pub sidebar_header_bg: Option<String>,
     /// Terminal width at or below which Herdr uses the mobile single-column layout. Default: 64.
     pub mobile_width_threshold: u16,
     /// Capture mouse input for Herdr's mouse UI. Default: true.
