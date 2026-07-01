@@ -811,6 +811,8 @@ pub struct UiConfig {
     /// Optional background color for the "spaces" header row in the sidebar.
     /// Accepts hex (#rrggbb), named colors, or rgb(r,g,b). Unset by default.
     pub sidebar_header_bg: Option<String>,
+    /// Optional label for the "spaces" header row in the sidebar. Unset by default.
+    pub sidebar_header_title: Option<String>,
     /// Terminal width at or below which Herdr uses the mobile single-column layout. Default: 64.
     pub mobile_width_threshold: u16,
     /// Capture mouse input for Herdr's mouse UI. Default: true.
@@ -1020,6 +1022,7 @@ impl Default for UiConfig {
             sidebar_max_width: 36,
             sidebar_resize_step: 2,
             sidebar_header_bg: None,
+            sidebar_header_title: None,
             mobile_width_threshold: DEFAULT_MOBILE_WIDTH_THRESHOLD,
             mouse_capture: true,
             right_click_passthrough_modifier: RightClickPassthroughModifierConfig::default(),

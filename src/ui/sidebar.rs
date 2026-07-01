@@ -835,8 +835,12 @@ fn render_workspace_list(
             Some(bg) => header_style.bg(bg),
             None => header_style,
         };
+        let header_title = app
+            .sidebar_header_title
+            .as_deref()
+            .unwrap_or(" spaces");
         frame.render_widget(
-            Paragraph::new(Line::from(vec![Span::styled(" spaces", header_style)])),
+            Paragraph::new(Line::from(vec![Span::styled(header_title, header_style)])),
             Rect::new(area.x, area.y, area.width, 1),
         );
     }

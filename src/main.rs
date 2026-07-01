@@ -257,6 +257,9 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Background color for the "spaces" header row. Accepts hex (#rrggbb), named colors, or rgb(r,g,b).
 # sidebar_header_bg = "#1e1e2e"
 
+# Label for the "spaces" header row. Leading space adds left padding. Defaults to " spaces".
+# sidebar_header_title = " spaces"
+
 # Terminal width at or below which Herdr uses the mobile single-column layout.
 # Increase this for foldables, tablets, or wide phone terminals.
 # mobile_width_threshold = 64
