@@ -1390,6 +1390,17 @@ impl AppState {
         true
     }
 
+    #[cfg(test)]
+    pub fn move_tab(&mut self, source_idx: usize, insert_idx: usize) {
+        if let Some(ws) = self.active.and_then(|i| self.workspaces.get_mut(i)) {
+            if ws.move_tab(source_idx, insert_idx) {
+                self.mark_session_dirty();
+                self.tab_scroll_follow_active = true;
+                self.refresh_tab_bar_view();
+            }
+        }
+    }
+
     pub fn move_workspace_block(
         &mut self,
         workspace_ids: &[String],

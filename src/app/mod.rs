@@ -618,7 +618,11 @@ impl App {
             sidebar_min_width,
             sidebar_max_width,
             sidebar_resize_step: config.ui.sidebar_resize_step,
-            sidebar_header_bg: config.ui.sidebar_header_bg.as_deref().map(crate::config::parse_color),
+            sidebar_header_bg: config
+                .ui
+                .sidebar_header_bg
+                .as_deref()
+                .map(crate::config::parse_color),
             sidebar_header_title: config.ui.sidebar_header_title.clone(),
             mobile_width_threshold: config.ui.mobile_width_threshold,
             sidebar_width_source,
@@ -1425,7 +1429,11 @@ impl App {
                 self.state.sidebar_min_width = config.ui.sidebar_min_width;
                 self.state.sidebar_max_width = config.ui.sidebar_max_width;
                 self.state.sidebar_resize_step = config.ui.sidebar_resize_step;
-                self.state.sidebar_header_bg = config.ui.sidebar_header_bg.as_deref().map(crate::config::parse_color);
+                self.state.sidebar_header_bg = config
+                    .ui
+                    .sidebar_header_bg
+                    .as_deref()
+                    .map(crate::config::parse_color);
                 self.state.sidebar_header_title = config.ui.sidebar_header_title.clone();
                 self.state.sidebar_collapsed_mode = config.ui.sidebar_collapsed_mode;
                 self.state.mobile_width_threshold = config.ui.mobile_width_threshold;

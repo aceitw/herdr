@@ -272,6 +272,28 @@ impl App {
                     leave_navigate_mode(&mut self.state);
                 }
             }
+            NavigateAction::SwapPreviousWorkspace => {
+                if let Some(ws_idx) = self.state.active {
+                    let workspace_count = self.state.workspaces.len();
+                    if ws_idx > 0 {
+                        self.move_workspace_via_api(ws_idx, ws_idx - 1);
+                    } else if self.state.swap_wrap && workspace_count > 1 {
+                        self.move_workspace_via_api(ws_idx, workspace_count);
+                    }
+                }
+                leave_navigate_mode(&mut self.state);
+            }
+            NavigateAction::SwapNextWorkspace => {
+                if let Some(ws_idx) = self.state.active {
+                    let workspace_count = self.state.workspaces.len();
+                    if ws_idx + 1 < workspace_count {
+                        self.move_workspace_via_api(ws_idx, ws_idx + 2);
+                    } else if self.state.swap_wrap && workspace_count > 1 {
+                        self.move_workspace_via_api(ws_idx, 0);
+                    }
+                }
+                leave_navigate_mode(&mut self.state);
+            }
             NavigateAction::PreviousAgent => {
                 if let Some((idx, ws_idx, pane_id)) = self.relative_agent_entry(false) {
                     self.focus_pane_internal_via_api(ws_idx, pane_id);
@@ -319,6 +341,38 @@ impl App {
                     self.focus_tab_idx_via_api(tab_idx);
                     leave_navigate_mode(&mut self.state);
                 }
+            }
+            NavigateAction::SwapPreviousTab => {
+                let tab_info = self.state.active.and_then(|ws_idx| {
+                    self.state
+                        .workspaces
+                        .get(ws_idx)
+                        .map(|ws| (ws_idx, ws.active_tab, ws.tabs.len()))
+                });
+                if let Some((ws_idx, tab_idx, tab_count)) = tab_info {
+                    if tab_idx > 0 {
+                        self.move_tab_via_api(ws_idx, tab_idx, tab_idx - 1);
+                    } else if self.state.swap_wrap && tab_count > 1 {
+                        self.move_tab_via_api(ws_idx, tab_idx, tab_count);
+                    }
+                }
+                leave_navigate_mode(&mut self.state);
+            }
+            NavigateAction::SwapNextTab => {
+                let tab_info = self.state.active.and_then(|ws_idx| {
+                    self.state
+                        .workspaces
+                        .get(ws_idx)
+                        .map(|ws| (ws_idx, ws.active_tab, ws.tabs.len()))
+                });
+                if let Some((ws_idx, tab_idx, tab_count)) = tab_info {
+                    if tab_idx + 1 < tab_count {
+                        self.move_tab_via_api(ws_idx, tab_idx, tab_idx + 2);
+                    } else if self.state.swap_wrap && tab_count > 1 {
+                        self.move_tab_via_api(ws_idx, tab_idx, 0);
+                    }
+                }
+                leave_navigate_mode(&mut self.state);
             }
             NavigateAction::CloseTab => {
                 if !self.close_active_tab_via_api_requires_confirmation() {
@@ -385,6 +439,30 @@ impl App {
             NavigateAction::EnterResizeMode => self.state.mode = Mode::Resize,
             NavigateAction::ToggleSidebar => {
                 self.state.sidebar_collapsed = !self.state.sidebar_collapsed;
+                leave_navigate_mode(&mut self.state);
+            }
+            NavigateAction::WidenSidebar => {
+                if !self.state.sidebar_collapsed {
+                    self.state.sidebar_width = self
+                        .state
+                        .sidebar_width
+                        .saturating_add(self.state.sidebar_resize_step)
+                        .clamp(self.state.sidebar_min_width, self.state.sidebar_max_width);
+                    self.state.sidebar_width_source = crate::app::state::SidebarWidthSource::Manual;
+                    self.state.mark_session_dirty();
+                }
+                leave_navigate_mode(&mut self.state);
+            }
+            NavigateAction::NarrowSidebar => {
+                if !self.state.sidebar_collapsed {
+                    self.state.sidebar_width = self
+                        .state
+                        .sidebar_width
+                        .saturating_sub(self.state.sidebar_resize_step)
+                        .clamp(self.state.sidebar_min_width, self.state.sidebar_max_width);
+                    self.state.sidebar_width_source = crate::app::state::SidebarWidthSource::Manual;
+                    self.state.mark_session_dirty();
+                }
                 leave_navigate_mode(&mut self.state);
             }
             NavigateAction::CyclePaneNext => {
