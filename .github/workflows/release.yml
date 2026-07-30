@@ -14,6 +14,7 @@ env:
 
 jobs:
   flake-check:
+    if: github.repository == 'ogulcancelik/herdr'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -36,6 +37,7 @@ jobs:
           nix flake check --all-systems --no-build --print-build-logs
 
   build:
+    if: github.repository == 'ogulcancelik/herdr'
     permissions:
       contents: read
     strategy:
@@ -154,6 +156,7 @@ jobs:
           path: ${{ matrix.name }}
 
   validate-release-inputs:
+    if: github.repository == 'ogulcancelik/herdr'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -170,6 +173,7 @@ jobs:
           test -f docs/next/README.zh-CN.md
 
   release:
+    if: github.repository == 'ogulcancelik/herdr'
     needs: [build, flake-check, validate-release-inputs]
     runs-on: ubuntu-latest
     permissions:
@@ -197,6 +201,7 @@ jobs:
           body_path: RELEASE_NOTES.md
 
   close-released-issues:
+    if: github.repository == 'ogulcancelik/herdr'
     needs: release
     runs-on: ubuntu-latest
     continue-on-error: true
@@ -333,6 +338,7 @@ jobs:
           done
 
   update-latest-json:
+    if: github.repository == 'ogulcancelik/herdr'
     needs: release
     runs-on: ubuntu-latest
     permissions:
