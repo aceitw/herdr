@@ -4,13 +4,12 @@
   rustPlatform,
   callPackage,
   runCommand,
-  writeShellScriptBin,
   zig_0_15,
   zstd,
   pkg-config,
   git,
-  apple-sdk ? null,
   cctools ? null,
+  xcbuild ? null,
 }:
 
 let
@@ -27,25 +26,10 @@ let
         '') entries}
       '';
   };
-
-  darwinSdkRoot = "${apple-sdk}/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk";
-  darwinDeveloperDir = "${apple-sdk}/Platforms/MacOSX.platform/Developer";
-  darwinXcodeSelect = writeShellScriptBin "xcode-select" ''
-    if [ "$1" = "--print-path" ]; then
-      echo ${lib.escapeShellArg darwinDeveloperDir}
-      exit 0
-    fi
-    echo "unsupported xcode-select invocation: $*" >&2
-    exit 1
-  '';
-  darwinXcrun = writeShellScriptBin "xcrun" ''
-    if [ "$1" = "--sdk" ] && [ "$3" = "--show-sdk-path" ]; then
-      echo ${lib.escapeShellArg darwinSdkRoot}
-      exit 0
-    fi
-    echo "unsupported xcrun invocation: $*" >&2
-    exit 1
-  '';
+  darwinToolchain = lib.optionals stdenv.hostPlatform.isDarwin [
+    cctools
+    xcbuild
+  ];
 in
 rustPlatform.buildRustPackage {
   pname = "herdr";
@@ -56,6 +40,7 @@ rustPlatform.buildRustPackage {
     fileset = lib.fileset.intersection (lib.fileset.fromSource (lib.sources.cleanSource ./..)) (
       lib.fileset.unions [
         ../assets
+        ../docs/next/api/herdr-api.schema.json
         ../src
         ../vendor/libghostty-vt
         ../vendor/libghostty-vt.vendor.json
@@ -63,6 +48,7 @@ rustPlatform.buildRustPackage {
         ../build.rs
         ../Cargo.lock
         ../Cargo.toml
+        ../skills/herdr/SKILL.md
       ]
     );
   };
@@ -74,21 +60,13 @@ rustPlatform.buildRustPackage {
   nativeBuildInputs = [
     git
     pkg-config
-  ]
-  ++ lib.optionals stdenv.hostPlatform.isDarwin [
-    cctools
-    darwinXcodeSelect
-    darwinXcrun
-  ];
+  ] ++ darwinToolchain;
 
   env = {
     LIBGHOSTTY_VT_OPTIMIZE = "ReleaseFast";
     LIBGHOSTTY_VT_SIMD = "true";
     LIBGHOSTTY_VT_ZIG_SYSTEM_DIR = zigDeps;
     ZIG = lib.getExe zig_0_15;
-  }
-  // lib.optionalAttrs stdenv.hostPlatform.isDarwin {
-    SDKROOT = darwinSdkRoot;
   };
 
   preBuild = ''
@@ -104,7 +82,7 @@ rustPlatform.buildRustPackage {
   meta = {
     description = "Terminal workspace manager for AI coding agents";
     homepage = "https://herdr.dev";
-    license = lib.licenses.agpl3Plus;
+    license = lib.licenses.asl20;
     mainProgram = "herdr";
     platforms = lib.platforms.linux ++ lib.platforms.darwin;
   };

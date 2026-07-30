@@ -6,30 +6,16 @@ use ratatui::{
     Frame,
 };
 
+use super::text::{display_width_u16, truncate_end};
 use super::widgets::{
     action_button_row_rects, centered_popup_rect, panel_contrast_fg, render_action_button,
     render_modal_header, render_modal_shell, render_panel_shell, ActionButtonSpec,
 };
 use crate::app::{state::WorktreeOpenState, AppState, Mode};
+use crate::terminal::TerminalRuntimeRegistry;
 
 const NEW_LINKED_WORKTREE_POPUP_WIDTH: u16 = 68;
 const NEW_LINKED_WORKTREE_POPUP_HEIGHT: u16 = 12;
-
-fn truncate_text(text: &str, max_width: usize) -> String {
-    let len = text.chars().count();
-    if len <= max_width {
-        return text.to_string();
-    }
-    if max_width <= 1 {
-        return "…".into();
-    }
-    format!(
-        "{}…",
-        text.chars()
-            .take(max_width.saturating_sub(1))
-            .collect::<String>()
-    )
-}
 
 pub(crate) fn rename_button_rects(inner: Rect) -> (Rect, Rect, Rect) {
     let rects = action_button_row_rects(
@@ -58,6 +44,7 @@ pub(super) fn render_rename_overlay(app: &AppState, frame: &mut Frame, area: Rec
     super::dim_background(frame, area);
 
     let title = match app.mode {
+        Mode::RenameWorkspace if app.pending_workspace_create_cwd.is_some() => "new workspace",
         Mode::RenameWorkspace => "rename workspace",
         Mode::RenameTab if app.creating_new_tab => "new tab",
         Mode::RenameTab => "rename tab",
@@ -497,27 +484,27 @@ pub(super) fn render_open_existing_worktree_overlay(app: &AppState, frame: &mut 
         let status = entry.status_label();
         let title_width = inner
             .width
-            .saturating_sub(status.len() as u16)
+            .saturating_sub(display_width_u16(status))
             .saturating_sub(4) as usize;
         let mut title = format!(
             "{marker} {}",
-            truncate_text(&entry.display_name(), title_width)
+            truncate_end(&entry.display_name(), title_width)
         );
         if !status.is_empty() {
             let pad = inner
                 .width
-                .saturating_sub(title.chars().count() as u16)
-                .saturating_sub(status.len() as u16)
+                .saturating_sub(display_width_u16(&title))
+                .saturating_sub(display_width_u16(status))
                 .max(1);
             title.push_str(&" ".repeat(pad as usize));
             title.push_str(status);
         }
         frame.render_widget(
-            Paragraph::new(truncate_text(&title, inner.width as usize)).style(row_style),
+            Paragraph::new(truncate_end(&title, inner.width as usize)).style(row_style),
             Rect::new(inner.x, y, inner.width, 1),
         );
         frame.render_widget(
-            Paragraph::new(truncate_text(
+            Paragraph::new(truncate_end(
                 &format!("  {}", entry.path.display()),
                 inner.width as usize,
             ))
@@ -610,11 +597,14 @@ fn render_open_worktree_search(
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn confirm_close_overlay_text(app: &AppState) -> (String, String) {
+fn confirm_close_overlay_text(
+    app: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+) -> (String, String) {
     let ws_name = app
         .workspaces
         .get(app.selected)
-        .map(|ws| ws.display_name())
+        .map(|ws| ws.display_name_from(&app.terminals, terminal_runtimes))
         .unwrap_or_else(|| "?".to_string());
     let selected_space = app
         .workspaces
@@ -673,8 +663,13 @@ fn confirm_close_overlay_text(app: &AppState) -> (String, String) {
     (title.to_string(), detail)
 }
 
-pub(super) fn render_confirm_close_overlay(app: &AppState, frame: &mut Frame, area: Rect) {
-    let (title, detail) = confirm_close_overlay_text(app);
+pub(super) fn render_confirm_close_overlay(
+    app: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    frame: &mut Frame,
+    area: Rect,
+) {
+    let (title, detail) = confirm_close_overlay_text(app, terminal_runtimes);
 
     super::dim_background(frame, area);
 
@@ -780,6 +775,98 @@ mod tests {
     use super::{confirm_close_overlay_text, render_new_linked_worktree_overlay};
 
     #[test]
+    fn confirm_close_text_uses_live_workspace_cwd_label() {
+        let mut app = AppState::test_new();
+        let mut workspace = Workspace::test_new("initial");
+        workspace.custom_name = None;
+        workspace.identity_cwd = "/projects/original".into();
+        let root_pane = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.tabs[0].panes[&root_pane]
+            .attached_terminal_id
+            .clone();
+        app.workspaces = vec![workspace];
+        app.ensure_test_terminals();
+        app.terminals.get_mut(&terminal_id).unwrap().cwd = "/projects/current".into();
+        app.selected = 0;
+
+        let terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        let (title, detail) = confirm_close_overlay_text(&app, &terminal_runtimes);
+
+        assert_eq!(title, "Close workspace?");
+        assert_eq!(detail, "current — 1 pane");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn confirm_close_text_prefers_live_runtime_cwd_over_stale_terminal_cwd() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-confirm-close-runtime-cwd-{}",
+            std::process::id()
+        ));
+        let stale_cwd = root.join("original");
+        let live_cwd = root.join("current");
+        std::fs::create_dir_all(&live_cwd).unwrap();
+
+        let mut app = AppState::test_new();
+        let mut workspace = Workspace::test_new("initial");
+        workspace.custom_name = None;
+        workspace.identity_cwd = stale_cwd.clone();
+        let root_pane = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.tabs[0].panes[&root_pane]
+            .attached_terminal_id
+            .clone();
+        app.workspaces = vec![workspace];
+        app.ensure_test_terminals();
+        app.selected = 0;
+
+        let (events, _) = tokio::sync::mpsc::channel(4);
+        let runtime = crate::terminal::TerminalRuntime::spawn(
+            root_pane,
+            24,
+            80,
+            live_cwd,
+            0,
+            crate::terminal_theme::TerminalTheme::default(),
+            crate::pane::PaneShellConfig::new("/bin/sh", crate::config::ShellModeConfig::NonLogin),
+            &crate::pane::PaneLaunchEnv::default(),
+            events,
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            std::sync::Arc::new(crate::render_signal::RenderSignal::new()),
+        )
+        .unwrap();
+        let mut terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        terminal_runtimes.insert(terminal_id, runtime);
+
+        let (_, detail) = confirm_close_overlay_text(&app, &terminal_runtimes);
+
+        assert_eq!(detail, "current — 1 pane");
+
+        drop(terminal_runtimes);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn confirm_close_text_uses_selected_custom_name_instead_of_active_workspace_cwd() {
+        let mut app = AppState::test_new();
+        let active = Workspace::test_new("active");
+        let selected = Workspace::test_new("selected");
+        let selected_root = selected.tabs[0].root_pane;
+        let selected_terminal_id = selected.tabs[0].panes[&selected_root]
+            .attached_terminal_id
+            .clone();
+        app.workspaces = vec![active, selected];
+        app.ensure_test_terminals();
+        app.terminals.get_mut(&selected_terminal_id).unwrap().cwd = "/projects/current".into();
+        app.active = Some(0);
+        app.selected = 1;
+
+        let terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        let (_, detail) = confirm_close_overlay_text(&app, &terminal_runtimes);
+
+        assert_eq!(detail, "selected — 1 pane");
+    }
+
+    #[test]
     fn confirm_close_text_reports_parent_group_scope() {
         let mut app = AppState::test_new();
         let mut parent = Workspace::test_new("main");
@@ -801,7 +888,8 @@ mod tests {
         app.workspaces = vec![parent, child];
         app.selected = 0;
 
-        let (title, detail) = confirm_close_overlay_text(&app);
+        let terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        let (title, detail) = confirm_close_overlay_text(&app, &terminal_runtimes);
 
         assert_eq!(title, "Close worktree group?");
         assert_eq!(detail, "main — 2 workspaces, 2 panes");

@@ -212,7 +212,7 @@ impl App {
                 source_checkout_path: space.repo_root.clone(),
                 source_repo_root: space.repo_root,
                 repo_key: space.key,
-                repo_name: space.label,
+                repo_name: space.repo_name,
             };
             return Ok(source);
         }
@@ -324,7 +324,7 @@ impl App {
             source_checkout_path: space.repo_root.clone(),
             source_repo_root: space.repo_root,
             repo_key: space.key,
-            repo_name: space.label,
+            repo_name: space.repo_name,
         })
     }
 
@@ -611,6 +611,7 @@ impl App {
         });
     }
 
+    #[cfg(test)]
     pub(crate) fn emit_worktree_opened_for_workspace(&mut self, ws_idx: usize, already_open: bool) {
         let Some(worktree) = self.worktree_info_for_workspace(ws_idx) else {
             return;
@@ -677,7 +678,7 @@ fn worktree_source_from_space(
         source_checkout_path: source_checkout_path.clone(),
         source_repo_root: source_checkout_path,
         repo_key: space.key,
-        repo_name: space.label,
+        repo_name: space.repo_name,
     }
 }
 
@@ -827,6 +828,7 @@ mod tests {
                 enabled: true,
                 platforms: None,
                 build: Vec::new(),
+                startup: Vec::new(),
                 actions: Vec::new(),
                 events: vec![crate::api::schema::PluginManifestEventHook {
                     on: event.into(),
@@ -942,11 +944,12 @@ mod tests {
             1
         );
         assert_eq!(
-            &kinds[kinds.len() - 4..],
+            &kinds[kinds.len() - 5..],
             &[
                 EventKind::WorkspaceCreated,
                 EventKind::TabCreated,
                 EventKind::PaneCreated,
+                EventKind::LayoutUpdated,
                 EventKind::WorktreeCreated,
             ]
         );
@@ -1010,11 +1013,12 @@ mod tests {
             .map(|(_, event)| event.event)
             .collect::<Vec<_>>();
         assert_eq!(
-            &event_kinds[event_kinds.len() - 4..],
+            &event_kinds[event_kinds.len() - 5..],
             &[
                 EventKind::WorkspaceCreated,
                 EventKind::TabCreated,
                 EventKind::PaneCreated,
+                EventKind::LayoutUpdated,
                 EventKind::WorktreeCreated,
             ]
         );

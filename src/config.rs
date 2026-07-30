@@ -3,6 +3,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 mod io;
 mod keybinds;
 mod model;
+mod sidebar;
 mod sound;
 mod theme;
 
@@ -19,9 +20,13 @@ pub use self::{
     },
     model::{
         validated_sidebar_bounds, AgentPanelSortConfig, Config, ConfigReloadReport,
-        ConfigReloadStatus, NewTerminalCwdConfig, ShellModeConfig, ToastClipboardPosition,
-        ToastConfig, ToastDelivery, ToastHerdrPosition, UpdateChannelConfig,
-        MAX_TOAST_DELAY_SECONDS,
+        ConfigReloadStatus, HostCursorModeConfig, NewTerminalCwdConfig, ShellModeConfig,
+        SidebarCollapsedModeConfig, ToastClipboardPosition, ToastConfig, ToastDelivery,
+        ToastHerdrPosition, UpdateChannelConfig, MAX_TOAST_DELAY_SECONDS,
+    },
+    sidebar::{
+        AgentSidebarToken, AgentsSidebarConfig, SidebarConfig, SidebarTokenStyle,
+        SpaceSidebarToken, SpacesSidebarConfig,
     },
     sound::SoundConfig,
     theme::{parse_color, CustomThemeColors, ThemeConfig},
@@ -67,7 +72,19 @@ impl Config {
             .chain(keybind_diags)
             .chain(self.remote_image_paste_key().err())
             .chain(self.ui.sound.diagnostics())
+            .chain(self.invalid_sidebar_bounds_diagnostic())
             .collect()
+    }
+
+    pub(crate) fn invalid_sidebar_bounds_diagnostic(&self) -> Option<String> {
+        validated_sidebar_bounds(self.ui.sidebar_min_width, self.ui.sidebar_max_width)
+            .is_none()
+            .then(|| {
+                format!(
+                    "ui.sidebar_min_width ({}) is greater than sidebar_max_width ({})",
+                    self.ui.sidebar_min_width, self.ui.sidebar_max_width
+                )
+            })
     }
 
     pub(crate) fn remote_image_paste_key(&self) -> Result<Option<(KeyCode, KeyModifiers)>, String> {
@@ -338,5 +355,17 @@ command = "echo one"
     fn remote_image_paste_key_can_be_disabled() {
         let config: Config = toml::from_str("[keys]\nremote_image_paste = ''\n").unwrap();
         assert_eq!(config.remote_image_paste_key().unwrap(), None);
+    }
+
+    #[test]
+    fn ui_host_cursor_defaults_to_auto_and_parses_overrides() {
+        let default_config = Config::default();
+        assert_eq!(default_config.ui.host_cursor, HostCursorModeConfig::Auto);
+
+        let native: Config = toml::from_str("[ui]\nhost_cursor = 'native'\n").unwrap();
+        assert_eq!(native.ui.host_cursor, HostCursorModeConfig::Native);
+
+        let drawn: Config = toml::from_str("[ui]\nhost_cursor = 'drawn'\n").unwrap();
+        assert_eq!(drawn.ui.host_cursor, HostCursorModeConfig::Drawn);
     }
 }

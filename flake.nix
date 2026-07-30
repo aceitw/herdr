@@ -3,10 +3,18 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
-    { self, nixpkgs }:
+    {
+      self,
+      nixpkgs,
+      rust-overlay,
+    }:
     let
       lib = nixpkgs.lib;
       systems = [
@@ -16,14 +24,39 @@
         "aarch64-darwin"
       ];
       forAllSystems = lib.genAttrs systems;
-      pkgsFor = system: import nixpkgs { inherit system; };
+      pkgsFor =
+        system:
+        import nixpkgs {
+          inherit system;
+          overlays = [ rust-overlay.overlays.default ];
+        };
+      rustToolchainFor = pkgs: pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+      rustDevToolchainFor =
+        pkgs:
+        (rustToolchainFor pkgs).override (toolchain: {
+          extensions = toolchain.extensions ++ [
+            "rust-src"
+            "rust-analyzer"
+          ];
+        });
+      rustPlatformFor =
+        pkgs:
+        let
+          rustToolchain = rustToolchainFor pkgs;
+        in
+        pkgs.makeRustPlatform {
+          cargo = rustToolchain;
+          rustc = rustToolchain;
+        };
     in
     {
       packages = forAllSystems (
         system:
         let
           pkgs = pkgsFor system;
-          herdr = pkgs.callPackage ./nix/package.nix { };
+          herdr = pkgs.callPackage ./nix/package.nix {
+            rustPlatform = rustPlatformFor pkgs;
+          };
         in
         {
           inherit herdr;
@@ -48,20 +81,18 @@
         system:
         let
           pkgs = pkgsFor system;
+          rustToolchain = rustDevToolchainFor pkgs;
         in
         {
           default = pkgs.mkShell {
             name = "herdr-dev";
             packages = with pkgs; [
-              cargo
               cargo-nextest
-              clippy
               cmake
               just
               ninja
               pkg-config
-              rustc
-              rustfmt
+              rustToolchain
               zig_0_15
             ];
 
@@ -75,8 +106,12 @@
 
       formatter = forAllSystems (system: (pkgsFor system).nixfmt);
 
-      overlays.default = final: _prev: {
-        herdr = final.callPackage ./nix/package.nix { };
-      };
+      overlays.default = lib.composeExtensions rust-overlay.overlays.default (
+        final: _prev: {
+          herdr = final.callPackage ./nix/package.nix {
+            rustPlatform = rustPlatformFor final;
+          };
+        }
+      );
     };
 }
