@@ -24,6 +24,11 @@
 
 ---
 
+> [!IMPORTANT]
+> This repository is the `aceitw/herdr` fork. See [FORK.md](FORK.md) for its
+> additional workspace/tab swapping, sidebar customization, installation, and
+> terminal compatibility notes.
+
 https://github.com/user-attachments/assets/043ec09f-4bdd-41d5-aee0-8fda6b83e267
 
 **agent multiplexer that lives in your terminal.**

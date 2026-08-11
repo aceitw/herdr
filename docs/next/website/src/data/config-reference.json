@@ -338,6 +338,18 @@
           "description": "Select the next workspace. Unset by default."
         },
         {
+          "key": "keys.swap_previous_workspace",
+          "type": "keybinding",
+          "default": "unset",
+          "description": "Move the active workspace one position earlier in the sidebar. Unset by default."
+        },
+        {
+          "key": "keys.swap_next_workspace",
+          "type": "keybinding",
+          "default": "unset",
+          "description": "Move the active workspace one position later in the sidebar. Unset by default."
+        },
+        {
           "key": "keys.previous_agent",
           "type": "keybinding",
           "default": "unset",
@@ -384,6 +396,24 @@
           "type": "keybinding",
           "default": "\"prefix+n\"",
           "description": "Select the next tab."
+        },
+        {
+          "key": "keys.swap_previous_tab",
+          "type": "keybinding",
+          "default": "unset",
+          "description": "Move the active tab one position to the left in the tab bar. Unset by default."
+        },
+        {
+          "key": "keys.swap_next_tab",
+          "type": "keybinding",
+          "default": "unset",
+          "description": "Move the active tab one position to the right in the tab bar. Unset by default."
+        },
+        {
+          "key": "keys.swap_wrap",
+          "type": "boolean",
+          "default": "true",
+          "description": "Wrap workspace and tab swaps across the first and last positions. Set to false to stop at either boundary."
         },
         {
           "key": "keys.switch_tab",
@@ -524,6 +554,18 @@
           "description": "Toggle sidebar collapse."
         },
         {
+          "key": "keys.widen_sidebar",
+          "type": "keybinding",
+          "default": "unset",
+          "description": "Widen the expanded sidebar by ui.sidebar_resize_step columns. Unset by default."
+        },
+        {
+          "key": "keys.narrow_sidebar",
+          "type": "keybinding",
+          "default": "unset",
+          "description": "Narrow the expanded sidebar by ui.sidebar_resize_step columns. Unset by default."
+        },
+        {
           "key": "keys.indexed.tabs",
           "type": "string",
           "default": "unset",
@@ -564,6 +606,24 @@
           "type": "integer",
           "default": "36",
           "description": "Maximum sidebar width (columns) when expanded."
+        },
+        {
+          "key": "ui.sidebar_resize_step",
+          "type": "integer",
+          "default": "2",
+          "description": "Column increment used by the widen_sidebar and narrow_sidebar keybindings."
+        },
+        {
+          "key": "ui.sidebar_header_bg",
+          "type": "string",
+          "default": "unset",
+          "description": "Optional background color for the spaces header row. Accepts hex, named colors, or rgb(r,g,b)."
+        },
+        {
+          "key": "ui.sidebar_header_title",
+          "type": "string",
+          "default": "unset",
+          "description": "Optional label for the spaces header row. The displayed fallback is spaces with leading padding."
         },
         {
           "key": "ui.sidebar_start_collapsed",
