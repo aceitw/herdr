@@ -9,6 +9,8 @@
 //! the single device push token in [`crate::persist::devices`] — a device may hold
 //! several at once. The daemon pushes its session's aggregate agent status to every
 //! registered token, so no per-session key is needed: this daemon IS the session.
+//! Like the device store, the file is owner-only (0600) on Unix because it holds
+//! relay capabilities.
 
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
@@ -25,6 +27,10 @@ pub struct RegisteredActivity {
     pub activity_push_token: String,
     /// Registration time in Unix milliseconds.
     pub registered_unix_ms: u64,
+    /// Opaque sealed capability from the HerdrUp push relay (`hpr1.…`). Sent back
+    /// verbatim to the relay; never parsed or logged. Absent on legacy records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_capability: Option<String>,
 }
 
 fn registry_path() -> PathBuf {
@@ -51,30 +57,14 @@ fn with_registry_lock<T>(operation: impl FnOnce() -> std::io::Result<T>) -> std:
 }
 
 fn save_to_path(path: &Path, activities: &[RegisteredActivity]) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let json = serde_json::to_string_pretty(activities)?;
-    let tmp_path = path.with_extension("json.tmp");
-    std::fs::write(&tmp_path, json)?;
-    #[cfg(windows)]
-    if path.exists() {
-        if let Err(err) = std::fs::remove_file(path) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(err);
-        }
-    }
-    if let Err(err) = std::fs::rename(&tmp_path, path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(err);
-    }
-    Ok(())
+    super::devices::save_owner_only_json(path, activities)
 }
 
 fn load_from_path_strict(path: &Path) -> std::io::Result<Vec<RegisteredActivity>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
+    super::devices::restrict_to_owner(path);
     let content = std::fs::read_to_string(path)?;
     serde_json::from_str::<Vec<RegisteredActivity>>(&content)
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
@@ -127,5 +117,80 @@ pub fn load() -> Vec<RegisteredActivity> {
             warn!(path = %registry_path().display(), err = %err, "failed to load activity registry");
             Vec::new()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "herdr-activities-{label}-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ))
+    }
+
+    #[test]
+    fn save_and_load_roundtrip_with_and_without_capability() {
+        let path = temp_path("roundtrip");
+        let activities = [
+            RegisteredActivity {
+                activity_push_token: "aaaa".to_string(),
+                registered_unix_ms: 1,
+                relay_capability: None,
+            },
+            RegisteredActivity {
+                activity_push_token: "bbbb".to_string(),
+                registered_unix_ms: 2,
+                relay_capability: Some("hpr1.c2VhbGVk".to_string()),
+            },
+        ];
+        save_to_path(&path, &activities).unwrap();
+        assert_eq!(load_from_path_strict(&path).unwrap(), activities);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn legacy_file_without_capability_still_loads() {
+        let path = temp_path("legacy");
+        std::fs::write(
+            &path,
+            r#"[{"activity_push_token":"abcd","registered_unix_ms":1700000000000}]"#,
+        )
+        .unwrap();
+        let loaded = load_from_path_strict(&path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].activity_push_token, "abcd");
+        assert_eq!(loaded[0].relay_capability, None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_is_owner_only_after_save_and_repaired_on_load() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = temp_path("mode");
+        let tmp = path.with_extension("json.tmp");
+        // A stale world-readable temp file must not leak its mode into the save.
+        std::fs::write(&tmp, "stale").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+        save_to_path(&path, &[]).unwrap();
+        assert_eq!(mode(&path), 0o600);
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        load_from_path_strict(&path).unwrap();
+        assert_eq!(mode(&path), 0o600);
+        let _ = std::fs::remove_file(&path);
     }
 }

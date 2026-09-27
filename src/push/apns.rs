@@ -11,8 +11,8 @@
 //! Follow-up (not in this change): set `apns-collapse-id` to coalesce repeated
 //! alerts for the same pane.
 
-use std::io::Write;
-use std::process::Stdio;
+use std::io::{Read, Write};
+use std::process::{Child, Stdio};
 
 use super::{PushKind, PushNotification};
 
@@ -67,7 +67,7 @@ fn device_url(sandbox: bool, device_token: &str) -> String {
 
 /// The non-sensitive curl argv. The JWT, headers, url, and payload are delivered
 /// out-of-band via the stdin config (`--config -`) so no secret lands on argv.
-fn build_curl_argv() -> Vec<String> {
+pub(super) fn build_curl_argv() -> Vec<String> {
     vec![
         "--http2".to_string(),
         "-s".to_string(),
@@ -86,7 +86,7 @@ fn build_curl_argv() -> Vec<String> {
 /// and `\"` inside quotes, so backslashes MUST be escaped before double-quotes
 /// (order matters — escaping quotes first would then double-escape the added
 /// backslashes). The JSON payload contains `"`, so this has to be exact.
-fn quote_config_value(value: &str) -> String {
+pub(super) fn quote_config_value(value: &str) -> String {
     let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
     format!("\"{escaped}\"")
 }
@@ -143,7 +143,7 @@ pub(super) fn live_activity_payload(content_state: &serde_json::Value, timestamp
 
 /// Split curl's combined stdout into `(body, status)`. `stdout` is
 /// `<body>\n<http_code>`.
-fn split_body_status(stdout: &str) -> (&str, &str) {
+pub(super) fn split_body_status(stdout: &str) -> (&str, &str) {
     let stdout = stdout.trim_end();
     match stdout.rsplit_once('\n') {
         Some((body, status)) => (body, status.trim()),
@@ -213,48 +213,9 @@ pub(super) fn deliver_one_typed(
     let url = device_url(sandbox, device_token);
     let config = build_curl_config_typed(&url, jwt, topic, push_type, priority, payload);
 
-    let mut child = match crate::noninteractive_process::curl_command()
-        .args(build_curl_argv())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(err) => {
-            tracing::warn!(error = %err, "apns curl failed to spawn");
-            return DeliveryOutcome::Failed;
-        }
+    let Some(stdout) = run_curl_with_stdin_config(&config) else {
+        return DeliveryOutcome::Failed;
     };
-
-    // Write the config to stdin and close it (EOF) before draining stdout. The
-    // config is tiny and curl reads it fully before issuing the request, so this
-    // cannot deadlock.
-    {
-        let Some(mut stdin) = child.stdin.take() else {
-            tracing::warn!("apns curl child stdin was unavailable");
-            let _ = child.kill();
-            let _ = child.wait();
-            return DeliveryOutcome::Failed;
-        };
-        if let Err(err) = stdin.write_all(config.as_bytes()) {
-            tracing::warn!(error = %err, "failed to write curl config to stdin");
-            drop(stdin);
-            let _ = child.kill();
-            let _ = child.wait();
-            return DeliveryOutcome::Failed;
-        }
-    }
-
-    let output = match child.wait_with_output() {
-        Ok(output) => output,
-        Err(err) => {
-            tracing::warn!(error = %err, "failed to collect curl output");
-            return DeliveryOutcome::Failed;
-        }
-    };
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
     let (body, status) = split_body_status(&stdout);
     let outcome = classify_status(status);
     if matches!(
@@ -269,6 +230,94 @@ pub(super) fn deliver_one_typed(
         );
     }
     outcome
+}
+
+/// Upper bound on curl's stdout. A response is a small JSON body plus the status
+/// line; the relay URL is configurable, so a faulty or hostile endpoint must not
+/// be able to grow the daemon's memory without limit.
+const MAX_RESPONSE_BYTES: u64 = 64 * 1024;
+
+/// Spawn curl with the fixed [`build_curl_argv`] and feed `config` on stdin, so
+/// url, headers and body never reach argv. Returns curl's stdout
+/// (`<body>\n<http_code>`), or `None` after logging a spawn/IO failure or an
+/// oversized response. stderr goes to null, so curl never blocks on it.
+pub(super) fn run_curl_with_stdin_config(config: &str) -> Option<String> {
+    let mut child = match crate::noninteractive_process::curl_command()
+        .args(build_curl_argv())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) => {
+            tracing::warn!(error = %err, "push curl failed to spawn");
+            return None;
+        }
+    };
+
+    // Write the config to stdin and close it (EOF) before draining stdout. The
+    // config is tiny and curl reads it fully before issuing the request, so this
+    // cannot deadlock.
+    {
+        let Some(mut stdin) = child.stdin.take() else {
+            tracing::warn!("push curl child stdin was unavailable");
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        };
+        if let Err(err) = stdin.write_all(config.as_bytes()) {
+            tracing::warn!(error = %err, "failed to write curl config to stdin");
+            drop(stdin);
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+    }
+
+    collect_capped_stdout(child, MAX_RESPONSE_BYTES)
+}
+
+/// Read at most `cap` bytes of `child`'s stdout, then reap it. Output past the
+/// cap kills the child and yields `None`; none of the remote bytes are logged.
+fn collect_capped_stdout(mut child: Child, cap: u64) -> Option<String> {
+    let Some(stdout) = child.stdout.take() else {
+        tracing::warn!("push curl child stdout was unavailable");
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
+    match read_capped(stdout, cap) {
+        Ok(Some(bytes)) => {
+            if let Err(err) = child.wait() {
+                tracing::warn!(error = %err, "failed to reap curl");
+            }
+            Some(String::from_utf8_lossy(&bytes).into_owned())
+        }
+        Ok(None) => {
+            tracing::warn!(
+                cap_bytes = cap,
+                "push response exceeded the size cap; dropped"
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+            None
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to collect curl output");
+            let _ = child.kill();
+            let _ = child.wait();
+            None
+        }
+    }
+}
+
+/// All of `reader` when it ends within `cap` bytes, or `None` once it exceeds
+/// the cap. Reads at most `cap + 1` bytes either way.
+fn read_capped(reader: impl Read, cap: u64) -> std::io::Result<Option<Vec<u8>>> {
+    let mut bytes = Vec::new();
+    reader.take(cap + 1).read_to_end(&mut bytes)?;
+    Ok((bytes.len() as u64 <= cap).then_some(bytes))
 }
 
 #[cfg(test)]
@@ -422,5 +471,70 @@ mod tests {
         );
         assert_eq!(reason_from_body("").as_deref(), None);
         assert_eq!(reason_from_body("not json").as_deref(), None);
+    }
+
+    #[test]
+    fn read_capped_stops_one_byte_past_the_cap() {
+        assert_eq!(read_capped(&b"abc"[..], 3).unwrap(), Some(b"abc".to_vec()));
+        assert_eq!(read_capped(&b"abcd"[..], 3).unwrap(), None);
+
+        // An endless reader stops after cap + 1 bytes instead of buffering forever.
+        let mut endless = std::io::repeat(b'x');
+        assert_eq!(read_capped(&mut endless, 1024).unwrap(), None);
+        let mut counted = CountingReader::default();
+        assert_eq!(read_capped(&mut counted, 1024).unwrap(), None);
+        assert_eq!(counted.read, 1025);
+    }
+
+    #[derive(Default)]
+    struct CountingReader {
+        read: u64,
+    }
+
+    impl Read for CountingReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            buf.fill(b'x');
+            self.read += buf.len() as u64;
+            Ok(buf.len())
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oversized_child_output_is_dropped_and_the_child_reaped() {
+        // `yes` writes forever; without the cap this would never return.
+        let child = std::process::Command::new("yes")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        assert_eq!(collect_capped_stdout(child, MAX_RESPONSE_BYTES), None);
+        // Reaped: no zombie is left behind under this pid.
+        assert!(!is_zombie(pid));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn small_child_output_is_returned() {
+        let child = std::process::Command::new("printf")
+            .arg("{}\\n200")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdout = collect_capped_stdout(child, MAX_RESPONSE_BYTES).unwrap();
+        assert_eq!(split_body_status(&stdout), ("{}", "200"));
+    }
+
+    /// True while `pid` exists as an unreaped zombie. A reaped pid has no /proc entry.
+    #[cfg(target_os = "linux")]
+    fn is_zombie(pid: u32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .map(|stat| {
+                stat.rsplit_once(')')
+                    .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'))
+            })
+            .unwrap_or(false)
     }
 }
