@@ -3,6 +3,9 @@ mod event_hub;
 pub(crate) mod federation;
 pub mod federation_manager;
 pub mod federation_store;
+#[cfg(unix)]
+pub(crate) mod gram_gateway;
+pub(crate) mod gram_relay;
 pub(crate) mod output_registry;
 #[cfg(unix)]
 pub(crate) mod reverse;

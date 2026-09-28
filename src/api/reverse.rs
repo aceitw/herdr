@@ -13,42 +13,27 @@ use interprocess::local_socket::{
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::api::client::{ApiClient, ConnectionTarget};
 use crate::api::federation_manager::PeerRoute;
+use crate::api::gram_gateway::{GramGatewaySession, GramGatewaySpawner, GramGatewaySpec};
 use crate::api::schema::{GramRelayCall, GramRelayParams, Method, Request};
 use crate::api::ApiRequestSender;
 
 const MAX_LINE: usize = 1_100_000; // one 512-KiB chunk encoded as JSON/base64
 const RESPONSE_LIMIT: usize = 2_000_000;
 
-/// Operator consent: comma-separated peer routing aliases, set on the
-/// coordinator daemon *before* starting it. A saved profile alone never grants
-/// Gram access. Changing this requires restarting the daemon.
-pub(crate) fn allowed_alias(alias: &str) -> bool {
-    std::env::var("HERDR_GRAM_RELAY_PEERS")
-        .ok()
-        .is_some_and(|list| {
-            list.split(',')
-                .any(|name| !name.is_empty() && name.trim() == alias)
-        })
-}
-
-/// Stable remote socket name. The remote daemon must opt in with this path in
-/// HERDR_GRAM_REVERSE_SOCKET; SSH creates it with an owner-only bind mask.
-pub(crate) fn reverse_socket_path(coordinator_id: &str, remote_id: &str) -> PathBuf {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(format!("herdr-gram:{coordinator_id}:{remote_id}"));
-    let suffix: String = digest[..12].iter().map(|b| format!("{b:02x}")).collect();
-    PathBuf::from("/tmp").join(format!("herdr-gram-{suffix}.sock"))
-}
-
 pub(crate) fn forward_local(request: &Request) -> Option<String> {
-    let path = std::env::var_os("HERDR_GRAM_REVERSE_SOCKET")?;
     let method = &request.method;
+    // Status is always answered by this daemon.
+    if matches!(method, Method::GramRelayStatus(_)) {
+        return None;
+    }
+    // Read per request so reload-config changes apply to the next call.
+    let path = crate::api::gram_relay::policy().remote_socket()?;
     if !matches!(
         method,
         Method::GramSend(_)
@@ -66,7 +51,7 @@ pub(crate) fn forward_local(request: &Request) -> Option<String> {
             .to_string()
         });
     }
-    let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.into()));
+    let client = ApiClient::for_target(ConnectionTarget::SocketPath(path));
     let reply =
         client.request_value_bounded(request, RESPONSE_LIMIT, Duration::from_secs(30), None);
     Some(match reply {
@@ -147,59 +132,171 @@ fn serve_one(
     conn.write_all(b"\n")
 }
 
+const FORWARD_READY_WINDOW: Duration = Duration::from_secs(2);
+const FORWARD_READY_POLL: Duration = Duration::from_millis(100);
+
+/// Owns a starting `ssh -R` child and kills and reaps it on drop, so no early
+/// return during setup can leak a forward the supervisor would then duplicate.
+struct ChildGuard(Option<std::process::Child>);
+
+impl ChildGuard {
+    fn new(child: std::process::Child) -> Self {
+        Self(Some(child))
+    }
+
+    fn child(&mut self) -> &mut std::process::Child {
+        self.0
+            .as_mut()
+            .expect("guarded child is present until released")
+    }
+
+    fn release(mut self) -> std::process::Child {
+        self.0.take().expect("guarded child is released once")
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// ExitOnForwardFailure makes a failed remote bind terminate SSH, so a forward
+/// that survives `window` is established. Every failure path (exit, cancel, or
+/// a `try_wait` error) drops the guard, which kills and reaps the child.
+fn await_forward_ready(
+    mut guard: ChildGuard,
+    window: Duration,
+    cancelled: impl Fn() -> bool,
+) -> io::Result<std::process::Child> {
+    let deadline = std::time::Instant::now() + window;
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(FORWARD_READY_POLL.min(window));
+        if cancelled() {
+            return Err(io::Error::other("Gram relay gateway start cancelled"));
+        }
+        if let Some(status) = guard.child().try_wait()? {
+            return Err(io::Error::other(format!(
+                "Gram relay SSH reverse bind failed: {status}"
+            )));
+        }
+    }
+    Ok(guard.release())
+}
+
+/// Production spawner: one [`ReverseGateway`] attempt per call.
+pub(crate) struct SshGramGatewaySpawner {
+    tx: ApiRequestSender,
+    running: Arc<AtomicBool>,
+}
+
+impl SshGramGatewaySpawner {
+    pub(crate) fn new(tx: ApiRequestSender, running: Arc<AtomicBool>) -> Self {
+        Self { tx, running }
+    }
+}
+
+impl GramGatewaySpawner for SshGramGatewaySpawner {
+    fn start(
+        &self,
+        spec: &GramGatewaySpec,
+        route: &PeerRoute,
+        cancel: &Arc<AtomicBool>,
+    ) -> io::Result<Box<dyn GramGatewaySession>> {
+        ReverseGateway::start(
+            spec,
+            route.clone(),
+            self.tx.clone(),
+            Arc::clone(&self.running),
+            Arc::clone(cancel),
+        )
+        .map(|gateway| Box::new(gateway) as Box<dyn GramGatewaySession>)
+    }
+}
+
+/// One gateway attempt: a private local listener plus one `ssh -R` child. It
+/// never respawns SSH itself; [`crate::api::gram_gateway::GramRelaySupervisor`]
+/// retries it after [`GramGatewaySession::exited`] reports a reason.
 pub(crate) struct ReverseGateway {
     stop: Arc<AtomicBool>,
+    exited: Arc<Mutex<Option<String>>>,
     listener: Option<JoinHandle<()>>,
     ssh: Option<JoinHandle<()>>,
     socket: PathBuf,
     socket_identity: crate::ipc::SocketFileIdentity,
 }
 
+impl GramGatewaySession for ReverseGateway {
+    fn exited(&self) -> Option<String> {
+        self.exited
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+fn record_exit(exited: &Mutex<Option<String>>, reason: String) {
+    exited
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get_or_insert(reason);
+}
+
 impl ReverseGateway {
-    pub(crate) fn start(
-        profile_id: &str,
-        ssh_target: &str,
-        session: &str,
-        alias: String,
-        remote_machine_id: &str,
+    fn start(
+        spec: &GramGatewaySpec,
         route: PeerRoute,
         tx: ApiRequestSender,
         running: Arc<AtomicBool>,
+        cancel: Arc<AtomicBool>,
     ) -> io::Result<Self> {
+        let profile_id = spec.profile_id.as_str();
+        let ssh_target = spec
+            .endpoint
+            .strip_prefix("ssh://")
+            .ok_or_else(|| io::Error::other("Gram reverse gateway requires an SSH peer"))?;
         let coordinator_id = crate::persist::machine::get_or_create();
-        let remote = reverse_socket_path(&coordinator_id, remote_machine_id);
+        let remote =
+            crate::api::gram_relay::reverse_socket_path(&coordinator_id, &spec.remote_machine_id);
         let socket = crate::platform::remote_bridge_endpoint_path(
             &format!(
                 "herdr-gram-gateway-{}-{}.sock",
                 std::process::id(),
                 profile_id
             ),
-            &format!("hg-{}-{}.sock", std::process::id(), &profile_id[..16]),
+            &format!(
+                "hg-{}-{}.sock",
+                std::process::id(),
+                profile_id.get(..16).unwrap_or(profile_id)
+            ),
         );
         let listener = crate::ipc::bind_private_local_listener(&socket)?;
         let socket_identity = crate::ipc::socket_file_identity(&socket)?;
         crate::ipc::restrict_socket_permissions(&socket, 0o600)?;
         listener.set_nonblocking(ListenerNonblockingMode::Accept)?;
         // ExitOnForwardFailure makes a failed remote bind terminate SSH. Do not
-        // advertise a ready gateway until the initial forwarding attempt has
-        // survived its setup interval. The request path still fails closed until
-        // the route's pinned machine identity is validated by federation polling.
-        let first_child = (|| -> io::Result<std::process::Child> {
+        // advertise a ready gateway until the forwarding attempt has survived
+        // its setup interval. The request path still fails closed until the
+        // route's pinned machine identity is validated by federation polling.
+        let child = (|| -> io::Result<std::process::Child> {
             let mut command = crate::remote::reverse_forward_command(
-                profile_id, ssh_target, session, &remote, &socket,
+                profile_id,
+                ssh_target,
+                &spec.session,
+                &remote,
+                &socket,
+                Arc::clone(&cancel),
             )?;
-            let mut child = command.spawn()?;
-            for _ in 0..20 {
-                std::thread::sleep(Duration::from_millis(100));
-                if let Some(status) = child.try_wait()? {
-                    return Err(io::Error::other(format!(
-                        "Gram relay SSH reverse bind failed: {status}"
-                    )));
-                }
-            }
-            Ok(child)
+            await_forward_ready(
+                ChildGuard::new(command.spawn()?),
+                FORWARD_READY_WINDOW,
+                || cancel.load(Ordering::Acquire) || !running.load(Ordering::Acquire),
+            )
         })();
-        let first_child = match first_child {
+        let mut child = match child {
             Ok(child) => child,
             Err(error) => {
                 let _ = crate::ipc::remove_socket_file_if_owned(&socket, &socket_identity);
@@ -207,8 +304,11 @@ impl ReverseGateway {
             }
         };
         let stop = Arc::new(AtomicBool::new(false));
+        let exited = Arc::new(Mutex::new(None));
         let listener_stop = Arc::clone(&stop);
         let listener_running = Arc::clone(&running);
+        let listener_exited = Arc::clone(&exited);
+        let alias = spec.alias.clone();
         let active = Arc::new(AtomicUsize::new(0));
         let mut last_sweep = std::time::Instant::now() - Duration::from_secs(60 * 60);
         let listener_thread = std::thread::spawn(move || {
@@ -237,58 +337,43 @@ impl ReverseGateway {
                         std::thread::sleep(Duration::from_millis(25))
                     }
                     Err(error) => {
-                        tracing::warn!(%error, "Gram relay gateway listener failed");
+                        record_exit(
+                            &listener_exited,
+                            format!("Gram relay gateway listener failed: {error}"),
+                        );
                         break;
                     }
                 }
             }
         });
-        let profile_id = profile_id.to_owned();
-        let ssh_target = ssh_target.to_owned();
-        let session = session.to_owned();
-        let ssh_socket = socket.clone();
         let ssh_stop = Arc::clone(&stop);
-        let mut first_child = Some(first_child);
+        let ssh_exited = Arc::clone(&exited);
         let ssh_thread = std::thread::spawn(move || {
             while !ssh_stop.load(Ordering::Relaxed) && running.load(Ordering::Relaxed) {
-                let child = match first_child.take() {
-                    Some(child) => Ok(child),
-                    None => crate::remote::reverse_forward_command(
-                        &profile_id,
-                        &ssh_target,
-                        &session,
-                        &remote,
-                        &ssh_socket,
-                    )
-                    .and_then(|mut command| command.spawn()),
-                };
-                match child {
-                    Ok(mut child) => {
-                        while !ssh_stop.load(Ordering::Relaxed) && running.load(Ordering::Relaxed) {
-                            match child.try_wait() {
-                                Ok(Some(status)) => {
-                                    tracing::warn!(%status, "Gram relay SSH forward exited");
-                                    break;
-                                }
-                                Ok(None) => std::thread::sleep(Duration::from_millis(250)),
-                                Err(error) => {
-                                    tracing::warn!(%error, "Gram relay SSH forward failed");
-                                    break;
-                                }
-                            }
-                        }
-                        let _ = child.kill();
-                        let _ = child.wait();
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        record_exit(
+                            &ssh_exited,
+                            format!("Gram relay SSH forward exited: {status}"),
+                        );
+                        break;
                     }
-                    Err(error) => tracing::warn!(%error, "Gram relay SSH forward could not start"),
-                }
-                if !ssh_stop.load(Ordering::Relaxed) {
-                    std::thread::sleep(Duration::from_secs(2));
+                    Ok(None) => std::thread::sleep(Duration::from_millis(250)),
+                    Err(error) => {
+                        record_exit(
+                            &ssh_exited,
+                            format!("Gram relay SSH forward failed: {error}"),
+                        );
+                        break;
+                    }
                 }
             }
+            let _ = child.kill();
+            let _ = child.wait();
         });
         Ok(Self {
             stop,
+            exited,
             listener: Some(listener_thread),
             ssh: Some(ssh_thread),
             socket,
@@ -307,5 +392,61 @@ impl Drop for ReverseGateway {
             let _ = listener.join();
         }
         let _ = crate::ipc::remove_socket_file_if_owned(&self.socket, &self.socket_identity);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::{Command, Stdio};
+
+    fn sleeper() -> (ChildGuard, libc::pid_t) {
+        let child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = libc::pid_t::try_from(child.id()).unwrap();
+        (ChildGuard::new(child), pid)
+    }
+
+    /// True once the pid is gone entirely: killed AND reaped (no zombie).
+    fn reaped(pid: libc::pid_t) -> bool {
+        // SAFETY: signal 0 only checks for the process's existence.
+        let missing = unsafe { libc::kill(pid, 0) } == -1;
+        missing && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
+
+    #[test]
+    fn dropping_the_guard_kills_and_reaps_the_forward() {
+        let (guard, pid) = sleeper();
+        assert!(!reaped(pid));
+        drop(guard);
+        assert!(reaped(pid));
+    }
+
+    #[test]
+    fn cancelled_readiness_kills_and_reaps_the_forward() {
+        let (guard, pid) = sleeper();
+        let error = await_forward_ready(guard, Duration::from_secs(5), || true).unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+        assert!(reaped(pid));
+    }
+
+    #[test]
+    fn surviving_the_window_hands_over_the_live_child() {
+        let (guard, pid) = sleeper();
+        let mut child = await_forward_ready(guard, Duration::from_millis(250), || false).unwrap();
+        assert!(!reaped(pid));
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn an_exited_forward_reports_its_status() {
+        let child = Command::new("sh").args(["-c", "exit 255"]).spawn().unwrap();
+        let error = await_forward_ready(ChildGuard::new(child), Duration::from_secs(5), || false)
+            .unwrap_err();
+        assert!(error.to_string().contains("reverse bind failed"), "{error}");
     }
 }

@@ -179,6 +179,8 @@ expected_machine_id = "machine_0123456789abcdef0123456789abcdef"
 
 在协调端运行 `herdr machine status`（或 `herdr machine status --json`），分别查看已保存配置档案、端点/TUI 和联邦的健康状况。不受信任的配置档案会显示 `herdr machine federate <profile-id>` 作为下一步操作（JSON 中为 `next_action`）。联邦可达性、已验证的远端机器 ID、上次成功轮询、有限类别的错误、协商的版本/能力及过期数据会分别报告。错误信息不会暴露 SSH 命令、令牌或远端 stderr。
 
+当某台已保存机器在 Gram 中继授权范围内时，其状态还包含 `gram_relay`（文本输出显示 `gram relay:` 一行）。`state` 为 `off`、`starting`、`up` 或 `retrying`；`retrying` 另含 `attempt`、`next_in_secs` 和截断后的 `last_error`。协调端会自行重试失败或已退出的反向网关，间隔从 2 秒起倍增，上限 60 秒，且不会重启该机器的联邦桥接。示例：`"gram_relay": {"state": "retrying", "attempt": 3, "next_in_secs": 8, "last_error": "remote Gram reverse socket preflight failed: exit status: 255"}`。
+
 运行 `herdr machine add --label <label> <user@host>` 后，再运行 `herdr machine federate <label-or-id>`，仅为该已保存机器启用联邦。该命令通过 OpenSSH 连接，首次使用时获取远端安装身份，将其固定在 `federation.saved_machines` 中，启用协调端模式并重新加载正在运行的守护进程。用 `herdr machine status` 验证可达性；`herdr machine unfederate <label-or-id>` 仅移除该策略，保留已保存的 SSH 配置档案。后续身份不匹配时会拒绝访问，而不会替换固定的身份。首次连接前请检查 SSH 主机密钥：该命令不会让未知主机自动变得可信。
 
 ### 迁移 SSH 联邦对等方
@@ -205,7 +207,27 @@ TCP 联邦令牌只授予对应对等方的能力级别，不会授予更多权�
 
 Gram 仍保存在协调端的规范存储中。已保存且固定了身份的 SSH 对等方可以通过另一个默认关闭的反向 Unix socket，在远端执行 `gram send --file`、列出文件、下载文件和删除文件。所有者通过带机器限定名称的代理名向远端代理发送消息（`herdr gram post "message" --to <profile-id>/<agent>`）。这**不会**将 `gram.*` 添加到普通 TCP 联邦的允许列表，也不会转发协调端不受限制的本地 API。
 
-启动**协调端守护进程**前，在其环境中设置 `HERDR_GRAM_RELAY_PEERS=<profile-id>`（多个明确受信任的配置档案 ID 以逗号分隔）。从 Herdr 配置目录下的 `machine.json` 读取协调端安装 ID。启动**远端守护进程**前，将其 `HERDR_GRAM_REVERSE_SOCKET` 设置为 `herdr gram relay-path <coordinator-install-id>` 的输出。两端都需要更新后的二进制文件；协调端已保存的 SSH 配置档案必须已固定远端安装 ID。OpenSSH 必须允许反向 stream-local 转发。不会将任何私有 SSH 密钥复制到远端机器。
+中继授权是持久化的 Herdr 配置，默认关闭。两端都需要更新后的二进制；协调端的已保存 SSH 配置档必须已固定远程机器的安装 ID（`herdr machine federate`）。OpenSSH 必须允许反向 stream-local 转发。不会把任何 SSH 私钥复制到远程机器。
+
+**协调端**（`config.toml`）：用 `herdr machine list` 显示的配置档 ID 允许一台已保存机器。
+
+```toml
+[gram_relay]
+peers = ["8195b6326f748f4da1945364a4e205b9"]
+```
+
+**远程机器**（`config.toml`）：信任协调端的安装 ID，该 ID 可从协调端 Herdr 配置目录下的 `machine.json` 读取。反向套接字路径由该 ID 与远程机器自身的安装 ID 推导得出（`herdr gram relay-path <coordinator-install-id>` 会打印它）。
+
+```toml
+[gram_relay]
+coordinator_machine_id = "machine_f872cca4c7743d39c1fad1fa5a74a087"
+```
+
+两端都可用 `herdr server reload-config` 应用，无需重启守护进程，窗格和其他联邦路由保持不变。协调端会为新允许的对端启动反向网关，并带退避地重试直到成功。用 `herdr gram relay-status`（脚本可加 `--json`）检查各端：显示配置值、旧环境变量是否存在、生效值及其 `source`（`config`、`environment` 或 `none`）、`error`，协调端还显示每个允许对端的网关状态，远程端显示套接字路径以及当前是否接受连接。无效的 `[gram_relay]` 段（例如格式错误的安装 ID）在重新加载时会被拒绝：之前的生效设置保持不变，状态报告 `invalid_config`。启动时若配置文件无法解析，则回退到默认值，不授予任何访问。
+
+回滚时，把键设为显式空值并运行 `herdr server reload-config`：协调端为 `peers = []`，远程端为 `coordinator_machine_id = ""`。协调端会拆除该对端的网关、关闭其反向套接字，并拒绝该对端之后的中继请求；远程端的 Gram 回到本地存储。显式空值始终不授予任何访问，即使旧环境变量仍然存在（此时状态报告 `conflict`）。删除键也可以回滚，但仅适用于没有旧变量的守护进程，因为键缺失时会沿用变量。
+
+环境变量 `HERDR_GRAM_RELAY_PEERS` 和 `HERDR_GRAM_REVERSE_SOCKET` 已弃用。变量即使为空也视为已设置，空值不授予任何访问。配置中未设置该键的守护进程会遵循变量（`source` 为 `environment`，并在日志和状态中给出弃用警告）。配置键存在且与变量相同时，以配置为准（`source` 为 `config`）。两者不同时（包括一侧为空列表或空 ID），该端的中继会以 `error: conflict` 被禁用，直到两者一致或在没有该变量的情况下启动守护进程。Herdr 绝不会通过合并两者来扩大访问范围。
 
 反向 socket 仅供远端账户私用，并随已保存的 SSH 会话重新连接。断开连接期间，远端 Gram 操作会失败，而不会悄悄写入另一个本地存储。`gram post` 和 `gram grab` 等仅供协调端使用的方法在远端也会明确失败；请在协调端运行它们。文件先按现有大小限制暂存，只有长度和 SHA-256 均匹配后才提交到协调端；下载也会验证两者，然后以原子方式替换目标文件。默认的疑似凭据下载警告会扫描每个数据块；`--reveal` 是显式覆盖选项。已删除的源附件无法下载；上传中断只会留下有大小上限的暂存数据，并在过期后清理。
 
