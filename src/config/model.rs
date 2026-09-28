@@ -330,6 +330,7 @@ pub struct Config {
     pub push: PushConfig,
     pub federation: FederationConfig,
     pub gram_relay: GramRelayConfig,
+    pub guest: GuestConfig,
     pub accounts: Vec<AccountConfig>,
 }
 
@@ -1274,6 +1275,26 @@ pub struct PushConfig {
 }
 
 pub const DEFAULT_PUSH_RELAY_URL: &str = "https://push.herdrup.themartian.app";
+
+/// `[guest]`: guest access through the HerdrUp guest relay (unix only).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct GuestConfig {
+    /// Base URL of the HerdrUp guest relay. Invites carry it, and the daemon
+    /// links to it only while a guest or an unexpired invite exists.
+    #[cfg_attr(not(unix), allow(dead_code))] // Guest access is unix only.
+    pub relay_url: String,
+}
+
+pub const DEFAULT_GUEST_RELAY_URL: &str = "https://guest.herdrup.themartian.app";
+
+impl Default for GuestConfig {
+    fn default() -> Self {
+        Self {
+            relay_url: DEFAULT_GUEST_RELAY_URL.to_string(),
+        }
+    }
+}
 
 impl Default for PushConfig {
     fn default() -> Self {
