@@ -140,8 +140,8 @@ pub struct PeerCacheEntry {
     /// published. Empty for peers without an event stream.
     pub relayed: HashMap<String, RelayedStatus>,
     /// Per remote pane (qualified id), when a relay resync found the peer no
-    /// longer lists it. A poll that started earlier may still list the pane,
-    /// so it must not bring it back.
+    /// longer lists it or the relay saw it close. A poll that started earlier
+    /// may still list the pane, so it must not bring it back.
     pub vanished: HashMap<String, Instant>,
 }
 
@@ -186,6 +186,8 @@ pub enum RemotePaneEvent {
     AgentReleased,
     /// `pane.exited`: the pane's process exited.
     Exited,
+    /// `pane.closed`: the pane was closed on purpose; it leaves quietly.
+    Closed,
 }
 
 /// Cache of every configured federation peer's agents, keyed by peer alias.
@@ -258,19 +260,22 @@ impl FederationStore {
     }
 
     /// Record one status event the relay received from `alias` (ids already
-    /// qualified) and patch the cached agent. Returns whether it should be
-    /// published: `false` when it repeats the last status published for the
-    /// pane (a transition a resync already reported) or the alias is not
-    /// cached.
+    /// qualified) and patch the cached agent. The event's turn is first raised
+    /// to the newest the pane has shown ([`PeerCacheEntry::clamp_turn`]), so
+    /// what is recorded and published never rewinds it. Returns whether it
+    /// should be published: `false` when it repeats the last status published
+    /// for the pane (a transition a resync already reported) or the alias is
+    /// not cached.
     pub fn relay_status(
         &mut self,
         alias: &str,
-        event: &PaneAgentStatusChangedEvent,
+        event: &mut PaneAgentStatusChangedEvent,
         now: Instant,
     ) -> bool {
         let Some(entry) = self.peers.get_mut(alias) else {
             return false;
         };
+        entry.clamp_turn(event);
         if entry
             .relayed
             .get(&event.pane_id)
@@ -319,11 +324,17 @@ impl FederationStore {
         entry.record_relayed(event, now);
     }
 
-    /// Forget a closed remote pane's relay baseline.
-    pub fn relay_pane_closed(&mut self, alias: &str, pane_id: &str) {
-        if let Some(entry) = self.peers.get_mut(alias) {
-            entry.relayed.remove(pane_id);
-        }
+    /// Forget a closed remote pane: its relay baseline and cached agent go at
+    /// once, a poll that started earlier cannot bring it back, and the app loop
+    /// learns it was closed rather than lost ([`RemotePaneEvent::Closed`]).
+    pub fn relay_pane_closed(&mut self, alias: &str, pane_id: &str, now: Instant) {
+        let Some(entry) = self.peers.get_mut(alias) else {
+            return;
+        };
+        entry.relayed.remove(pane_id);
+        entry.agents.retain(|agent| agent.pane_id != pane_id);
+        entry.vanished.insert(pane_id.to_owned(), now);
+        self.relay_pane_event(alias, pane_id, RemotePaneEvent::Closed);
     }
 
     /// Queue a relayed pane lifecycle event (pane id qualified) for the app
@@ -351,7 +362,11 @@ impl FederationStore {
     /// baseline, and return the events to publish so each missed change is
     /// reported exactly once. The list is authoritative: panes the peer no
     /// longer lists lose their baseline and leave the cached agents, which the
-    /// app loop reports as exited.
+    /// app loop reports as exited. Its turns are taken as they are, never
+    /// clamped: the list is newer than every line applied before it, and after
+    /// a peer restart the cache may still hold the previous boot's turns,
+    /// which mean nothing for the new one. Recording it overwrites them, so
+    /// later clamps ([`PeerCacheEntry::clamp_turn`]) only see this boot.
     pub fn relay_resync(
         &mut self,
         alias: &str,
@@ -571,6 +586,27 @@ impl FederationStore {
 }
 
 impl PeerCacheEntry {
+    /// Raise `event`'s `(turn_epoch, turn)` to the newest the pane has shown,
+    /// in its relay baseline or cached agent, the same forward-only order
+    /// [`FederationStore::relay_turn`] keeps. Both belong to the peer's current
+    /// boot: every resync overwrites them from the fresh `agent.list`.
+    fn clamp_turn(&self, event: &mut PaneAgentStatusChangedEvent) {
+        let baseline = self
+            .relayed
+            .get(&event.pane_id)
+            .map(|relayed| (relayed.event.turn_epoch, relayed.event.turn));
+        let cached = self
+            .agents
+            .iter()
+            .find(|agent| agent.pane_id == event.pane_id)
+            .map(|agent| (agent.turn_epoch, agent.turn));
+        if let Some(newest) = baseline.max(cached) {
+            if newest > (event.turn_epoch, event.turn) {
+                (event.turn_epoch, event.turn) = newest;
+            }
+        }
+    }
+
     /// Make `event` the pane's relay baseline and patch its cached agent.
     fn record_relayed(&mut self, event: PaneAgentStatusChangedEvent, now: Instant) {
         if let Some(agent) = self
@@ -602,7 +638,10 @@ pub fn agent_status_event(agent: &AgentInfo) -> PaneAgentStatusChangedEvent {
     }
 }
 
-/// Overwrite `agent`'s status fields with a status event for its pane.
+/// Overwrite `agent`'s status fields with a status event for its pane. The
+/// event's turn is already the right one: a streamed status was clamped
+/// forward ([`PeerCacheEntry::clamp_turn`]), a resync is authoritative, and a
+/// poll only takes a relayed baseline newer than itself.
 fn apply_status_event(agent: &mut AgentInfo, event: &PaneAgentStatusChangedEvent) {
     agent.agent_status = event.agent_status;
     agent.input_pending = event.input_pending;
@@ -958,7 +997,11 @@ mod tests {
         let mut blocked = status("home/p1", AgentStatus::Blocked);
         blocked.turn = Some(4);
         blocked.turn_epoch = Some(2);
-        assert!(store.relay_status("home", &blocked, poll_started + Duration::from_millis(1)));
+        assert!(store.relay_status(
+            "home",
+            &mut blocked,
+            poll_started + Duration::from_millis(1)
+        ));
         assert_eq!(cached_status(&store, "home/p1"), AgentStatus::Blocked);
         store.set_polled_peer(
             "home",
@@ -1030,8 +1073,8 @@ mod tests {
         assert_eq!(cached_status(&store, "home/p1"), AgentStatus::Blocked);
         // The stream then delivers the same transition: it is not repeated,
         // while a genuinely new one is.
-        assert!(!store.relay_status("home", &status("home/p1", AgentStatus::Blocked), now));
-        assert!(store.relay_status("home", &status("home/p1", AgentStatus::Working), now));
+        assert!(!store.relay_status("home", &mut status("home/p1", AgentStatus::Blocked), now));
+        assert!(store.relay_status("home", &mut status("home/p1", AgentStatus::Working), now));
         // A second resync with nothing new reports nothing.
         assert!(store
             .relay_resync(
@@ -1057,5 +1100,176 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn relayed_status_never_rewinds_the_cached_turn() {
+        let mut store = FederationStore::default();
+        let now = Instant::now();
+        store.set_peer(
+            "home",
+            PeerCacheEntry::reachable(vec![pane_agent("home/p1", AgentStatus::Working)], now),
+        );
+        store.relay_turn("home", "home/p1", 5, 2, now);
+        // The cached agent's and the relay baseline's turn.
+        let turn = |store: &FederationStore| {
+            let entry = store.peer("home").unwrap();
+            let agent = &entry.agents[0];
+            let baseline = &entry.relayed["home/p1"].event;
+            [
+                (agent.turn_epoch, agent.turn),
+                (baseline.turn_epoch, baseline.turn),
+            ]
+        };
+        assert_eq!(turn(&store), [(Some(2), Some(5)); 2]);
+
+        // A status carrying an older turn, or none, still changes the status,
+        // but the cache, the baseline and the event handed back for
+        // publishing keep the newer turn.
+        let mut older = status("home/p1", AgentStatus::Idle);
+        older.turn = Some(4);
+        older.turn_epoch = Some(2);
+        assert!(store.relay_status("home", &mut older, now));
+        assert_eq!((older.turn_epoch, older.turn), (Some(2), Some(5)));
+        assert_eq!(cached_status(&store, "home/p1"), AgentStatus::Idle);
+        assert_eq!(turn(&store), [(Some(2), Some(5)); 2]);
+        let mut unnumbered = status("home/p1", AgentStatus::Working);
+        assert!(store.relay_status("home", &mut unnumbered, now));
+        assert_eq!((unnumbered.turn_epoch, unnumbered.turn), (Some(2), Some(5)));
+        assert_eq!(turn(&store), [(Some(2), Some(5)); 2]);
+
+        // A newer epoch moves it, even with a lower turn.
+        let mut restarted = status("home/p1", AgentStatus::Idle);
+        restarted.turn = Some(1);
+        restarted.turn_epoch = Some(3);
+        assert!(store.relay_status("home", &mut restarted, now));
+        assert_eq!(turn(&store), [(Some(3), Some(1)); 2]);
+    }
+
+    #[test]
+    fn closed_remote_pane_leaves_the_cache_at_once_and_stays_gone() {
+        use std::time::Duration;
+        let mut store = FederationStore::default();
+        let t0 = Instant::now();
+        let listed = || {
+            vec![
+                pane_agent("home/p1", AgentStatus::Working),
+                pane_agent("home/p2", AgentStatus::Idle),
+            ]
+        };
+        store.set_polled_peer("home", PeerCacheEntry::reachable(listed(), t0), t0);
+        store.relay_resync(
+            "home",
+            vec![
+                status("home/p1", AgentStatus::Working),
+                status("home/p2", AgentStatus::Idle),
+            ],
+            RelayResync::Seed,
+            t0,
+        );
+        let pane_ids = |store: &FederationStore| {
+            store
+                .merged_agents()
+                .into_iter()
+                .map(|agent| agent.pane_id)
+                .collect::<Vec<_>>()
+        };
+
+        let poll_started = Instant::now();
+        let revision = store.revision();
+        store.relay_pane_closed("home", "home/p1", poll_started + Duration::from_millis(1));
+        assert_eq!(pane_ids(&store), ["home/p2"]);
+        assert!(!store.peer("home").unwrap().relayed.contains_key("home/p1"));
+        assert_ne!(
+            store.revision(),
+            revision,
+            "the app loop re-reads the store"
+        );
+        assert_eq!(
+            store.take_pane_events(),
+            [("home/p1".to_owned(), RemotePaneEvent::Closed)]
+        );
+
+        // A poll that started before the close still lists the pane.
+        store.set_polled_peer(
+            "home",
+            PeerCacheEntry::reachable(listed(), t0),
+            poll_started,
+        );
+        assert_eq!(pane_ids(&store), ["home/p2"]);
+    }
+
+    #[test]
+    fn peer_restart_takes_the_new_boots_turns_over_stale_cached_ones() {
+        use std::time::Duration;
+        let mut store = FederationStore::default();
+        let t0 = Instant::now();
+        // The previous boot: p1 at (epoch 10, turn 9), p2 at (10, 3).
+        let old_boot = || {
+            ["home/p1", "home/p2"].map(|pane_id| {
+                let mut agent = pane_agent(pane_id, AgentStatus::Working);
+                agent.turn_epoch = Some(10);
+                agent.turn = Some(if pane_id == "home/p1" { 9 } else { 3 });
+                agent
+            })
+        };
+        store.set_polled_peer(
+            "home",
+            PeerCacheEntry::reachable(old_boot().to_vec(), t0),
+            t0,
+        );
+        store.relay_resync(
+            "home",
+            old_boot().iter().map(agent_status_event).collect(),
+            RelayResync::Seed,
+            t0,
+        );
+        let turns = |store: &FederationStore, pane_id: &str| {
+            let entry = store.peer("home").unwrap();
+            let agent = entry
+                .agents
+                .iter()
+                .find(|agent| agent.pane_id == pane_id)
+                .unwrap();
+            let baseline = &entry.relayed[pane_id].event;
+            [
+                (agent.turn_epoch, agent.turn),
+                (baseline.turn_epoch, baseline.turn),
+            ]
+        };
+
+        // The peer restarts and the relay reconnects before the poll refreshes
+        // the cache: the new boot reports a lower epoch for p1 and no turn for
+        // p2 (no agent in it any more).
+        let poll_started = Instant::now();
+        let reset_at = poll_started + Duration::from_millis(1);
+        let mut p1 = status("home/p1", AgentStatus::Idle);
+        (p1.turn_epoch, p1.turn) = (Some(4), Some(1));
+        let p2 = status("home/p2", AgentStatus::Idle);
+        let published = store.relay_resync(
+            "home",
+            vec![p1.clone(), p2.clone()],
+            RelayResync::Reset,
+            reset_at,
+        );
+        assert_eq!(published, [p1, p2], "published as the new boot sent them");
+        assert_eq!(turns(&store, "home/p1"), [(Some(4), Some(1)); 2]);
+        assert_eq!(turns(&store, "home/p2"), [(None, None); 2]);
+
+        // A poll of the old boot that started before the reset lands after it.
+        store.set_polled_peer(
+            "home",
+            PeerCacheEntry::reachable(old_boot().to_vec(), t0),
+            poll_started,
+        );
+        assert_eq!(turns(&store, "home/p1"), [(Some(4), Some(1)); 2]);
+
+        // The new boot's next turn and statuses move forward from its own.
+        store.relay_turn("home", "home/p1", 2, 4, reset_at);
+        assert_eq!(turns(&store, "home/p1"), [(Some(4), Some(2)); 2]);
+        let mut working = status("home/p1", AgentStatus::Working);
+        (working.turn_epoch, working.turn) = (Some(4), Some(2));
+        assert!(store.relay_status("home", &mut working, reset_at));
+        assert_eq!((working.turn_epoch, working.turn), (Some(4), Some(2)));
     }
 }

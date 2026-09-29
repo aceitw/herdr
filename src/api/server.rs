@@ -786,8 +786,8 @@ fn poll_once_into_cache(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             // Race guard for a changed peer: the manager sets this peer's
-            // `peer_stop` AND evicts the alias while holding this same store
-            // Mutex, so checking `peer_stop` here — WHILE HOLDING the lock, just
+            // `peer_stop` and then evicts the alias while holding this same
+            // store Mutex, so checking `peer_stop` here — WHILE HOLDING the lock, just
             // before the write — serializes a retiring thread against the
             // reconcile. If stop is set, skip the write so a stale entry can
             // never reappear after the alias was evicted (or be overwritten by
@@ -808,11 +808,17 @@ fn poll_once_into_cache(
             reachability
         }
         Err(err) => {
-            if let Some(route) = route {
-                route.set_identity_validated(false);
+            let error_class = federation_poll_error_class(&err);
+            // Only a different machine behind the endpoint revokes its
+            // identity. A transport, protocol or authentication miss says
+            // nothing about who answers there, so the identity the last poll
+            // proved stands and the event relay keeps streaming.
+            if error_class == FederationPollErrorClass::IdentityMismatch {
+                if let Some(route) = route {
+                    route.set_identity_validated(false);
+                }
             }
             let reachability = tracker.record_miss();
-            let error_class = federation_poll_error_class(&err);
             warn!(alias = %alias, ?error_class, ?reachability, "federation peer poll failed");
             let mut store = cache
                 .lock()
@@ -5376,6 +5382,9 @@ mod federation_tests {
             addr: peer_srv.addr,
             token: Some(SEEDED_PEER_TOKEN.into()),
         });
+        // Validated by an earlier poll; the machine behind the endpoint then
+        // changes.
+        route.set_identity_validated(true);
 
         assert_eq!(
             poll_once_into_cache(
@@ -5397,7 +5406,7 @@ mod federation_tests {
         );
         assert!(
             !route.identity_validated(),
-            "identity mismatch must keep proxy routing disabled"
+            "identity mismatch must disable proxy routing"
         );
         assert_eq!(
             cache
@@ -8169,6 +8178,13 @@ mod federation_tests {
     }
 
     fn start_relay(addr: SocketAddr) -> RelayFixture {
+        start_relay_on(PeerRoute::for_test(ConnectionTarget::Tcp {
+            addr,
+            token: Some(SEEDED_PEER_TOKEN.into()),
+        }))
+    }
+
+    fn start_relay_on(route: PeerRoute) -> RelayFixture {
         let hub = EventHub::default();
         let store = Arc::new(Mutex::new(FederationStore::default()));
         store.lock().unwrap().set_peer(
@@ -8182,10 +8198,6 @@ mod federation_tests {
                 },
             ),
         );
-        let route = PeerRoute::for_test(ConnectionTarget::Tcp {
-            addr,
-            token: Some(SEEDED_PEER_TOKEN.into()),
-        });
         let stop = Arc::new(AtomicBool::new(false));
         let relay = PeerRelay {
             alias: "box".into(),
@@ -8578,6 +8590,201 @@ mod federation_tests {
                 ),
             ]
         );
+
+        relay.stop();
+        peer.shutdown();
+    }
+
+    /// A poll that stops vouching for a pinned peer's identity ends its live
+    /// stream: events the peer sends afterwards are neither published nor
+    /// recorded, and the relay streams again only once the identity is
+    /// validated anew.
+    #[test]
+    fn relay_stops_relaying_once_peer_identity_is_revoked() {
+        let state = streaming_state(
+            vec![peer_agent("w1:p1", AgentStatus::Working)],
+            "boot-1",
+            true,
+        );
+        let peer = StreamingPeer::spawn(Arc::clone(&state));
+        let route = PeerRoute::for_test_unvalidated(ConnectionTarget::Tcp {
+            addr: peer.addr,
+            token: Some(SEEDED_PEER_TOKEN.into()),
+        });
+        route.set_identity_validated(true);
+        let relay = start_relay_on(route);
+        assert!(wait_until(Duration::from_secs(5), || peer.subscribes()
+            == 1
+            && relay_baseline_has(&relay.store, "box/w1:p1")));
+        peer.event_hub
+            .push(peer_status("w1:p1", AgentStatus::Blocked));
+        assert!(wait_until(Duration::from_secs(5), || hub_statuses(
+            &relay.hub
+        )
+        .len()
+            == 1));
+
+        // The poll found a different machine behind the endpoint.
+        relay.route.set_identity_validated(false);
+        peer.event_hub.push(peer_status("w1:p1", AgentStatus::Idle));
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(
+            hub_statuses(&relay.hub),
+            status_pairs(&[("box/w1:p1", AgentStatus::Blocked)]),
+            "a revoked peer's events must not be relayed"
+        );
+        assert_eq!(
+            relay.store.lock().unwrap().peer("box").unwrap().relayed["box/w1:p1"]
+                .event
+                .agent_status,
+            AgentStatus::Blocked,
+            "a revoked peer's events must not be recorded"
+        );
+        assert_eq!(peer.subscribes(), 1);
+
+        relay.route.set_identity_validated(true);
+        assert!(
+            wait_until(Duration::from_secs(5), || peer.subscribes() == 2),
+            "the revoked stream ended, so a validated peer opens a new one"
+        );
+
+        relay.stop();
+        peer.shutdown();
+    }
+
+    /// A poll that misses on transport says nothing about the identity behind
+    /// the endpoint: a validated peer's live stream keeps relaying.
+    #[test]
+    fn relay_keeps_streaming_when_a_poll_misses_on_transport() {
+        let state = streaming_state(
+            vec![peer_agent("w1:p1", AgentStatus::Working)],
+            "boot-1",
+            true,
+        );
+        let peer = StreamingPeer::spawn(Arc::clone(&state));
+        let route = PeerRoute::for_test_unvalidated(ConnectionTarget::Tcp {
+            addr: peer.addr,
+            token: Some(SEEDED_PEER_TOKEN.into()),
+        });
+        route.set_identity_validated(true);
+        let relay = start_relay_on(route);
+        assert!(wait_until(Duration::from_secs(5), || peer.subscribes()
+            == 1
+            && relay_baseline_has(&relay.store, "box/w1:p1")));
+
+        // The next poll cannot connect at all.
+        let dead_addr = {
+            let probe = TcpListener::bind("127.0.0.1:0").expect("probe bind");
+            probe.local_addr().expect("probe addr")
+        };
+        poll_once_into_cache(
+            &ApiClient::for_target(ConnectionTarget::Tcp {
+                addr: dead_addr,
+                token: Some(SEEDED_PEER_TOKEN.into()),
+            }),
+            "box",
+            Some("machine-peer"),
+            Some(&relay.route),
+            &shared_presentation("box"),
+            &relay.store,
+            &mut ReachabilityTracker::default(),
+            &Arc::new(AtomicBool::new(true)),
+            &Arc::new(AtomicBool::new(false)),
+        );
+        assert_eq!(
+            relay
+                .store
+                .lock()
+                .unwrap()
+                .peer("box")
+                .unwrap()
+                .last_error_class,
+            Some(FederationPollErrorClass::Transport)
+        );
+
+        peer.event_hub
+            .push(peer_status("w1:p1", AgentStatus::Blocked));
+        assert!(
+            wait_until(Duration::from_secs(5), || hub_statuses(&relay.hub)
+                == status_pairs(&[("box/w1:p1", AgentStatus::Blocked)])),
+            "a transport miss must not stop the relay"
+        );
+        assert_eq!(peer.subscribes(), 1, "the stream was never dropped");
+
+        relay.stop();
+        peer.shutdown();
+    }
+
+    /// A status that arrives after a newer completed turn still reports the
+    /// status change, but neither the published event nor the relay baseline
+    /// goes back to its older turn.
+    #[test]
+    fn relay_never_publishes_or_records_a_rewound_turn() {
+        let state = streaming_state(
+            vec![peer_agent("w1:p1", AgentStatus::Working)],
+            "boot-1",
+            true,
+        );
+        let peer = StreamingPeer::spawn(Arc::clone(&state));
+        let relay = start_relay(peer.addr);
+        assert!(wait_until(Duration::from_secs(5), || peer.subscribes()
+            == 1
+            && relay_baseline_has(&relay.store, "box/w1:p1")));
+
+        let pane: crate::api::schema::PaneInfo = serde_json::from_value(serde_json::json!({
+            "pane_id": "w1:p1", "terminal_id": "t-w1:p1", "workspace_id": "w1", "tab_id": "w1:t1",
+            "focused": false, "agent_status": "idle", "revision": 2,
+        }))
+        .unwrap();
+        peer.event_hub.push(EventEnvelope {
+            event: EventKind::PaneTurnCompleted,
+            data: EventData::PaneTurnCompleted {
+                pane,
+                turn: 5,
+                turn_epoch: 2,
+                outcome: crate::terminal::TurnOutcome::Completed,
+                message: None,
+                message_truncated: false,
+                agent_session_path: None,
+                completed_unix_ms: 1,
+            },
+        });
+        let mut late = peer_status("w1:p1", AgentStatus::Idle);
+        if let EventData::PaneAgentStatusChanged {
+            turn, turn_epoch, ..
+        } = &mut late.data
+        {
+            (*turn, *turn_epoch) = (Some(4), Some(2));
+        }
+        peer.event_hub.push(late);
+        assert!(wait_until(Duration::from_secs(5), || !hub_statuses(
+            &relay.hub
+        )
+        .is_empty()));
+
+        let published: Vec<_> = relay
+            .hub
+            .events_after(0)
+            .into_iter()
+            .filter_map(|(_, event)| match event.data {
+                EventData::PaneAgentStatusChanged {
+                    agent_status,
+                    turn,
+                    turn_epoch,
+                    ..
+                } => Some((agent_status, turn_epoch, turn)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            published,
+            [(AgentStatus::Idle, Some(2), Some(5))],
+            "the status change is published without rewinding the turn"
+        );
+        let baseline = relay.store.lock().unwrap().peer("box").unwrap().relayed["box/w1:p1"]
+            .event
+            .clone();
+        assert_eq!((baseline.turn_epoch, baseline.turn), (Some(2), Some(5)));
 
         relay.stop();
         peer.shutdown();
