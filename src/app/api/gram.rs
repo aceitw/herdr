@@ -228,10 +228,12 @@ impl App {
                     read_by_owner: false,
                     file,
                     origin_id: store_id.clone(),
+                    // Relayed from another machine: never a local agent's Gram.
+                    sender: None,
                 };
                 match crate::persist::gram::append(item.clone()) {
                     Ok(_) => {
-                        self.emit_apns_gram_message(&from, text, item.file.as_ref());
+                        self.emit_apns_gram_message(&item);
                         encode_success(
                             id,
                             ResponseResult::GramSent {
@@ -303,6 +305,10 @@ impl App {
             Ok(file) => file,
             Err(err) => return err,
         };
+        let sender = params
+            .caller_pane_id
+            .as_deref()
+            .and_then(|pane| self.caller_sender(pane));
         let item = GramItem {
             id: message_id,
             direction: StoredDirection::AgentToOwner,
@@ -315,11 +321,12 @@ impl App {
             read_by_owner: false,
             file,
             origin_id: store_id.clone(),
+            sender,
         };
 
         match crate::persist::gram::append(item.clone()) {
             Ok(_) => {
-                self.emit_apns_gram_message(&from, text, item.file.as_ref());
+                self.emit_apns_gram_message(&item);
                 encode_success(
                     id,
                     ResponseResult::GramSent {
@@ -388,6 +395,7 @@ impl App {
             read_by_owner: true,
             file,
             origin_id: store_id.clone(),
+            sender: None,
         };
 
         match crate::persist::gram::append(item.clone()) {
@@ -613,18 +621,25 @@ impl App {
             return gram_unavailable(id);
         }
 
-        let target_id = params.id.clone();
-        // Returns (found, changed); a re-mark of an already-read message is found
-        // but changes nothing, so it does not rewrite the store.
+        let targets: Vec<String> = params.targets().map(str::to_string).collect();
+        if targets.is_empty() {
+            return encode_error(id, "invalid_params", "pass id or ids");
+        }
+        // Returns (found, changed): every id must exist before any is marked,
+        // and a re-mark of already-read messages does not rewrite the store.
         let outcome = crate::persist::gram::update_if_changed(move |items| {
-            match items.iter_mut().find(|item| item.id == target_id) {
-                Some(item) => {
-                    let changed = !item.read_by_owner;
-                    item.read_by_owner = true;
-                    (true, changed)
-                }
-                None => (false, false),
+            if !targets
+                .iter()
+                .all(|target| items.iter().any(|item| &item.id == target))
+            {
+                return (false, false);
             }
+            let mut changed = false;
+            for item in items.iter_mut().filter(|item| targets.contains(&item.id)) {
+                changed |= !item.read_by_owner;
+                item.read_by_owner = true;
+            }
+            (true, changed)
         });
         match outcome {
             Ok((true, _)) => encode_success(id, ResponseResult::Ok {}),
@@ -888,6 +903,18 @@ impl App {
             .or_else(|| self.public_pane_id(ws_idx, pane_id))
     }
 
+    /// The terminal and agent kind behind a caller pane, recorded on the Gram
+    /// it sends so a guest's view follows the agent, not a reusable name.
+    fn caller_sender(&self, caller_pane_id: &str) -> Option<crate::persist::gram::GramSender> {
+        let (ws_idx, pane_id) = self.parse_pane_id(caller_pane_id)?;
+        let terminal_id = self.state.workspaces.get(ws_idx)?.terminal_id(pane_id)?;
+        let terminal = self.state.terminals.get(terminal_id)?;
+        Some(crate::persist::gram::GramSender {
+            terminal_id: terminal_id.to_string(),
+            agent: terminal.effective_agent_label().map(str::to_string),
+        })
+    }
+
     /// Whether some live terminal has this exact unique agent name. Used to reject
     /// a direct `gram.post` to a nonexistent agent instead of black-holing it.
     fn is_live_agent_name(&self, name: &str) -> bool {
@@ -927,16 +954,16 @@ impl App {
     /// A sibling of `emit_apns_agent_notifications`: detached, best-effort, guarded
     /// by `crate::push::may_deliver`. The alert deep-links to the app's Gram page, so
     /// it carries no pane/workspace id (the payload's `gram` marker signals this).
-    fn emit_apns_gram_message(&self, from: &str, text: &str, file: Option<&GramFile>) {
+    fn emit_apns_gram_message(&self, item: &GramItem) {
         if self.no_session || !crate::push::may_deliver(&self.state.push_config) {
             return;
         }
-        let title =
-            super::sanitized_notification_text(from, 80).unwrap_or_else(|| "New gram".to_string());
-        let mut body = super::sanitized_notification_text(text, 240).unwrap_or_default();
+        let title = super::sanitized_notification_text(&item.from, 80)
+            .unwrap_or_else(|| "New gram".to_string());
+        let mut body = super::sanitized_notification_text(&item.text, 240).unwrap_or_default();
         // Note an attachment so a file-only (or captioned) gram reads sensibly on
         // the lock screen. The name is already a sanitized basename.
-        if let Some(file) = file {
+        if let Some(file) = &item.file {
             let hint = format!("📎 {}", file.name);
             body = if body.is_empty() {
                 hint
@@ -950,6 +977,12 @@ impl App {
             pane_id: String::new(),
             workspace_id: String::new(),
             kind: crate::push::PushKind::Gram,
+            #[cfg(unix)]
+            guest_scope: Some(crate::guest::push::GuestScope::Gram {
+                from: item.from.clone(),
+                sender: item.sender.clone(),
+                gram_id: item.id.clone(),
+            }),
         };
         crate::push::dispatch(self.state.push_config.clone(), vec![notification]);
     }
@@ -1274,6 +1307,7 @@ mod tests {
             read_by_owner: true,
             file: None,
             origin_id: "machine_test".to_string(),
+            sender: None,
         }
     }
 

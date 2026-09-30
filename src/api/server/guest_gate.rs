@@ -3,9 +3,11 @@
 //! terminal takes no input (a guest may watch it, read its scrollback and,
 //! while watching, resize it for everyone viewing), and streams close with
 //! `guest_paused` when the agent leaves the foreground or `guest_revoked` on
-//! revoke.
+//! revoke. With `share_gram` the guest also reads the agent's Grams (see
+//! `crate::guest::gram`), and any guest may register a phone for the agent's
+//! push notifications (see `crate::guest::push`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -16,10 +18,10 @@ use super::{
     ConnectionPrincipal, EventHub,
 };
 use crate::api::schema::{
-    AgentInfo, ErrorResponse, GramPostParams, GramUploadChunkParams, GuestAgentProbeParams,
-    GuestAuditEvent, GuestAuditFile, GuestGrantInfo, Method, PanePtyLeaseReleaseParams,
-    PaneReadParams, PaneSetPtySizeParams, ReadIntent, ReadSource, Request, ResponseResult,
-    SuccessResponse,
+    AgentInfo, ErrorResponse, GramGetFileChunkParams, GramGetFileParams, GramPostParams,
+    GramUploadChunkParams, GuestAgentProbeParams, GuestAuditEvent, GuestAuditFile, GuestGrantInfo,
+    Method, PanePtyLeaseReleaseParams, PaneReadParams, PaneSetPtySizeParams, ReadIntent,
+    ReadSource, Request, ResponseResult, SuccessResponse,
 };
 use crate::api::transport::ApiStream;
 use crate::guest::GuestPrincipal;
@@ -42,11 +44,12 @@ const RESIZE_ROWS: std::ops::RangeInclusive<u16> = 5..=300;
 const RESIZE_TTL_MS: std::ops::RangeInclusive<u64> = 1_000..=60_000;
 const RESIZE_DEFAULT_TTL_MS: u64 = 30_000;
 
-/// When each guest's last throttled event was audited.
+/// When each throttled event was last audited, per key (a guest id, or a
+/// guest id and Gram id for file opens).
 static AUDITED: Mutex<Vec<(GuestAuditEvent, String, Instant)>> = Mutex::new(Vec::new());
 
-/// Whether this guest's `event` should be audited now; records it if so.
-fn audit_due(event: GuestAuditEvent, guest_id: &str) -> bool {
+/// Whether `event` for `key` should be audited now; records it if so.
+fn audit_due(event: GuestAuditEvent, key: &str) -> bool {
     let now = Instant::now();
     let mut audited = AUDITED
         .lock()
@@ -54,11 +57,11 @@ fn audit_due(event: GuestAuditEvent, guest_id: &str) -> bool {
     audited.retain(|(_, _, at)| now.duration_since(*at) < AUDIT_INTERVAL);
     if audited
         .iter()
-        .any(|(seen, id, _)| *seen == event && id == guest_id)
+        .any(|(seen, seen_key, _)| *seen == event && seen_key == key)
     {
         return false;
     }
-    audited.push((event, guest_id.to_string(), now));
+    audited.push((event, key.to_string(), now));
     true
 }
 
@@ -198,28 +201,13 @@ pub(super) fn probe_target(
     }
 }
 
-fn same_kind(a: &str, b: &str) -> bool {
-    match (
-        crate::detect::parse_agent_label(a),
-        crate::detect::parse_agent_label(b),
-    ) {
-        (Some(a), Some(b)) => a == b,
-        _ => a == b,
-    }
-}
-
 /// The grant is the agent with this name and kind in this terminal, local,
 /// not archived and not being transferred. The harness session may change:
 /// a restarted agent keeps its guest.
 fn grant_matches(grant: &GuestGrantInfo, agent: &AgentInfo) -> bool {
-    grant.terminal_id == agent.terminal_id
-        && grant.agent_name.is_some()
-        && grant.agent_name == agent.name
-        && agent
-            .agent
-            .as_deref()
-            .is_some_and(|kind| same_kind(kind, grant.kind()))
-        && agent.machine_id.is_none()
+    agent.agent.as_deref().is_some_and(|kind| {
+        crate::guest::grant_names(grant, &agent.terminal_id, agent.name.as_deref(), kind)
+    }) && agent.machine_id.is_none()
         && agent.archived.is_none()
         && agent.session_transfer.is_none()
 }
@@ -705,7 +693,7 @@ pub(super) fn serve_request(
                     text: params.text,
                     to: agent.name,
                     file,
-                    from: Some(guest.label().trim_end_matches(": ").to_string()),
+                    from: Some(guest.post_from()),
                 }),
             };
             let response = dispatch_to_app_with_timeout(request, api_tx, None);
@@ -715,7 +703,169 @@ pub(super) fn serve_request(
                 &guest_reply(&id, &response, project_gram_sent),
             )
         }
+        Method::GramList(params) if guest.shares_gram() => {
+            if audit_due(GuestAuditEvent::GramList, &guest.guest_id) {
+                guest.audit(GuestAuditEvent::GramList, Some(method), None, None);
+            }
+            let items = crate::persist::gram::load();
+            let reply = match crate::guest::gram::list(
+                guest,
+                &items,
+                params.limit,
+                params.before_id.as_deref(),
+            ) {
+                Ok((messages, has_more)) => success_value(
+                    &id,
+                    serde_json::json!({
+                        "type": "guest_gram_list",
+                        "messages": messages,
+                        "has_more": has_more,
+                    }),
+                ),
+                Err(message) => error_response_json(id, "invalid_params", message.into()),
+            };
+            write_text_line_allow_disconnect(&mut stream, &reply)
+        }
+        Method::GramMarkRead(params) if guest.shares_gram() => {
+            let ids: Vec<String> = params.targets().map(str::to_string).collect();
+            if ids.is_empty() {
+                return write_text_line_allow_disconnect(
+                    &mut stream,
+                    &error_response_json(id, "invalid_params", "pass id or ids".into()),
+                );
+            }
+            let items = crate::persist::gram::load();
+            let visible: HashSet<&str> = items
+                .iter()
+                .filter(|item| crate::guest::gram::visible(guest, item))
+                .map(|item| item.id.as_str())
+                .collect();
+            if !ids.iter().all(|id| visible.contains(id.as_str())) {
+                return forbidden(&mut stream);
+            }
+            if audit_due(GuestAuditEvent::GramRead, &guest.guest_id) {
+                guest.audit(GuestAuditEvent::GramRead, Some(method), None, None);
+            }
+            let reply =
+                match crate::guest::gram::mark_read(&guest.dir, &guest.guest_id, &ids, &visible) {
+                    Ok(()) => success_value(&id, serde_json::json!({"type": "ok"})),
+                    Err(err) => error_response_json(id, "guest_store_failed", err.to_string()),
+                };
+            write_text_line_allow_disconnect(&mut stream, &reply)
+        }
+        Method::GramGetFile(params) if guest.shares_gram() => {
+            if !may_fetch(guest, method, &params.id) {
+                return forbidden(&mut stream);
+            }
+            let request = Request {
+                id: id.clone(),
+                method: Method::GramGetFile(GramGetFileParams {
+                    id: params.id,
+                    caller_pane_id: None,
+                }),
+            };
+            let response = dispatch_to_app_with_timeout(request, api_tx, None);
+            write_text_line_allow_disconnect(
+                &mut stream,
+                &guest_reply(&id, &response, project_file),
+            )
+        }
+        Method::GramGetFileChunk(params) if guest.shares_gram() => {
+            if !may_fetch(guest, method, &params.id) {
+                return forbidden(&mut stream);
+            }
+            let request = Request {
+                id: id.clone(),
+                method: Method::GramGetFileChunk(GramGetFileChunkParams {
+                    caller_pane_id: None,
+                    ..params
+                }),
+            };
+            let response = dispatch_to_app_with_timeout(request, api_tx, None);
+            write_text_line_allow_disconnect(
+                &mut stream,
+                &guest_reply(&id, &response, project_file),
+            )
+        }
+        Method::NotificationsRegisterDevice(params) => {
+            let reply = match crate::app::registered_device(params) {
+                Err(message) => error_response_json(id.clone(), "invalid_params", message.into()),
+                Ok(device) => {
+                    match crate::guest::push::register(&guest.dir, &guest.guest_id, device) {
+                        Ok(()) => success_value(&id, serde_json::json!({"type": "ok"})),
+                        Err(err) => error_response_json(
+                            id.clone(),
+                            "device_registry_save_failed",
+                            err.to_string(),
+                        ),
+                    }
+                }
+            };
+            // Revoked while registering: the revoke already removed this
+            // guest's devices, so remove the one that landed after it.
+            if is_revoked(guest, &live) {
+                if let Err(err) = crate::guest::push::remove_guest(&guest.dir, &guest.guest_id) {
+                    tracing::warn!(err = %err, "guest push devices removal failed");
+                }
+                return write_text_line_allow_disconnect(
+                    &mut stream,
+                    &guest_error(&id, "guest_revoked"),
+                );
+            }
+            write_text_line_allow_disconnect(&mut stream, &reply)
+        }
+        Method::NotificationsUnregisterDevice(params) => {
+            let reply = match crate::guest::push::unregister(
+                &guest.dir,
+                &guest.guest_id,
+                params.device_token.trim(),
+            ) {
+                Ok(_) => success_value(&id, serde_json::json!({"type": "ok"})),
+                Err(err) => error_response_json(id, "device_registry_save_failed", err.to_string()),
+            };
+            write_text_line_allow_disconnect(&mut stream, &reply)
+        }
         _ => forbidden(&mut stream),
+    }
+}
+
+/// Whether message `message_id` is in the guest's shared Gram. The first
+/// fetch of its file, at whatever offset, is audited as the guest opening it;
+/// further fetches of the same file within [`AUDIT_INTERVAL`] are not.
+fn may_fetch(guest: &GuestPrincipal, method: &str, message_id: &str) -> bool {
+    let Some(item) = crate::persist::gram::load()
+        .into_iter()
+        .find(|item| item.id == message_id)
+        .filter(|item| crate::guest::gram::visible(guest, item))
+    else {
+        return false;
+    };
+    let key = format!("{}\0{message_id}", guest.guest_id);
+    if let Some(file) = item
+        .file
+        .filter(|_| audit_due(GuestAuditEvent::GramFile, &key))
+    {
+        guest.audit(
+            GuestAuditEvent::GramFile,
+            Some(method),
+            None,
+            Some(GuestAuditFile {
+                name: file.name,
+                size: file.size,
+                sha256: file.sha256,
+            }),
+        );
+    }
+    true
+}
+
+/// File bytes and the metadata the owner's reply carries.
+fn project_file(result: ResponseResult) -> Option<serde_json::Value> {
+    match result {
+        ResponseResult::GramFileContent { .. } | ResponseResult::GramFileChunk { .. } => {
+            serde_json::to_value(result).ok()
+        }
+        _ => None,
     }
 }
 
@@ -908,6 +1058,15 @@ mod tests {
     impl Harness {
         /// An invite to agent `index`, created through the store.
         fn invite(&self, index: usize, name: &str) -> crate::guest::store::NewInvite {
+            self.invite_with(index, name, false)
+        }
+
+        fn invite_with(
+            &self,
+            index: usize,
+            name: &str,
+            share_gram: bool,
+        ) -> crate::guest::store::NewInvite {
             let probe = probe_target(&self.api_tx, None, Some(&self.pane_ids[index]))
                 .expect("probe the granted agent");
             assert!(
@@ -928,6 +1087,7 @@ mod tests {
                 "Jerry",
                 "Jerry's Mac Studio",
                 3600,
+                share_gram,
                 now_ms(),
             )
             .unwrap()
@@ -941,7 +1101,12 @@ mod tests {
 
         /// Accept a new invite for agent `index` from the same device.
         fn admit_to(&self, index: usize) -> GuestPrincipal {
-            let invite = self.invite(index, "plotarmordev");
+            self.admit_with(index, false)
+        }
+
+        /// Accept a new invite for agent `index` with Gram sharing on or off.
+        fn admit_with(&self, index: usize, share_gram: bool) -> GuestPrincipal {
+            let invite = self.invite_with(index, "plotarmordev", share_gram);
             let hello = json!({"v": 1, "invite_id": invite.record.invite_id, "secret": invite.secret, "device": "iPhone"});
             match admit_in(self.dir.0.clone(), [4; 32], &hello) {
                 Admission::Admitted { principal, .. } => principal,
@@ -2218,5 +2383,491 @@ mod tests {
         assert!(guest.is_none());
         assert_eq!(relay.closed(43), "revoked");
         assert!(harness.pty_text(0, Duration::from_millis(200)).is_empty());
+    }
+
+    /// An owner request straight to the app.
+    fn owner(harness: &Harness, request: Value) -> Value {
+        let request: Request = serde_json::from_value(request).unwrap();
+        serde_json::from_str(&dispatch_to_app_with_timeout(
+            request,
+            &harness.api_tx,
+            None,
+        ))
+        .unwrap()
+    }
+
+    /// The pane an agent of the harness runs in, by name.
+    fn pane_of(harness: &Harness, agent: &str) -> Option<String> {
+        let index = ["llm-opt", "other-agent"]
+            .iter()
+            .position(|name| *name == agent)?;
+        Some(harness.pane_ids[index].clone())
+    }
+
+    fn sent_id(sent: &Value) -> String {
+        sent["result"]["message"]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("sent: {sent}"))
+            .to_string()
+    }
+
+    /// A Gram to the owner labeled `from`, sent from `pane` as `herdr gram send`
+    /// in that pane would (no pane: sent from outside any pane); returns its id.
+    fn send_gram_as(harness: &Harness, pane: Option<String>, from: &str, text: &str) -> String {
+        sent_id(&owner(
+            harness,
+            json!({"id": "s", "method": "gram.send", "params": {"text": text, "from": from, "caller_pane_id": pane}}),
+        ))
+    }
+
+    /// An agent's Gram to the owner from its own pane; returns its id.
+    fn send_gram(harness: &Harness, from: &str, text: &str) -> String {
+        send_gram_as(harness, pane_of(harness, from), from, text)
+    }
+
+    /// An agent's Gram from its pane carrying a file holding `hello`.
+    fn send_file(harness: &Harness, from: &str, name: &str) -> String {
+        let upload = format!("up-{name}");
+        let staged = owner(
+            harness,
+            json!({"id": "u", "method": "gram.upload_chunk", "params": {"upload_id": upload, "offset": 0, "data_base64": "aGVsbG8="}}),
+        );
+        assert_eq!(staged["result"]["type"], "ok", "{staged}");
+        sent_id(&owner(
+            harness,
+            json!({"id": "s", "method": "gram.send", "params": {"text": "", "from": from, "caller_pane_id": pane_of(harness, from), "file": {"upload_id": upload, "name": name, "mime": "text/plain"}}}),
+        ))
+    }
+
+    fn guest_list(harness: &Harness, guest: &GuestPrincipal, params: Value) -> Value {
+        let lines = harness.call(
+            guest,
+            json!({"id": "l", "method": "gram.list", "params": params}),
+        );
+        lines[0]["result"].clone()
+    }
+
+    fn texts(result: &Value) -> Vec<String> {
+        result["messages"]
+            .as_array()
+            .unwrap_or_else(|| panic!("messages: {result}"))
+            .iter()
+            .map(|message| message["text"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn read_marks(result: &Value) -> Vec<(String, bool)> {
+        result["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| {
+                (
+                    message["id"].as_str().unwrap().to_string(),
+                    message["read"].as_bool().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn grams_named_like_the_agent_but_sent_by_another_are_hidden() {
+        let _config = ConfigHome::new("gram-impostor");
+        let harness = start("gram-impostor");
+        let guest = harness.admit_with(0, true);
+        let other_pane = pane_of(&harness, "other-agent");
+        let elsewhere = send_gram_as(&harness, other_pane, "llm-opt", "same name, other pane");
+        let no_pane = send_gram_as(&harness, None, "llm-opt", "same name, no pane");
+        // What a Gram relayed from another machine's `llm-opt` stores.
+        crate::persist::gram::append(crate::persist::gram::GramItem {
+            id: "relay-remote".into(),
+            direction: crate::persist::gram::GramDirection::AgentToOwner,
+            from: "llm-opt".into(),
+            to: None,
+            text: "same name, relayed".into(),
+            grabbed_by: None,
+            grabbed_unix_ms: None,
+            created_unix_ms: now_ms(),
+            read_by_owner: false,
+            file: None,
+            origin_id: String::new(),
+            sender: None,
+        })
+        .unwrap();
+        send_gram(&harness, "llm-opt", "the granted agent");
+
+        let result = guest_list(&harness, &guest, json!({}));
+        assert_eq!(texts(&result), ["the granted agent"]);
+        for id in [elsewhere.as_str(), no_pane.as_str(), "relay-remote"] {
+            let lines = harness.call(
+                &guest,
+                json!({"id": "m", "method": "gram.mark_read", "params": {"ids": [id]}}),
+            );
+            assert_eq!(code(&lines), "guest_forbidden", "{id}");
+        }
+    }
+
+    #[test]
+    fn a_shared_guest_sees_the_agents_grams_since_its_grant_and_its_own_posts() {
+        let _config = ConfigHome::new("gram-visible");
+        let harness = start("gram-visible");
+        send_gram(&harness, "llm-opt", "before the grant");
+        std::thread::sleep(Duration::from_millis(5));
+        let guest = harness.admit_with(0, true);
+        send_gram(&harness, "llm-opt", "after the grant");
+        send_gram(&harness, "other-agent", "another agent");
+        let posted = owner(
+            &harness,
+            json!({"id": "o", "method": "gram.post", "params": {"text": "from the owner", "to": "llm-opt"}}),
+        );
+        assert!(posted.get("result").is_some(), "{posted}");
+        let own = harness.call(
+            &guest,
+            json!({"id": "g", "method": "gram.post", "params": {"text": "from the guest"}}),
+        );
+        let own_id = own[0]["result"]["message"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let result = guest_list(&harness, &guest, json!({}));
+        assert_eq!(result["type"], "guest_gram_list");
+        assert_eq!(texts(&result), ["from the guest", "after the grant"]);
+        assert_eq!(result["has_more"], false);
+        let messages = result["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["direction"], "owner_to_agent");
+        assert_eq!(messages[0]["from"], "plotarmordev (via HerdrUp)");
+        assert_eq!(messages[0]["read"], true);
+        assert_eq!(messages[1]["direction"], "agent_to_owner");
+        assert_eq!(messages[1]["from"], "llm-opt");
+        assert_eq!(messages[1]["read"], false);
+        assert_eq!(
+            keys(&messages[1]),
+            set(&["id", "direction", "from", "text", "created_unix_ms", "read"])
+        );
+
+        let first = guest_list(&harness, &guest, json!({"limit": 1}));
+        assert_eq!(texts(&first), ["from the guest"]);
+        assert_eq!(first["has_more"], true);
+        let next = guest_list(&harness, &guest, json!({"limit": 1, "before_id": own_id}));
+        assert_eq!(texts(&next), ["after the grant"]);
+        assert_eq!(next["has_more"], false);
+        let stale = harness.call(
+            &guest,
+            json!({"id": "l", "method": "gram.list", "params": {"before_id": "gram-missing"}}),
+        );
+        assert_eq!(code(&stale), "invalid_params");
+    }
+
+    #[test]
+    fn gram_methods_need_share_gram() {
+        let _config = ConfigHome::new("gram-share");
+        let harness = start("gram-share");
+        let guest = harness.admit();
+        let id = send_file(&harness, "llm-opt", "notes.txt");
+        let requests = [
+            json!({"id": "d", "method": "gram.list", "params": {}}),
+            json!({"id": "d", "method": "gram.mark_read", "params": {"ids": [id]}}),
+            json!({"id": "d", "method": "gram.get_file", "params": {"id": id}}),
+            json!({"id": "d", "method": "gram.get_file_chunk", "params": {"id": id, "offset": 0}}),
+        ];
+        for request in &requests {
+            let lines = harness.call(&guest, request.clone());
+            assert_eq!(code(&lines), "guest_forbidden", "{request} -> {lines:?}");
+        }
+        // The owner's change applies to the session already admitted.
+        crate::guest::update_at(&guest.dir, &guest.guest_id, true)
+            .unwrap()
+            .unwrap();
+        for request in &requests {
+            let lines = harness.call(&guest, request.clone());
+            assert_eq!(code(&lines), "<success>", "{request} -> {lines:?}");
+        }
+        crate::guest::update_at(&guest.dir, &guest.guest_id, false)
+            .unwrap()
+            .unwrap();
+        for request in &requests {
+            let lines = harness.call(&guest, request.clone());
+            assert_eq!(code(&lines), "guest_forbidden", "{request} -> {lines:?}");
+        }
+    }
+
+    #[test]
+    fn a_guest_fetches_only_visible_files_and_each_open_is_audited() {
+        let _config = ConfigHome::new("gram-files");
+        let harness = start("gram-files");
+        let before = send_file(&harness, "llm-opt", "old.txt");
+        std::thread::sleep(Duration::from_millis(5));
+        let guest = harness.admit_with(0, true);
+        let visible = send_file(&harness, "llm-opt", "notes.txt");
+        let second = send_file(&harness, "llm-opt", "second.txt");
+        let other = send_file(&harness, "other-agent", "other.txt");
+
+        // A download resumed mid-file is still an open.
+        let resumed = harness.call(
+            &guest,
+            json!({"id": "c", "method": "gram.get_file_chunk", "params": {"id": second, "offset": 3}}),
+        );
+        assert_eq!(resumed[0]["result"]["data_base64"], "bG8=", "{resumed:?}");
+
+        let chunk = harness.call(
+            &guest,
+            json!({"id": "c", "method": "gram.get_file_chunk", "params": {"id": visible, "offset": 0}}),
+        );
+        let result = &chunk[0]["result"];
+        assert_eq!(result["type"], "gram_file_chunk", "{chunk:?}");
+        assert_eq!(result["name"], "notes.txt");
+        assert_eq!(result["data_base64"], "aGVsbG8=");
+        let rest = harness.call(
+            &guest,
+            json!({"id": "c", "method": "gram.get_file_chunk", "params": {"id": visible, "offset": 3}}),
+        );
+        assert_eq!(rest[0]["result"]["data_base64"], "bG8=", "{rest:?}");
+        let whole = harness.call(
+            &guest,
+            json!({"id": "f", "method": "gram.get_file", "params": {"id": visible}}),
+        );
+        assert_eq!(whole[0]["result"]["type"], "gram_file_content", "{whole:?}");
+
+        for id in [before.as_str(), other.as_str(), "gram-missing"] {
+            for request in [
+                json!({"id": "f", "method": "gram.get_file", "params": {"id": id}}),
+                json!({"id": "c", "method": "gram.get_file_chunk", "params": {"id": id, "offset": 0}}),
+            ] {
+                let lines = harness.call(&guest, request.clone());
+                assert_eq!(code(&lines), "guest_forbidden", "{request} -> {lines:?}");
+            }
+        }
+        let mut opened: Vec<String> =
+            crate::guest::audit::read(&guest.dir, Some(&guest.guest_id), None, 100)
+                .unwrap()
+                .into_iter()
+                .filter(|entry| entry.event == GuestAuditEvent::GramFile)
+                .map(|entry| entry.file.unwrap().name)
+                .collect();
+        opened.sort();
+        assert_eq!(opened, ["notes.txt", "second.txt"], "one per file opened");
+    }
+
+    #[test]
+    fn guest_read_marks_need_visible_ids_and_never_touch_the_owners() {
+        let _config = ConfigHome::new("gram-read");
+        let harness = start("gram-read");
+        let guest = harness.admit_with(0, true);
+        let first = send_gram(&harness, "llm-opt", "first");
+        let second = send_gram(&harness, "llm-opt", "second");
+        let other = send_gram(&harness, "other-agent", "other");
+
+        let mixed = harness.call(
+            &guest,
+            json!({"id": "m", "method": "gram.mark_read", "params": {"ids": [first, other]}}),
+        );
+        assert_eq!(code(&mixed), "guest_forbidden");
+        let unread = guest_list(&harness, &guest, json!({}));
+        assert_eq!(
+            read_marks(&unread),
+            [(second.clone(), false), (first.clone(), false)]
+        );
+
+        let marked = harness.call(
+            &guest,
+            json!({"id": "m", "method": "gram.mark_read", "params": {"ids": [first]}}),
+        );
+        assert_eq!(marked[0], json!({"id": "m", "result": {"type": "ok"}}));
+        let owner_view = owner(
+            &harness,
+            json!({"id": "l", "method": "gram.list", "params": {}}),
+        );
+        let owner_read = owner_view["result"]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["id"] == first.as_str())
+            .unwrap()["read_by_owner"]
+            .clone();
+        assert_eq!(owner_read, false);
+
+        let owner_marked = owner(
+            &harness,
+            json!({"id": "r", "method": "gram.mark_read", "params": {"id": second}}),
+        );
+        assert_eq!(owner_marked["result"]["type"], "ok", "{owner_marked}");
+        let after = guest_list(&harness, &guest, json!({}));
+        assert_eq!(read_marks(&after), [(second, false), (first, true)]);
+    }
+
+    fn register(token: &str, prefs: Value) -> Value {
+        let mut params =
+            json!({"device_token": token, "platform": "ios", "relay_capability": "hpr1.guest_cap"});
+        for (key, value) in prefs.as_object().unwrap() {
+            params[key] = value.clone();
+        }
+        json!({"id": "n", "method": "notifications.register_device", "params": params})
+    }
+
+    fn guest_devices(guest: &GuestPrincipal) -> Vec<(String, String, bool)> {
+        crate::guest::push::devices(&guest.dir)
+            .unwrap()
+            .into_iter()
+            .map(|registered| {
+                (
+                    registered.guest_id,
+                    registered.device.device_token,
+                    registered.device.notify_needs_input,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_guest_device_registers_under_the_guest_apart_from_the_owners() {
+        let _config = ConfigHome::new("guest-device");
+        let harness = start("guest-device");
+        let guest = harness.admit();
+        let token = "ab".repeat(32);
+        let registered = harness.call(
+            &guest,
+            register(&token, json!({"notify_needs_input": true})),
+        );
+        assert_eq!(registered[0], json!({"id": "n", "result": {"type": "ok"}}));
+        assert_eq!(
+            guest_devices(&guest),
+            [(guest.guest_id.clone(), token.clone(), true)]
+        );
+        harness.call(
+            &guest,
+            register(&token, json!({"notify_needs_input": false})),
+        );
+        assert_eq!(
+            guest_devices(&guest),
+            [(guest.guest_id.clone(), token.clone(), false)]
+        );
+        assert!(crate::persist::devices::load().is_empty());
+
+        let invalid = harness.call(&guest, register("zz", json!({})));
+        assert_eq!(code(&invalid), "invalid_params");
+        let removed = harness.call(
+            &guest,
+            json!({"id": "u", "method": "notifications.unregister_device", "params": {"device_token": token}}),
+        );
+        assert_eq!(removed[0], json!({"id": "u", "result": {"type": "ok"}}));
+        assert!(guest_devices(&guest).is_empty());
+    }
+
+    /// Relay mode without an APNs key, as on a host with only the HerdrUp relay.
+    fn relay_only() -> crate::config::PushConfig {
+        crate::config::PushConfig {
+            mode: crate::config::PushMode::Auto,
+            relay_url: "https://push.example".into(),
+            ..Default::default()
+        }
+    }
+
+    /// Both agents need input and send a Gram from their panes, and the other
+    /// agent sends one more labeled `llm-opt`; every alert the app dispatches.
+    fn both_agents_alert(harness: &Harness) -> Vec<crate::push::PushNotification> {
+        let (done_tx, done_rx) = std_mpsc::channel();
+        let panes = harness.pane_ids.clone();
+        harness
+            .control
+            .send(Box::new(move |app: &mut App| {
+                let capture = crate::push::test_sink::Capture::install();
+                app.state.push_config = relay_only();
+                for index in 0..2 {
+                    let pane_id = app.state.workspaces[index].tabs[0].root_pane;
+                    app.handle_internal_event(crate::events::AppEvent::StateChanged {
+                        pane_id,
+                        runtime_epoch: None,
+                        agent: Some(crate::detect::Agent::Pi),
+                        state: crate::detect::AgentState::Blocked,
+                        visible_blocker: true,
+                        visible_working: false,
+                        process_exited: false,
+                        observed_at: Instant::now(),
+                    });
+                }
+                for (pane, from) in [
+                    (&panes[0], "llm-opt"),
+                    (&panes[1], "other-agent"),
+                    (&panes[1], "llm-opt"),
+                ] {
+                    let request: Request = serde_json::from_value(
+                        json!({"id": "s", "method": "gram.send", "params": {"text": "done", "from": from, "caller_pane_id": pane}}),
+                    )
+                    .unwrap();
+                    app.handle_api_request(request);
+                }
+                let _ = done_tx.send(capture.take().alerts);
+            }))
+            .unwrap();
+        done_rx.recv_timeout(Duration::from_secs(10)).unwrap()
+    }
+
+    /// What the guest's devices would receive: (route, payload) per send.
+    fn guest_sends(
+        guest: &GuestPrincipal,
+        alerts: &[crate::push::PushNotification],
+    ) -> Vec<(&'static str, Value)> {
+        let guests = crate::guest::store::load_store(&guest.dir).unwrap().guests;
+        let devices = crate::guest::push::devices(&guest.dir).unwrap();
+        let plan = crate::guest::push::plan(&relay_only(), alerts, &guests, &devices, "host-1");
+        let payload = |index: usize| serde_json::from_str::<Value>(&plan.payloads[index]).unwrap();
+        plan.direct
+            .iter()
+            .map(|(index, _)| ("direct", payload(*index)))
+            .chain(
+                plan.relayed
+                    .iter()
+                    .map(|(index, _)| ("relay", payload(*index))),
+            )
+            .collect()
+    }
+
+    #[test]
+    fn the_granted_agents_status_and_grams_reach_the_guests_phone_through_the_relay() {
+        let _config = ConfigHome::new("guest-push");
+        let harness = start("guest-push");
+        let guest = harness.admit_with(0, true);
+        let all = json!({"notify_needs_input": true, "notify_finishes": true, "notify_dies": true, "notify_gram": true});
+        let token = "cd".repeat(32);
+        harness.call(&guest, register(&token, all));
+
+        let alerts = both_agents_alert(&harness);
+        let sends = guest_sends(&guest, &alerts);
+        assert_eq!(sends.len(), 2, "{sends:?} from {alerts:?}");
+        let (route, status) = &sends[0];
+        assert_eq!(*route, "relay");
+        assert_eq!(
+            status["herdr_guest"],
+            json!({"host_id": "host-1", "guest_id": guest.guest_id, "kind": "status"})
+        );
+        assert!(status["aps"]["alert"]["title"]
+            .as_str()
+            .unwrap()
+            .starts_with("llm-opt"));
+        assert_eq!(status["aps"]["alert"]["body"], "Jerry's Mac Studio");
+        assert_eq!(keys(status), set(&["aps", "herdr_guest"]));
+        let (route, gram) = &sends[1];
+        assert_eq!(*route, "relay");
+        assert_eq!(gram["herdr_guest"]["kind"], "gram");
+        assert_eq!(gram["aps"]["alert"]["title"], "llm-opt");
+        let gram_id = gram["herdr_guest"]["gram_id"].as_str().unwrap();
+        let listed = guest_list(&harness, &guest, json!({}));
+        assert_eq!(listed["messages"][0]["id"], gram_id);
+
+        // Without Gram sharing the status still arrives, the Gram does not.
+        crate::guest::update_at(&guest.dir, &guest.guest_id, false)
+            .unwrap()
+            .unwrap();
+        let sends = guest_sends(&guest, &alerts);
+        assert_eq!(sends.len(), 1, "{sends:?}");
+        assert_eq!(sends[0].1["herdr_guest"]["kind"], "status");
+
+        // The device's own preferences decide.
+        crate::guest::update_at(&guest.dir, &guest.guest_id, true)
+            .unwrap()
+            .unwrap();
+        harness.call(&guest, register(&token, json!({"notify_finishes": true})));
+        assert!(guest_sends(&guest, &alerts).is_empty());
     }
 }
