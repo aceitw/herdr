@@ -847,6 +847,18 @@ impl App {
         // connecting/disconnecting cannot clear an API lease and vice versa.
         let now = std::time::Instant::now();
         let viewer = crate::app::state::AppState::lease_viewer_key(params.viewer_id.as_deref());
+        // Checked here, on the app loop, so a lease cannot land after the
+        // viewer's last stream closed and outlive it.
+        if params.lock
+            && params.require_stream
+            && !self.state.has_stream_viewer(&terminal_id, &viewer)
+        {
+            return encode_error(
+                id,
+                "guest_no_stream",
+                "open the agent's stream before resizing it",
+            );
+        }
         if params.lock {
             let ttl = params
                 .ttl_ms
@@ -957,21 +969,32 @@ impl App {
         // `pane.set_pty_size`. The viewer's identity (`params.viewer_id`) is
         // carried through to the matching close (see the stream server), which is
         // where the lease liveness tie is honoured by dropping that viewer's lease
-        // (#137).
+        // once its last stream closes (#137).
+        if let Some(viewer_id) = params.viewer_id.as_deref() {
+            if let Some(terminal_id) = self.state.terminal_id_for_pane(ws_idx, pane_id) {
+                self.state
+                    .open_stream_viewer(&params.pane_id, viewer_id, terminal_id);
+            }
+        }
         encode_success(id, ResponseResult::Ok {})
     }
 
     /// Internal close for `pane.stream`: detaches one viewer and, once the last
     /// leaves, unpublishes the ring (which also stops the read hot-path tap).
-    /// When the close carries a `viewer_id` (threaded from the open, #137) it also
-    /// drops that viewer's width lease — the PRIMARY liveness signal — and re-runs
-    /// the arbiter so the pane shrinks (debounced) to the next-widest viewer, or
-    /// the TUI reclaims the layout width once the last lease is gone.
+    /// When the close carries a `viewer_id` (threaded from the open, #137) and
+    /// is that viewer's last open stream on the pane, it also drops the viewer's
+    /// width lease — the PRIMARY liveness signal — and re-runs the arbiter so the
+    /// pane shrinks (debounced) to the next-widest viewer, or the TUI reclaims
+    /// the layout width once the last lease is gone.
     pub(super) fn handle_pane_stream_close(
         &mut self,
         id: String,
         params: PaneStreamParams,
     ) -> String {
+        let last_viewer_stream = params
+            .viewer_id
+            .as_deref()
+            .map(|viewer_id| self.state.close_stream_viewer(&params.pane_id, viewer_id));
         match self.parse_pane_id(&params.pane_id) {
             Some((ws_idx, pane_id)) => {
                 let remaining = self
@@ -983,7 +1006,9 @@ impl App {
                 if remaining.is_none_or(|count| count == 0) {
                     crate::api::output_registry::unregister(&params.pane_id);
                 }
-                if let Some(viewer_id) = params.viewer_id.as_deref() {
+                if let (Some(viewer_id), Some(true)) =
+                    (params.viewer_id.as_deref(), last_viewer_stream)
+                {
                     if let Some(terminal_id) = self.state.terminal_id_for_pane(ws_idx, pane_id) {
                         if self.state.remove_pty_width_lease(&terminal_id, viewer_id) {
                             // A viewer leaving is a lease DROP: the shrink to the
@@ -1000,6 +1025,32 @@ impl App {
                 }
             }
             None => crate::api::output_registry::unregister(&params.pane_id),
+        }
+        encode_success(id, ResponseResult::Ok {})
+    }
+
+    /// Internal: drop one viewer's width lease wherever it holds one, with the
+    /// same debounced shrink as that viewer's `pane.stream` closing.
+    pub(super) fn handle_pane_pty_lease_release(
+        &mut self,
+        id: String,
+        params: crate::api::schema::PanePtyLeaseReleaseParams,
+    ) -> String {
+        let released: std::collections::HashSet<_> = self
+            .state
+            .pty_width_leases
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .filter(|terminal_id| {
+                self.state
+                    .remove_pty_width_lease(terminal_id, &params.viewer_id)
+            })
+            .collect();
+        let now = std::time::Instant::now();
+        for (ws_idx, pane_id, terminal_id) in self.state.pane_locations_for_terminals(&released) {
+            self.reconcile_pty_lease_size(ws_idx, pane_id, &terminal_id, now, false);
         }
         encode_success(id, ResponseResult::Ok {})
     }
@@ -2844,6 +2895,7 @@ mod tests {
             lock,
             viewer_id: viewer_id.map(str::to_string),
             ttl_ms: None,
+            require_stream: false,
         }
     }
 
