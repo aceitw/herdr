@@ -156,6 +156,8 @@ fn serve_guest_with(
         None,
         ConnectionPrincipal::Guest(principal),
         &HashMap::new(),
+        // Guests cannot register SSH agents for the server.
+        None,
     )
 }
 
@@ -3604,6 +3606,7 @@ mod tests {
             None,
             ConnectionPrincipal::Owner,
             &HashMap::new(),
+            None,
         )
         .unwrap();
         let mut line = String::new();

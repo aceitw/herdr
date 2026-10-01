@@ -149,18 +149,12 @@ fn detect_state(status: AgentStatus) -> crate::detect::AgentState {
 
 /// The alert a remote pane's status change calls for, if any; only agent
 /// panes notify.
-fn transition_kind(
-    previous: AgentStatus,
-    previous_agent: Option<&str>,
-    agent: &RemoteAgent,
-) -> Option<PushKind> {
+fn transition_kind(previous: AgentStatus, agent: &RemoteAgent) -> Option<PushKind> {
     agent.agent.as_ref()?;
-    let toast = crate::app::actions::notification_toast_for_state_change_with_agent_labels(
+    let toast = crate::app::actions::notification_toast_for_state_change(
         false,
         detect_state(previous),
         detect_state(agent.status),
-        previous_agent,
-        agent.agent.as_deref(),
     );
     super::push_kind_for(false, toast)
 }
@@ -293,7 +287,7 @@ impl RemotePushTracker {
             let kind = if seeding {
                 None
             } else {
-                transition_kind(AgentStatus::Unknown, None, &agent)
+                transition_kind(AgentStatus::Unknown, &agent)
             };
             if let Some(kind) = kind {
                 transitions.push(RemoteTransition {
@@ -325,7 +319,7 @@ impl RemotePushTracker {
         let kind = if exited {
             None
         } else {
-            transition_kind(seen.status, seen.agent.as_deref(), &agent)
+            transition_kind(seen.status, &agent)
         };
         // A finish that comes with a release waits for a possible exit; the
         // release is spent by the status change it causes.
