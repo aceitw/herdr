@@ -495,8 +495,18 @@ fn capture_tab(
                     })
                 })
             });
+        // A transfer that still owns the source restores the pinned source session
+        // above. A resume command reported by any other agent (the target being
+        // launched) must not outrank it, or a restart would relaunch the target
+        // under the source's account.
         let agent_resume = terminal
             .and_then(|terminal| terminal.reported_resume())
+            .filter(|resume| {
+                guarded_transfer.is_none_or(|transfer| {
+                    resume.source == transfer.source_session.source
+                        && resume.agent == transfer.source_session.agent
+                })
+            })
             .map(|resume| PaneAgentResumeSnapshot {
                 source: resume.source.clone(),
                 agent: resume.agent.clone(),
@@ -1756,41 +1766,7 @@ mod tests {
             std::time::Duration::from_secs(3),
             std::time::Duration::from_secs(30),
         );
-        terminal.session_transfer = Some(crate::session_transfer::RuntimeSessionTransfer {
-            id: "transfer-1".into(),
-            source_kind: crate::session_transfer::HarnessKind::Claude,
-            source_session: crate::agent_resume::PersistedAgentSession {
-                source: "herdr:claude".into(),
-                agent: "claude".into(),
-                session_ref: crate::agent_resume::AgentSessionRef::id("claude-source").unwrap(),
-            },
-            source_account: Some("claude-work".into()),
-            source_config_home: PathBuf::from("/tmp/claude-home"),
-            source_sessions_root: PathBuf::from("/tmp/claude-home"),
-            source_cursor: None,
-            source_process_pid: None,
-            target_kind: crate::session_transfer::HarnessKind::Codex,
-            target_account: Some("codex-work".into()),
-            target_config_home: PathBuf::from("/tmp/codex-home"),
-            target_sessions_root: PathBuf::from("/tmp/codex-home"),
-            phase: crate::api::schema::AgentSessionTransferPhase::AwaitingTarget,
-            message_count: 3,
-            omissions: Default::default(),
-            error: None,
-            source_path: None,
-            source_fingerprint: None,
-            target_session_ref: crate::agent_resume::AgentSessionRef::id("codex-target"),
-            target_cursor: None,
-            target_transcript_path: None,
-            target_fingerprint: None,
-            target_deadline: None,
-            target_process: None,
-            source_rollback_process: None,
-            verification_in_flight: None,
-            verification_observation_deadline: None,
-            awaiting_deferred_target_report: false,
-            target_report_accepted: false,
-        });
+        terminal.session_transfer = Some(claude_to_codex_transfer_awaiting_target());
 
         let guarded = capture_from_state(&state);
         let pane = &guarded.workspaces[0].tabs[0].panes[&root.raw()];
@@ -1870,6 +1846,112 @@ mod tests {
         assert_eq!(session.value, "claude-source");
         assert_eq!(pane.agent_account.as_deref(), Some("claude-work"));
         assert_eq!(pane.agent_name.as_deref(), Some("jarvis"));
+    }
+
+    fn claude_to_codex_transfer_awaiting_target() -> crate::session_transfer::RuntimeSessionTransfer
+    {
+        crate::session_transfer::RuntimeSessionTransfer {
+            id: "transfer-1".into(),
+            source_kind: crate::session_transfer::HarnessKind::Claude,
+            source_session: crate::agent_resume::PersistedAgentSession {
+                source: "herdr:claude".into(),
+                agent: "claude".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id("claude-source").unwrap(),
+            },
+            source_account: Some("claude-work".into()),
+            source_config_home: PathBuf::from("/tmp/claude-home"),
+            source_sessions_root: PathBuf::from("/tmp/claude-home"),
+            source_cursor: None,
+            source_process_pid: None,
+            target_kind: crate::session_transfer::HarnessKind::Codex,
+            target_account: Some("codex-work".into()),
+            target_config_home: PathBuf::from("/tmp/codex-home"),
+            target_sessions_root: PathBuf::from("/tmp/codex-home"),
+            phase: crate::api::schema::AgentSessionTransferPhase::AwaitingTarget,
+            message_count: 3,
+            omissions: Default::default(),
+            error: None,
+            source_path: None,
+            source_fingerprint: None,
+            target_session_ref: crate::agent_resume::AgentSessionRef::id("codex-target"),
+            target_cursor: None,
+            target_transcript_path: None,
+            target_fingerprint: None,
+            target_deadline: None,
+            target_process: None,
+            source_rollback_process: None,
+            verification_in_flight: None,
+            verification_observation_deadline: None,
+            awaiting_deferred_target_report: false,
+            target_report_accepted: false,
+        }
+    }
+
+    /// While a transfer still owns the source, a restart restores the source
+    /// session. A resume command the not-yet-verified target reported must not
+    /// override that: it would relaunch the target under the source's account.
+    #[test]
+    fn guarded_transfer_snapshot_drops_a_target_reported_resume() {
+        let mut state = state_with_workspaces(&["one"]);
+        let root = state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = state.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_hook_authority_with_session_ref(
+            "herdr:codex".into(),
+            "codex".into(),
+            crate::detect::AgentState::Idle,
+            None,
+            Some(crate::agent_resume::AgentSessionRef::id("codex-target").unwrap()),
+            Some(20),
+        );
+        assert!(terminal.record_reported_resume(
+            "herdr:codex",
+            "codex",
+            Some(21),
+            vec!["codex".into(), "resume".into(), "codex-target".into()],
+        ));
+        terminal.session_transfer = Some(claude_to_codex_transfer_awaiting_target());
+
+        let guarded = capture_from_state(&state);
+        let pane = &guarded.workspaces[0].tabs[0].panes[&root.raw()];
+        assert_eq!(pane.agent_session.as_ref().unwrap().agent, "claude");
+        assert!(
+            pane.agent_resume.is_none(),
+            "the target's resume command must not outrank the pinned source session"
+        );
+
+        // The source's own reported resume still names the session being restored.
+        let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.restore_reported_resume(crate::agent_resume::ReportedAgentResume {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            argv: vec!["claude".into(), "--resume".into(), "claude-source".into()],
+        });
+        let guarded = capture_from_state(&state);
+        let resume = guarded.workspaces[0].tabs[0].panes[&root.raw()]
+            .agent_resume
+            .as_ref()
+            .expect("the source's reported resume is kept");
+        assert_eq!(resume.agent, "claude");
+
+        // Once the target is verified the transfer no longer guards the pane.
+        let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+        assert!(terminal.record_reported_resume(
+            "herdr:codex",
+            "codex",
+            Some(22),
+            vec!["codex".into(), "resume".into(), "codex-target".into()],
+        ));
+        terminal.session_transfer.as_mut().unwrap().phase =
+            crate::api::schema::AgentSessionTransferPhase::Completed;
+        let completed = capture_from_state(&state);
+        let resume = completed.workspaces[0].tabs[0].panes[&root.raw()]
+            .agent_resume
+            .as_ref()
+            .expect("a completed transfer keeps the target's reported resume");
+        assert_eq!(resume.agent, "codex");
     }
 
     #[test]
