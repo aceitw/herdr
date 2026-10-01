@@ -39,10 +39,11 @@ try {
         "--seq",
         "$seq",
         "--agent-session-id",
-        "$sessionId",
-        "--agent-session-path",
-        "$($payload.transcript_path)"
+        "$sessionId"
     )
+    if (-not [string]::IsNullOrWhiteSpace($payload.transcript_path)) {
+        $args += @("--agent-session-path", "$($payload.transcript_path)")
+    }
     if ($Action -ne "session") { $args += @("--state", $Action) }
     if ($payload.hook_event_name -eq "SessionStart" -and $payload.source -is [string] -and -not [string]::IsNullOrWhiteSpace($payload.source)) {
         $args += @("--session-start-source", "$($payload.source)")

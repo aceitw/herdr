@@ -57,10 +57,11 @@ request_id = f"{source}:{int(time.time() * 1000)}:{random.randrange(1_000_000):0
 report_seq = time.time_ns()
 session_id = hook_input.get("session_id")
 agent_session_id = session_id if isinstance(session_id, str) and session_id else None
-if action == "session":
-    transcript_path = hook_input.get("transcript_path")
-    if not isinstance(transcript_path, str) or not transcript_path.strip():
+transcript_path = hook_input.get("transcript_path")
+if not isinstance(transcript_path, str) or not transcript_path.strip():
+    if action == "session":
         raise SystemExit(0)
+    transcript_path = None
 inherited_session_id = os.environ.get("CODEX_THREAD_ID")
 if inherited_session_id and inherited_session_id != agent_session_id:
     raise SystemExit(0)
@@ -74,8 +75,9 @@ if agent_session_id:
         "agent": "codex",
         "seq": report_seq,
         "agent_session_id": agent_session_id,
-        "agent_session_path": transcript_path,
     }
+    if transcript_path:
+        params["agent_session_path"] = transcript_path
     if action == "session":
         if session_start_source:
             params["session_start_source"] = session_start_source
