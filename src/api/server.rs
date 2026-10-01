@@ -16,6 +16,7 @@ use std::fs;
 use crate::api::client::{
     parse_response_value, ApiClient, ApiClientError, ProxyError, FEDERATION_STREAM_IDLE_TIMEOUT,
 };
+use crate::api::event_hub::EventHistoryError;
 use crate::api::federation::{
     authorized_peer, federation_access, federation_method_policy, FederationAccess,
     FederationHello, PeerContext, FEDERATION_PROTOCOL_VERSION,
@@ -30,7 +31,7 @@ use crate::api::schema::{
     ErrorBody, ErrorResponse, FederationPollErrorClass, Method, PaneStreamParams, Request,
     ResponseResult, ServerCapabilities, SuccessResponse,
 };
-use crate::api::subscriptions::ActiveSubscription;
+use crate::api::subscriptions::{history_error, ActiveSubscription};
 use crate::api::wait::{prompt_agent, wait_for_agent, wait_for_event, wait_for_output};
 use crate::api::{
     request_changes_ui, socket_path, ApiRequestMessage, ApiRequestSender, ApiStream, ApiStreamRead,
@@ -50,10 +51,11 @@ mod guest_gate;
 mod guest_owner;
 #[cfg(unix)]
 pub(crate) use guest_gate::serve_guest_stream;
-mod pane_graphics_stream;
 mod pane_input_stream;
 mod pane_output_stream;
 mod stream_read;
+#[cfg(test)]
+mod subscription_socket_tests;
 
 /// The single-writer claim on a gram `upload_id`, held by every writer:
 /// `gram.upload.stream` for a channel's lifetime, `gram.upload_chunk` for one
@@ -108,6 +110,7 @@ const FEDERATION_PROXY_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 /// (it is closed) rather than driving unbounded allocation — an OOM — on the home.
 /// The idle-timeout companion is [`FEDERATION_STREAM_IDLE_TIMEOUT`].
 pub(super) const FEDERATION_MAX_STREAM_FRAME_BYTES: usize = FEDERATION_MAX_RESPONSE_BYTES;
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 
 pub struct ServerHandle {
     _thread: JoinHandle<()>,
@@ -200,13 +203,14 @@ pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
             crate::api::schema::AgentSessionTransferHarness::Omp,
         ],
         events_v2: true,
+        ssh_agent_registration: false,
     })
 }
 
 fn start_server_inner(
     api_tx: ApiRequestSender,
     event_hub: EventHub,
-    capabilities: Option<ServerCapabilities>,
+    mut capabilities: Option<ServerCapabilities>,
     server_stop: Option<Arc<AtomicBool>>,
     federation: &FederationConfig,
     federation_store: Arc<Mutex<FederationStore>>,
@@ -218,6 +222,31 @@ fn start_server_inner(
     restrict_socket_permissions(&path)?;
     let identity = socket_file_identity(&path)?;
     info!(path = %path.display(), "api server listening");
+
+    #[cfg(unix)]
+    let ssh_agents = match crate::platform::ssh_agent::SshAgentRegistry::new(
+        crate::platform::ssh_agent::socket_path(),
+        std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from),
+    ) {
+        Ok(registry) => Some(registry),
+        Err(error) => {
+            warn!(%error, "SSH agent refresh unavailable; retaining inherited pane environment");
+            None
+        }
+    };
+
+    if let Some(capabilities) = capabilities.as_mut() {
+        capabilities.ssh_agent_registration = {
+            #[cfg(unix)]
+            {
+                ssh_agents.is_some()
+            }
+            #[cfg(not(unix))]
+            {
+                false
+            }
+        };
+    }
 
     let running = Arc::new(AtomicBool::new(true));
 
@@ -245,42 +274,43 @@ fn start_server_inner(
     let listener_server_stop = server_stop.clone();
     let listener_federation_manager = Arc::clone(&federation_manager);
     let thread = std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            match stream {
-                Ok(stream) => {
-                    let api_tx = listener_api_tx.clone();
-                    let event_hub = listener_event_hub.clone();
-                    let capabilities = listener_capabilities.clone();
-                    let server_stop = listener_server_stop.clone();
-                    let connection_running = Arc::clone(&listener_running);
-                    let federation_manager = Arc::clone(&listener_federation_manager);
-                    std::thread::spawn(move || {
-                        // Snapshot the outbound proxy registry per connection so a
-                        // concurrent reconcile (add/remove/change peer) is picked
-                        // up without restarting the accept loop.
-                        let federation_peers = federation_manager.registry_snapshot();
-                        if let Err(err) = handle_connection_with_stop(
-                            ApiStream::Local(stream),
-                            &api_tx,
-                            &event_hub,
-                            &connection_running,
-                            capabilities,
-                            server_stop.as_ref(),
-                            // Local unix-socket connections are never federation
-                            // peers, so they bypass the capability-tier gate.
-                            None,
-                            &federation_peers,
-                        ) {
-                            warn!(err = %err, "api connection failed");
-                        }
-                    });
-                }
-                Err(err) => {
-                    error!(err = %err, "api listener accept failed");
-                    break;
-                }
-            }
-        }
+        run_accept_loop(
+            listener.incoming(),
+            &listener_running,
+            ACCEPT_ERROR_BACKOFF,
+            |stream| {
+                let api_tx = listener_api_tx.clone();
+                let event_hub = listener_event_hub.clone();
+                let capabilities = listener_capabilities.clone();
+                let server_stop = listener_server_stop.clone();
+                let connection_running = Arc::clone(&listener_running);
+                let federation_manager = Arc::clone(&listener_federation_manager);
+                #[cfg(unix)]
+                let ssh_agents = ssh_agents.clone();
+                std::thread::spawn(move || {
+                    // Snapshot the outbound proxy registry per connection so a
+                    // concurrent reconcile (add/remove/change peer) is picked
+                    // up without restarting the accept loop.
+                    let federation_peers = federation_manager.registry_snapshot();
+                    if let Err(err) = handle_connection_with_stop(
+                        ApiStream::Local(stream),
+                        &api_tx,
+                        &event_hub,
+                        &connection_running,
+                        capabilities,
+                        server_stop.as_ref(),
+                        // Local unix-socket connections are never federation
+                        // peers, so they bypass the capability-tier gate.
+                        None,
+                        &federation_peers,
+                        #[cfg(unix)]
+                        ssh_agents.as_ref(),
+                    ) {
+                        warn!(err = %err, "api connection failed");
+                    }
+                });
+            },
+        );
         debug!("api server thread exiting");
     });
 
@@ -1163,6 +1193,10 @@ fn handle_federation_connection(
         server_stop,
         Some(peer),
         &no_outbound_routing,
+        // Federation peers may not register SSH agents (`server.ssh_agent.register`
+        // is denied in the audit table), so inbound connections get no registry.
+        #[cfg(unix)]
+        None,
     )
 }
 
@@ -1214,6 +1248,107 @@ fn federation_identity_unverified_error(id: String, alias: &str) -> ErrorRespons
     }
 }
 
+fn run_accept_loop<S>(
+    incoming: impl IntoIterator<Item = io::Result<S>>,
+    running: &AtomicBool,
+    error_backoff: Duration,
+    mut handle: impl FnMut(S),
+) {
+    let mut consecutive_errors = 0_u64;
+    for stream in incoming {
+        match stream {
+            Ok(stream) => {
+                if consecutive_errors > 0 {
+                    info!(consecutive_errors, "api listener accept recovered");
+                    consecutive_errors = 0;
+                }
+                handle(stream);
+            }
+            Err(err) => {
+                if !running.load(Ordering::Relaxed) {
+                    break;
+                }
+                // Accept errors such as ECONNABORTED or EMFILE are transient;
+                // exiting would leave the socket file with no listener.
+                if consecutive_errors == 0 {
+                    error!(err = %err, "api listener accept failed; retrying");
+                }
+                consecutive_errors = consecutive_errors.saturating_add(1);
+                std::thread::sleep(error_backoff);
+                if !running.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod accept_loop_tests {
+    use super::*;
+
+    fn accept_error() -> io::Result<u32> {
+        Err(io::Error::other("transient accept failure"))
+    }
+
+    #[test]
+    fn keeps_serving_after_repeated_errors() {
+        let running = AtomicBool::new(true);
+        let mut handled = Vec::new();
+
+        run_accept_loop(
+            [Ok(1), accept_error(), accept_error(), Ok(2)],
+            &running,
+            Duration::ZERO,
+            |stream| handled.push(stream),
+        );
+
+        assert_eq!(handled, vec![1, 2]);
+    }
+
+    #[test]
+    fn exits_when_shutdown_happens_while_errors_continue() {
+        let running = AtomicBool::new(true);
+        let mut attempts = 0;
+        let incoming = std::iter::from_fn(|| {
+            attempts += 1;
+            if attempts == 3 {
+                running.store(false, Ordering::Relaxed);
+            }
+            Some(accept_error())
+        });
+
+        run_accept_loop(incoming, &running, Duration::ZERO, |_| {
+            panic!("no connection should be handled")
+        });
+
+        assert_eq!(attempts, 3);
+    }
+}
+
+fn retired_pane_graphics_method_error(line: &str, id: &str) -> Option<ErrorResponse> {
+    #[derive(serde::Deserialize)]
+    struct RequestMethod {
+        method: String,
+    }
+
+    let envelope = serde_json::from_str::<RequestMethod>(line).ok()?;
+    let method = envelope.method.as_str();
+    if !matches!(
+        method,
+        "pane.graphics.info" | "pane.graphics.set" | "pane.graphics.clear" | "pane.graphics.stream"
+    ) {
+        return None;
+    }
+
+    Some(ErrorResponse {
+        id: id.into(),
+        error: ErrorBody {
+            code: "unknown_method".into(),
+            message: format!("unknown method: {method}"),
+        },
+    })
+}
 fn prepare_socket_path(path: &Path) -> std::io::Result<()> {
     crate::ipc::prepare_socket_path(path, |path| {
         format!(
@@ -1244,6 +1379,8 @@ fn handle_connection(
         None,
         None,
         &HashMap::new(),
+        #[cfg(unix)]
+        None,
     )
 }
 
@@ -1271,6 +1408,7 @@ fn handle_connection_with_stop(
     server_stop: Option<&Arc<AtomicBool>>,
     federation: Option<PeerContext>,
     federation_peers: &HashMap<String, PeerRoute>,
+    #[cfg(unix)] ssh_agents: Option<&crate::platform::ssh_agent::SshAgentRegistry>,
 ) -> std::io::Result<()> {
     let principal = match federation {
         Some(peer) => ConnectionPrincipal::Federation(peer),
@@ -1285,6 +1423,8 @@ fn handle_connection_with_stop(
         server_stop,
         principal,
         federation_peers,
+        #[cfg(unix)]
+        ssh_agents,
     )
 }
 
@@ -1298,6 +1438,7 @@ fn handle_principal_connection(
     server_stop: Option<&Arc<AtomicBool>>,
     principal: ConnectionPrincipal,
     federation_peers: &HashMap<String, PeerRoute>,
+    #[cfg(unix)] ssh_agents: Option<&crate::platform::ssh_agent::SshAgentRegistry>,
 ) -> std::io::Result<()> {
     if let Err(err) = stream.set_send_timeout(Some(STREAM_WRITE_TIMEOUT)) {
         debug!(err = %err, "api connection write timeout unavailable");
@@ -1328,16 +1469,15 @@ fn handle_principal_connection(
             } else {
                 String::new()
             };
-            write_json_line_allow_disconnect(
-                &mut stream,
-                &ErrorResponse {
+            let response =
+                retired_pane_graphics_method_error(line, &id).unwrap_or_else(|| ErrorResponse {
                     id,
                     error: ErrorBody {
                         code: "invalid_request".into(),
                         message: format!("invalid request: {request_error}"),
                     },
-                },
-            )?;
+                });
+            write_json_line_allow_disconnect(&mut stream, &response)?;
             return Ok(());
         }
     };
@@ -1440,21 +1580,48 @@ fn handle_principal_connection(
     }
 
     match request.method {
-        Method::PaneGraphicsStream(params) => {
-            let result =
-                pane_graphics_stream::serve(stream, request_id.clone(), params, api_tx, running);
-            match &result {
-                Ok(()) => crate::logging::api_request_completed(
-                    &request_id,
-                    method,
-                    "stream_closed",
-                    changes_ui,
-                ),
-                Err(err) => {
-                    crate::logging::api_request_failed(&request_id, method, &err.to_string())
+        #[cfg(unix)]
+        Method::ServerSshAgentRegister(params) => {
+            let lease = ssh_agents
+                .ok_or_else(|| io::Error::other("SSH agent registration is unavailable"))
+                .and_then(|registry| registry.register(PathBuf::from(params.socket_path)));
+            let lease = match lease {
+                Ok(lease) => lease,
+                Err(error) => {
+                    return write_text_line_allow_disconnect(
+                        &mut stream,
+                        &error_response_json(
+                            request_id,
+                            if error.kind() == io::ErrorKind::InvalidInput {
+                                "invalid_ssh_agent"
+                            } else {
+                                "ssh_agent_unavailable"
+                            },
+                            error.to_string(),
+                        ),
+                    )
+                }
+            };
+            write_json_line(
+                &mut stream,
+                &SuccessResponse {
+                    id: request_id,
+                    result: ResponseResult::Ok {},
+                },
+            )?;
+            stream.set_polling(true)?;
+            let mut byte = [0];
+            while running.load(Ordering::Relaxed) {
+                match stream.poll_read(&mut byte)? {
+                    ApiStreamRead::Pending => {
+                        // SSH can unlink an inherited socket after its bridge's lease closes.
+                        lease.refresh()?;
+                        std::thread::sleep(CONNECTION_POLL_INTERVAL);
+                    }
+                    _ => break,
                 }
             }
-            result
+            Ok(())
         }
         Method::PaneStream(mut params) => {
             // W5: a `pane.stream` whose target is `<alias>/<remote-pane-id>` names a
@@ -2176,7 +2343,7 @@ fn handle_request(
         );
     }
 
-    dispatch_to_app(request, api_tx, None, response_write_complete, None, None)
+    dispatch_to_app(request, api_tx, None, response_write_complete, None)
 }
 
 pub(crate) fn api_method_name(method: &Method) -> &'static str {
@@ -2188,6 +2355,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::ServerReloadConfig(_) => "server.reload_config",
         Method::ServerStagedUpdate(_) => "server.staged_update",
         Method::ServerApplyStagedUpdate(_) => "server.apply_staged_update",
+        Method::ServerSshAgentRegister(_) => "server.ssh_agent.register",
         Method::ServerAgentManifests(_) => "server.agent_manifests",
         Method::ServerReloadAgentManifests(_) => "server.reload_agent_manifests",
         Method::NotificationShow(_) => "notification.show",
@@ -2276,6 +2444,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::PaneFocusDirection(_) => "pane.focus_direction",
         Method::PaneResize(_) => "pane.resize",
         Method::PaneScroll(_) => "pane.scroll",
+        Method::PaneClear(_) => "pane.clear",
         Method::PaneEditScrollback(_) => "pane.edit_scrollback",
         Method::PaneSelectionRead(_) => "pane.selection.read",
         Method::PaneCopyMotion(_) => "pane.copy_motion",
@@ -2294,14 +2463,6 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::PaneSendKeys(_) => "pane.send_keys",
         Method::PaneSendInput(_) => "pane.send_input",
         Method::PaneRead(_) => "pane.read",
-        Method::PaneGraphicsSet(_) => "pane.graphics.set",
-        Method::PaneGraphicsClear(_) => "pane.graphics.clear",
-        Method::PaneGraphicsInfo(_) => "pane.graphics.info",
-        Method::PaneGraphicsStream(_) => "pane.graphics.stream",
-        Method::PaneGraphicsStreamSet(_) => "pane.graphics.stream.set",
-        Method::PaneGraphicsStreamDirect(_) => "pane.graphics.stream.direct",
-        Method::PaneGraphicsStreamOpen(_) => "pane.graphics.stream.open",
-        Method::PaneGraphicsStreamClose(_) => "pane.graphics.stream.close",
         Method::PaneStream(_) => "pane.stream",
         Method::PaneStreamOpen(_) => "pane.stream.open",
         Method::PaneStreamClose(_) => "pane.stream.close",
@@ -2610,7 +2771,7 @@ fn stream_subscriptions_with_heartbeat(
     if !write_subscription_line(
         &mut stream,
         &SuccessResponse {
-            id: request_id,
+            id: request_id.clone(),
             result: ResponseResult::SubscriptionStarted { rejected },
         },
     )? {
@@ -2625,11 +2786,30 @@ fn stream_subscriptions_with_heartbeat(
             return Ok(());
         }
 
-        let batch = if local_only {
-            event_hub.read_local_after(cursor)
-        } else {
-            event_hub.read_after(cursor)
+        let batch = match event_hub.read_checked(cursor, !local_only) {
+            Ok(batch) => batch,
+            Err(error) => {
+                return write_json_line_allow_disconnect(
+                    &mut stream,
+                    &ErrorResponse {
+                        id: request_id,
+                        error: history_error(error),
+                    },
+                );
+            }
         };
+        // A legacy reader that fell behind retained history gets `events_lost`
+        // and the stream closes before it sees a partial stream; an `events_v2`
+        // reader gets a `lagged` line below and continues.
+        if batch.missed.is_some() && !events_v2 {
+            return write_json_line_allow_disconnect(
+                &mut stream,
+                &ErrorResponse {
+                    id: request_id,
+                    error: history_error(EventHistoryError::Lost),
+                },
+            );
+        }
         cursor = batch.head;
         for (index, subscription) in subscriptions.iter_mut().enumerate() {
             lines.extend(
@@ -2644,7 +2824,7 @@ fn stream_subscriptions_with_heartbeat(
         lines.sort_by_key(|(index, line)| (line.seq, line.derived, *index));
 
         let mut wrote = false;
-        if let Some(missed) = batch.missed.filter(|_| events_v2) {
+        if let Some(missed) = batch.missed {
             let lagged = crate::api::schema::SubscriptionControlLine::Lagged {
                 seq: missed.last,
                 first_missed_seq: missed.first,
@@ -2734,7 +2914,7 @@ pub(super) fn dispatch_to_app_with_timeout(
     api_tx: &ApiRequestSender,
     timeout: Option<Duration>,
 ) -> String {
-    dispatch_to_app(request, api_tx, timeout, None, None, None)
+    dispatch_to_app(request, api_tx, timeout, None, None)
 }
 
 pub(super) fn dispatch_to_app_with_caller_timeout(
@@ -2747,32 +2927,7 @@ pub(super) fn dispatch_to_app_with_caller_timeout(
         api_tx,
         timeout,
         None,
-        None,
         Some(("timeout", "timed out waiting for agent status")),
-    )
-}
-
-pub(super) fn dispatch_stream_open(
-    request: Request,
-    api_tx: &ApiRequestSender,
-    timeout: Duration,
-    active: Arc<AtomicBool>,
-) -> String {
-    dispatch_to_app(request, api_tx, Some(timeout), None, Some(active), None)
-}
-
-pub(super) fn dispatch_stream_frame(
-    request: Request,
-    api_tx: &ApiRequestSender,
-    active: Arc<AtomicBool>,
-) -> String {
-    dispatch_to_app(
-        request,
-        api_tx,
-        Some(crate::app::pane_graphics::DIRECT_OUTER_TIMEOUT),
-        None,
-        Some(active),
-        None,
     )
 }
 
@@ -2781,21 +2936,15 @@ fn dispatch_to_app(
     api_tx: &ApiRequestSender,
     timeout: Option<Duration>,
     response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
-    stream_active: Option<Arc<AtomicBool>>,
     timeout_response: Option<(&str, &str)>,
 ) -> String {
     let request_id = request.id.clone();
-    let request_active = stream_active.clone();
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     if let Err(err) = api_tx.send(ApiRequestMessage {
         request,
         respond_to,
         response_write_complete,
-        stream_active,
     }) {
-        if let Some(active) = request_active {
-            active.store(false, Ordering::Release);
-        }
         return error_response_json(
             request_id,
             "server_unavailable",
@@ -2825,9 +2974,6 @@ fn dispatch_to_app(
     match response {
         Ok(response) => response,
         Err(err) => {
-            if let Some(active) = request_active {
-                active.store(false, Ordering::Release);
-            }
             if err.kind() == std::io::ErrorKind::TimedOut {
                 if let Some((code, message)) = timeout_response {
                     return error_response_json(request_id, code, message.into());
@@ -2915,6 +3061,53 @@ mod tests {
         (client, server, path)
     }
 
+    #[test]
+    fn ssh_agent_registration_lasts_only_for_the_api_connection() {
+        let directory = unique_test_path("agent-lease");
+        fs::create_dir(&directory).unwrap();
+        let agent = directory.join("upstream");
+        let _agent = UnixListener::bind(&agent).unwrap();
+        let stable = directory.join("stable");
+        let registry =
+            crate::platform::ssh_agent::SshAgentRegistry::new(stable.clone(), None).unwrap();
+        let (mut client, server, api_path) = local_stream_pair("agent-api");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let worker_registry = registry.clone();
+        let worker = std::thread::spawn(move || {
+            handle_connection_with_stop(
+                ApiStream::Local(server),
+                &tx,
+                &EventHub::default(),
+                &Arc::new(AtomicBool::new(true)),
+                None,
+                None,
+                None,
+                &HashMap::new(),
+                Some(&worker_registry),
+            )
+            .unwrap();
+        });
+        let request = serde_json::to_string(&Request {
+            id: "agent-lease".into(),
+            method: Method::ServerSshAgentRegister(
+                crate::api::schema::ServerSshAgentRegisterParams {
+                    socket_path: agent.to_string_lossy().into_owned(),
+                },
+            ),
+        })
+        .unwrap();
+        std::io::Write::write_all(&mut client, format!("{request}\n").as_bytes()).unwrap();
+        let response: SuccessResponse = serde_json::from_str(&read_line(&mut client)).unwrap();
+        assert!(matches!(response.result, ResponseResult::Ok {}));
+        assert_eq!(fs::read_link(&stable).unwrap(), agent);
+        drop(client);
+        worker.join().unwrap();
+        assert!(!stable.exists());
+        drop(registry);
+        fs::remove_file(api_path).unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     fn pane_info(
         pane_id: &str,
         agent_status: crate::api::schema::AgentStatus,
@@ -2927,6 +3120,7 @@ mod tests {
             focused: true,
             cwd: None,
             foreground_cwd: None,
+            restore_error: None,
             label: None,
             agent: Some("pi".into()),
             title: None,
@@ -3065,6 +3259,93 @@ mod tests {
     }
 
     #[test]
+    fn removed_pane_graphics_methods_return_unknown_method_without_stream_upgrade() {
+        for method in [
+            "pane.graphics.info",
+            "pane.graphics.set",
+            "pane.graphics.clear",
+            "pane.graphics.stream",
+        ] {
+            let (mut client, server, _path) = local_stream_pair("removed-pane-graphics");
+            let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+            writeln!(
+                client,
+                "{{\"id\":\"removed\",\"method\":\"{method}\",\"params\":{{}}}}"
+            )
+            .unwrap();
+            client.flush().unwrap();
+
+            handle_connection(
+                server,
+                &api_tx,
+                &EventHub::default(),
+                &Arc::new(AtomicBool::new(true)),
+                None,
+            )
+            .unwrap();
+
+            let response = read_line(&mut client);
+            let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(response["id"], "removed", "{method}");
+            assert_eq!(response["error"]["code"], "unknown_method", "{method}");
+            assert!(response["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(method)));
+            assert!(response.get("result").is_none(), "{method}");
+            assert!(api_rx.try_recv().is_err(), "{method} reached the app");
+        }
+    }
+
+    #[test]
+    fn unrelated_unknown_method_retains_standard_invalid_request_response() {
+        let (mut client, server, _path) = local_stream_pair("unknown-api-request");
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        client
+            .write_all(b"{\"id\":\"unknown\",\"method\":\"nope\",\"params\":{}}\n")
+            .unwrap();
+        client.flush().unwrap();
+
+        handle_connection(
+            server,
+            &api_tx,
+            &EventHub::default(),
+            &Arc::new(AtomicBool::new(true)),
+            None,
+        )
+        .unwrap();
+
+        let response = read_line(&mut client);
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["id"], "unknown");
+        assert_eq!(response["error"]["code"], "invalid_request");
+        assert!(api_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn ordinary_api_request_still_uses_normal_connection_path() {
+        let (mut client, server, _path) = local_stream_pair("ordinary-api-request");
+        let (api_tx, _api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        client
+            .write_all(b"{\"id\":\"ordinary\",\"method\":\"ping\",\"params\":{}}\n")
+            .unwrap();
+        client.flush().unwrap();
+
+        handle_connection(
+            server,
+            &api_tx,
+            &EventHub::default(),
+            &Arc::new(AtomicBool::new(true)),
+            None,
+        )
+        .unwrap();
+
+        let response = read_line(&mut client);
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["id"], "ordinary");
+        assert_eq!(response["result"]["type"], "pong");
+    }
+
+    #[test]
     fn ping_request_returns_pong() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let response = handle_request(
@@ -3090,6 +3371,7 @@ mod tests {
                     crate::api::schema::AgentSessionTransferHarness::Omp,
                 ],
                 events_v2: false,
+                ssh_agent_registration: false,
             }),
             None,
             None,
@@ -3526,6 +3808,14 @@ mod tests {
                 .expect("subscription line")
         }
 
+        /// The server closed the stream with no further line.
+        fn closed(&self) -> bool {
+            matches!(
+                self.lines.recv_timeout(Duration::from_secs(5)),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+            )
+        }
+
         fn stop(self) {
             self.running.store(false, Ordering::Relaxed);
             self.server.join().unwrap();
@@ -3709,9 +3999,11 @@ mod tests {
         stream.stop();
     }
 
+    const RING_OVERFLOW_EVENTS: usize = 5_000;
+
     /// Stalls the stream inside a `pane.get` while the ring overflows, then
-    /// returns the first line after the stall and the line after one more event.
-    fn lines_after_ring_overflow(events_v2: bool) -> Vec<serde_json::Value> {
+    /// releases it with the subscriber's cursor already evicted from history.
+    fn stream_after_ring_overflow(events_v2: bool) -> (SubscriptionStreamHarness, EventHub) {
         let (api_tx, blocked, release) = spawn_gated_pane_responder();
         let event_hub = EventHub::default();
         let stream = SubscriptionStreamHarness::start(
@@ -3736,26 +4028,25 @@ mod tests {
             serde_json::json!({"id": "sub", "result": {"type": "subscription_started"}})
         );
         blocked.recv_timeout(Duration::from_secs(5)).unwrap();
-        const PUSHED: usize = 5_000;
-        for index in 0..PUSHED {
+        for index in 0..RING_OVERFLOW_EVENTS {
             event_hub.push(focused_event(&index.to_string()));
         }
         release.send(()).unwrap();
+        (stream, event_hub)
+    }
 
+    #[test]
+    fn lagged_v2_subscription_reports_missed_range_then_continues() {
+        let (stream, event_hub) = stream_after_ring_overflow(true);
         let mut lines = vec![stream.next()];
-        while lines.last().unwrap()["seq"] != PUSHED as u64 {
+        while lines.last().unwrap()["seq"] != RING_OVERFLOW_EVENTS as u64 {
             lines.push(stream.next());
         }
         event_hub.push(focused_event("after"));
         lines.push(stream.next());
         stream.stop();
-        lines
-    }
 
-    #[test]
-    fn lagged_v2_subscription_reports_missed_range_then_continues() {
-        let lines = lines_after_ring_overflow(true);
-        let first_retained = 5_000 - EventHub::MAX_EVENTS as u64 + 1;
+        let first_retained = (RING_OVERFLOW_EVENTS - EventHub::MAX_EVENTS) as u64 + 1;
         assert_eq!(
             lines[0],
             serde_json::json!({
@@ -3775,14 +4066,16 @@ mod tests {
     }
 
     #[test]
-    fn lagged_legacy_subscription_writes_no_control_line() {
-        let lines = lines_after_ring_overflow(false);
-        let first_retained = 5_000 - EventHub::MAX_EVENTS as u64 + 1;
-        assert_eq!(lines.len(), EventHub::MAX_EVENTS + 1);
-        assert!(lines
-            .iter()
-            .zip(first_retained..)
-            .all(|(line, seq)| line["seq"] == seq && line["event"] == "workspace_focused"));
+    fn lagged_legacy_subscription_reports_events_lost_and_closes() {
+        let (stream, _event_hub) = stream_after_ring_overflow(false);
+        let line = stream.next();
+        assert_eq!(line["id"], "sub", "{line}");
+        assert_eq!(line["error"]["code"], "events_lost", "{line}");
+        assert!(
+            stream.closed(),
+            "a legacy subscriber must not see a partial stream after events_lost"
+        );
+        stream.stop();
     }
 
     #[test]
@@ -3950,6 +4243,8 @@ mod tests {
                 // Local path: no federation peer, so no capability filtering.
                 None,
                 &HashMap::new(),
+                #[cfg(unix)]
+                None,
             );
         });
 
@@ -3973,42 +4268,6 @@ mod tests {
         drop(message);
         let _ = handle.join();
         let _ = std::fs::remove_file(path);
-    }
-}
-
-#[cfg(test)]
-mod pane_graphics_request_tests {
-    use super::*;
-    use base64::Engine as _;
-
-    #[test]
-    fn maximum_public_graphics_request_fits_initial_json_line() {
-        let request = Request {
-            id: "graphics-max".into(),
-            method: Method::PaneGraphicsSet(crate::api::schema::PaneGraphicsSetParams {
-                pane_id: "pane_1".into(),
-                layer_id: None,
-                z_index: 0,
-                owner: String::new(),
-                format: crate::api::schema::PaneGraphicsFormat::Png,
-                image_width: 1,
-                image_height: 1,
-                data_base64: base64::engine::general_purpose::STANDARD
-                    .encode(vec![1_u8; crate::api::schema::PANE_GRAPHICS_SET_MAX_BYTES]),
-                data: None,
-                placement: crate::api::schema::PaneGraphicsPlacementParams::default(),
-            }),
-        };
-        let encoded = serde_json::to_vec(&request).unwrap();
-
-        assert!(encoded.len() < MAX_INITIAL_REQUEST_BYTES);
-    }
-
-    #[test]
-    fn duplicate_method_cannot_be_reinterpreted_as_graphics_stream() {
-        let encoded = r#"{"id":"duplicate","method":"ping","method":"pane.graphics.stream","params":{"pane_id":"pane_1"}}"#;
-
-        assert!(serde_json::from_str::<Request>(encoded).is_err());
     }
 }
 
@@ -4404,6 +4663,7 @@ mod federation_tests {
             ("server.apply_staged_update", Denied),
             ("server.agent_manifests", Denied),
             ("server.reload_agent_manifests", Denied),
+            ("server.ssh_agent.register", Denied),
             ("notification.show", Denied),
             ("notifications.register_device", Denied),
             ("notifications.unregister_device", Denied),
@@ -4505,14 +4765,7 @@ mod federation_tests {
             ("pane.send_keys", AllowedAt(Interact)),
             ("pane.send_input", AllowedAt(Admin)),
             ("pane.read", AllowedAt(Observe)),
-            ("pane.graphics.set", Denied),
-            ("pane.graphics.clear", Denied),
-            ("pane.graphics.info", AllowedAt(Observe)),
-            ("pane.graphics.stream", Denied),
-            ("pane.graphics.stream.set", Denied),
-            ("pane.graphics.stream.direct", Denied),
-            ("pane.graphics.stream.open", Denied),
-            ("pane.graphics.stream.close", Denied),
+            ("pane.clear", Denied),
             ("pane.stream", AllowedAt(Observe)),
             ("pane.stream.open", Denied),
             ("pane.stream.close", Denied),
@@ -6764,6 +7017,8 @@ mod federation_tests {
                 None,
                 None,
                 &registry,
+                #[cfg(unix)]
+                None,
             );
         });
         HomeConn {

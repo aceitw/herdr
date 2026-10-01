@@ -385,6 +385,9 @@ pub struct AgentInfo {
     /// state restarts). The app derives a compact "5m/2h/3d" badge from `now - this` (#173).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_since_unix_ms: Option<u64>,
+    /// The current idle transition completed work, independently of who has viewed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_seq: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

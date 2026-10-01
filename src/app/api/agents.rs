@@ -3544,6 +3544,7 @@ mod tests {
                 ),
                 agent_session_cursor: None,
                 agent_process_pid: None,
+                resume_argv: None,
                 session_start_source: Some("resume".into()),
             },
         );
@@ -3586,6 +3587,7 @@ mod tests {
                 agent_session_path: None,
                 agent_session_cursor: None,
                 agent_process_pid: None,
+                resume_argv: None,
                 session_start_source: Some("resume".into()),
             },
         );
