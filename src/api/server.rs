@@ -204,6 +204,7 @@ pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
         ],
         events_v2: true,
         ssh_agent_registration: false,
+        agent_forget: true,
     })
 }
 
@@ -2417,6 +2418,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::AgentRename(_) => "agent.rename",
         Method::AgentArchive(_) => "agent.archive",
         Method::AgentUnarchive(_) => "agent.unarchive",
+        Method::AgentForget(_) => "agent.forget",
         Method::AgentViewSet(_) => "agent.view.set",
         Method::AgentViewClear(_) => "agent.view.clear",
         Method::AgentFocus(_) => "agent.focus",
@@ -3372,6 +3374,7 @@ mod tests {
                 ],
                 events_v2: false,
                 ssh_agent_registration: false,
+                agent_forget: false,
             }),
             None,
             None,
@@ -4720,6 +4723,7 @@ mod federation_tests {
             ("agent.rename", AllowedAt(Admin)),
             ("agent.archive", Denied),
             ("agent.unarchive", Denied),
+            ("agent.forget", Denied),
             ("agent.view.set", AllowedAt(Admin)),
             ("agent.view.clear", AllowedAt(Admin)),
             ("agent.focus", AllowedAt(Admin)),
