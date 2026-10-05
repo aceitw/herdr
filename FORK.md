@@ -9,7 +9,7 @@ still applies unless this file says otherwise.
 The installer in this repository uses the fork release manifest:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/aceitw/herdr/master/website/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/aceitw/herdr/master/distribution/install.sh | sh
 ```
 
 Fork binaries and release notes are available from the

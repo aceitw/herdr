@@ -10,10 +10,36 @@ use crate::popup_size::PopupSize;
 
 pub type KeyCombo = (KeyCode, KeyModifiers);
 
+/// Built-in prefix used when `keys.prefix` is unset or invalid.
+pub(crate) const DEFAULT_PREFIX: KeyCombo = (KeyCode::Char('b'), KeyModifiers::CONTROL);
+
 #[derive(Debug, Clone)]
 pub struct LiveKeybindConfig {
-    pub prefix: KeyCombo,
+    /// Every configured prefix key. The first entry is the primary prefix used
+    /// for compact display; all entries enter prefix mode.
+    pub prefix: Vec<KeyCombo>,
     pub keybinds: Keybinds,
+}
+
+impl LiveKeybindConfig {
+    /// Whether `key` is one of the configured prefix keys.
+    pub fn matches_prefix(&self, key: &TerminalKey) -> bool {
+        self.prefix
+            .iter()
+            .any(|combo| terminal_key_matches_combo(key, *combo))
+    }
+
+    /// Primary prefix combo, used for the compact status bar.
+    pub fn primary_prefix(&self) -> Option<KeyCombo> {
+        self.prefix.first().copied()
+    }
+
+    /// Primary prefix rendered for the compact status bar.
+    pub fn primary_prefix_label(&self) -> String {
+        self.primary_prefix()
+            .map(format_key_combo)
+            .unwrap_or_else(|| format_key_combo(DEFAULT_PREFIX))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -42,6 +68,13 @@ impl BindingConfig {
         match self {
             Self::One(value) => vec![value.as_str()],
             Self::Many(values) => values.iter().map(String::as_str).collect(),
+        }
+    }
+
+    pub(crate) fn into_values(self) -> Vec<String> {
+        match self {
+            Self::One(value) => vec![value],
+            Self::Many(values) => values,
         }
     }
 
@@ -158,7 +191,7 @@ impl ResolvedBinding {
         key_event_matches_combo(key, self.trigger.combo())
     }
 
-    fn matches_terminal_key(&self, key: TerminalKey) -> bool {
+    fn matches_terminal_key(&self, key: &TerminalKey) -> bool {
         terminal_key_matches_combo(key, self.trigger.combo())
     }
 }
@@ -169,6 +202,18 @@ pub struct ActionKeybinds {
 }
 
 impl ActionKeybinds {
+    pub(crate) fn from_labels(labels: &[String]) -> Result<Self, String> {
+        let mut bindings = Vec::new();
+        for label in labels {
+            match parse_binding_string(label) {
+                Some(ParsedBinding::Single(binding)) => bindings.push(binding),
+                Some(ParsedBinding::Range(range)) => bindings.extend(range),
+                None => return Err(format!("invalid endpoint command binding: {label}")),
+            }
+        }
+        Ok(Self { bindings })
+    }
+
     #[cfg(test)]
     pub fn prefix(label: &str) -> Self {
         let raw = if label.starts_with("prefix+") {
@@ -207,13 +252,13 @@ impl ActionKeybinds {
             .any(|binding| binding.trigger.is_prefix() && binding.matches_key_event(key))
     }
 
-    pub fn matches_prefix_key(&self, key: TerminalKey) -> bool {
+    pub fn matches_prefix_key(&self, key: &TerminalKey) -> bool {
         self.bindings
             .iter()
             .any(|binding| binding.trigger.is_prefix() && binding.matches_terminal_key(key))
     }
 
-    pub fn matches_direct_key(&self, key: TerminalKey) -> bool {
+    pub fn matches_direct_key(&self, key: &TerminalKey) -> bool {
         self.bindings
             .iter()
             .any(|binding| binding.trigger.is_direct() && binding.matches_terminal_key(key))
@@ -263,7 +308,7 @@ pub struct IndexedKeybind {
 }
 
 impl IndexedKeybind {
-    pub fn matched_index(&self, key: TerminalKey) -> Option<usize> {
+    pub fn matched_index(&self, key: &TerminalKey) -> Option<usize> {
         let combo = self.trigger.combo();
         let (expected_code, _) = normalize_key_combo(combo);
         let KeyCode::Char(key_number @ '1'..='9') = expected_code else {
@@ -330,13 +375,14 @@ pub struct Keybinds {
     pub rename_tab: ActionKeybinds,
     pub previous_tab: ActionKeybinds,
     pub next_tab: ActionKeybinds,
-    pub swap_previous_tab: ActionKeybinds,
-    pub swap_next_tab: ActionKeybinds,
+    pub move_tab_previous: ActionKeybinds,
+    pub move_tab_next: ActionKeybinds,
     pub switch_tab: Vec<IndexedKeybind>,
     pub switch_workspace: Vec<IndexedKeybind>,
     pub close_tab: ActionKeybinds,
     pub rename_pane: ActionKeybinds,
     pub edit_scrollback: ActionKeybinds,
+    pub clear_pane: ActionKeybinds,
     pub copy_mode: ActionKeybinds,
     pub focus_pane_left: ActionKeybinds,
     pub focus_pane_down: ActionKeybinds,
@@ -354,6 +400,10 @@ pub struct Keybinds {
     pub close_pane: ActionKeybinds,
     pub zoom: ActionKeybinds,
     pub resize_mode: ActionKeybinds,
+    pub resize_pane_left: ActionKeybinds,
+    pub resize_pane_down: ActionKeybinds,
+    pub resize_pane_up: ActionKeybinds,
+    pub resize_pane_right: ActionKeybinds,
     pub toggle_sidebar: ActionKeybinds,
     pub widen_sidebar: ActionKeybinds,
     pub narrow_sidebar: ActionKeybinds,
@@ -384,16 +434,19 @@ struct RegisteredBinding {
 }
 
 struct BindingRegistry {
-    prefix_combo: KeyCombo,
+    prefix_combos: Vec<KeyCombo>,
     prefix_source: BindingSource,
     direct: std::collections::HashMap<KeyCombo, RegisteredBinding>,
     prefix: std::collections::HashMap<KeyCombo, RegisteredBinding>,
 }
 
 impl BindingRegistry {
-    fn new(prefix_combo: KeyCombo, prefix_source: BindingSource) -> Self {
+    fn new(prefix_combos: Vec<KeyCombo>, prefix_source: BindingSource) -> Self {
+        let mut normalized: Vec<KeyCombo> =
+            prefix_combos.into_iter().map(normalize_key_combo).collect();
+        normalized.dedup();
         Self {
-            prefix_combo: normalize_key_combo(prefix_combo),
+            prefix_combos: normalized,
             prefix_source,
             direct: std::collections::HashMap::new(),
             prefix: std::collections::HashMap::new(),
@@ -409,8 +462,18 @@ impl BindingRegistry {
             });
     }
 
+    /// Reserve every configured prefix key as a direct/modifier key so no
+    /// action can hijack it before prefix mode starts.
+    fn reserve_prefix_keys(&mut self, field: &str, source: BindingSource) {
+        let combos = self.prefix_combos.clone();
+        for combo in combos {
+            self.reserve_direct(combo, field, source);
+        }
+    }
+
     fn prefix_rhs_is_reserved(&self, combo: KeyCombo) -> bool {
-        normalize_key_combo(combo) == self.prefix_combo
+        let combo = normalize_key_combo(combo);
+        self.prefix_combos.contains(&combo)
     }
 
     fn conflict(&self, binding: &ResolvedBinding) -> Option<&RegisteredBinding> {
@@ -437,14 +500,14 @@ impl BindingRegistry {
 }
 
 impl Config {
-    pub(super) fn validated_keybinds(&self) -> (Option<String>, KeyCombo, Vec<String>, Keybinds) {
-        let mut diagnostics = Vec::new();
-        let (prefix, prefix_diag) = parse_key_combo_with_diagnostic(
-            &self.keys.prefix,
-            "keys.prefix",
-            (KeyCode::Char('b'), KeyModifiers::CONTROL),
-        );
+    pub(super) fn validated_keybinds(
+        &self,
+    ) -> (Option<String>, Vec<KeyCombo>, Vec<String>, Keybinds) {
+        let (prefix_keys, prefix_diag, mut diagnostics) = parse_prefix_keys(&self.keys.prefix);
         if let Some(diag) = &prefix_diag {
+            warn!(message = %diag, "config diagnostic");
+        }
+        for diag in &diagnostics {
             warn!(message = %diag, "config diagnostic");
         }
 
@@ -453,11 +516,12 @@ impl Config {
         } else {
             BindingSource::Default
         };
-        let mut registry = BindingRegistry::new(prefix, prefix_source);
-        registry.reserve_direct(prefix, "keys.prefix", prefix_source);
-        let mut navigate_registry = BindingRegistry::new(prefix, prefix_source);
-        navigate_registry.reserve_direct(prefix, "keys.prefix", prefix_source);
+        let mut registry = BindingRegistry::new(prefix_keys.clone(), prefix_source);
+        registry.reserve_prefix_keys("keys.prefix", prefix_source);
+        let mut navigate_registry = BindingRegistry::new(prefix_keys.clone(), prefix_source);
+        navigate_registry.reserve_prefix_keys("keys.prefix", prefix_source);
         reserve_navigate_runtime_keys(&mut navigate_registry);
+        let prefix = prefix_keys;
 
         macro_rules! empty_action {
             () => {
@@ -498,13 +562,14 @@ impl Config {
             rename_tab: empty_action!(),
             previous_tab: empty_action!(),
             next_tab: empty_action!(),
-            swap_previous_tab: empty_action!(),
-            swap_next_tab: empty_action!(),
+            move_tab_previous: empty_action!(),
+            move_tab_next: empty_action!(),
             switch_tab: Vec::new(),
             switch_workspace: Vec::new(),
             close_tab: empty_action!(),
             rename_pane: empty_action!(),
             edit_scrollback: empty_action!(),
+            clear_pane: empty_action!(),
             copy_mode: empty_action!(),
             focus_pane_left: empty_action!(),
             focus_pane_down: empty_action!(),
@@ -522,6 +587,10 @@ impl Config {
             close_pane: empty_action!(),
             zoom: empty_action!(),
             resize_mode: empty_action!(),
+            resize_pane_left: empty_action!(),
+            resize_pane_down: empty_action!(),
+            resize_pane_up: empty_action!(),
+            resize_pane_right: empty_action!(),
             toggle_sidebar: empty_action!(),
             widen_sidebar: empty_action!(),
             narrow_sidebar: empty_action!(),
@@ -639,8 +708,8 @@ impl Config {
             apply_action!(keybinds.rename_tab, rename_tab, source);
             apply_action!(keybinds.previous_tab, previous_tab, source);
             apply_action!(keybinds.next_tab, next_tab, source);
-            apply_action!(keybinds.swap_previous_tab, swap_previous_tab, source);
-            apply_action!(keybinds.swap_next_tab, swap_next_tab, source);
+            apply_action!(keybinds.move_tab_previous, move_tab_previous, source);
+            apply_action!(keybinds.move_tab_next, move_tab_next, source);
             apply_indexed!(
                 keybinds.switch_tab,
                 switch_tab,
@@ -656,6 +725,7 @@ impl Config {
             apply_action!(keybinds.close_tab, close_tab, source);
             apply_action!(keybinds.rename_pane, rename_pane, source);
             apply_action!(keybinds.edit_scrollback, edit_scrollback, source);
+            apply_action!(keybinds.clear_pane, clear_pane, source);
             apply_action!(keybinds.copy_mode, copy_mode, source);
             apply_action!(keybinds.focus_pane_left, focus_pane_left, source);
             apply_action!(keybinds.focus_pane_down, focus_pane_down, source);
@@ -673,6 +743,10 @@ impl Config {
             apply_action!(keybinds.close_pane, close_pane, source);
             apply_action!(keybinds.zoom, zoom, source);
             apply_action!(keybinds.resize_mode, resize_mode, source);
+            apply_action!(keybinds.resize_pane_left, resize_pane_left, source);
+            apply_action!(keybinds.resize_pane_down, resize_pane_down, source);
+            apply_action!(keybinds.resize_pane_up, resize_pane_up, source);
+            apply_action!(keybinds.resize_pane_right, resize_pane_right, source);
             apply_action!(keybinds.toggle_sidebar, toggle_sidebar, source);
             apply_action!(keybinds.widen_sidebar, widen_sidebar, source);
             apply_action!(keybinds.narrow_sidebar, narrow_sidebar, source);
@@ -1295,19 +1369,45 @@ fn single_key_char(s: &str) -> Option<char> {
     }
 }
 
-fn parse_key_combo_with_diagnostic(
-    s: &str,
-    field: &str,
-    fallback: KeyCombo,
-) -> (KeyCombo, Option<String>) {
-    match parse_key_combo(s) {
-        Some(binding) => (binding, None),
-        None => {
-            let diag = format!("invalid keybinding: {field} = {s:?}; using fallback");
-            warn!(message = %diag, "config diagnostic");
-            (fallback, Some(diag))
+/// Parse the configured prefix keys. Returns the effective list, an optional
+/// rejection diagnostic (used when nothing valid remains, so the caller keeps
+/// the previous keybinds), and per-entry diagnostics.
+fn parse_prefix_keys(config: &BindingConfig) -> (Vec<KeyCombo>, Option<String>, Vec<String>) {
+    let mut combos: Vec<KeyCombo> = Vec::new();
+    let mut diagnostics = Vec::new();
+
+    for raw in config.values() {
+        let raw = raw.trim();
+        match parse_key_combo(raw) {
+            Some(combo) if !combos.contains(&combo) => combos.push(combo),
+            Some(_) => {}
+            None => diagnostics.push(format!(
+                "invalid keybinding: keys.prefix = {raw:?}; ignoring prefix"
+            )),
         }
     }
+
+    if combos.is_empty() {
+        let reject = Some(format!(
+            "invalid keybinding: keys.prefix; using fallback {}",
+            format_key_combo(DEFAULT_PREFIX)
+        ));
+        return (vec![DEFAULT_PREFIX], reject, diagnostics);
+    }
+
+    (combos, None, diagnostics)
+}
+
+/// Render all configured prefix keys for the help panel.
+pub fn format_prefix_combos(prefixes: &[KeyCombo]) -> String {
+    if prefixes.is_empty() {
+        return format_key_combo(DEFAULT_PREFIX);
+    }
+    prefixes
+        .iter()
+        .map(|combo| format_key_combo(*combo))
+        .collect::<Vec<_>>()
+        .join(" / ")
 }
 
 pub fn normalize_key_combo((mut code, mut modifiers): KeyCombo) -> KeyCombo {
@@ -1325,7 +1425,7 @@ pub fn key_event_matches_combo(key: &KeyEvent, combo: KeyCombo) -> bool {
     key_parts_match_combo(key.code, key.modifiers, None, combo)
 }
 
-pub fn terminal_key_matches_combo(key: TerminalKey, combo: KeyCombo) -> bool {
+pub fn terminal_key_matches_combo(key: &TerminalKey, combo: KeyCombo) -> bool {
     key_parts_match_combo(key.code, key.modifiers, key.shifted_codepoint, combo)
 }
 
@@ -1426,7 +1526,7 @@ fn shifted_number_symbol(ch: char) -> Option<char> {
         .find_map(|(number, symbol)| (*symbol == ch).then_some(*number))
 }
 
-fn indexed_shifted_number_matches(key: TerminalKey, combo: KeyCombo, number: char) -> bool {
+fn indexed_shifted_number_matches(key: &TerminalKey, combo: KeyCombo, number: char) -> bool {
     let (expected_code, expected_modifiers) = normalize_key_combo(combo);
     matches!(expected_code, KeyCode::Char(expected) if expected == number)
         && expected_modifiers.contains(KeyModifiers::SHIFT)
@@ -1441,8 +1541,8 @@ fn shifted_char_matches_expected(
     let KeyCode::Char(expected) = expected_code else {
         return false;
     };
-    if shifted_codepoint.and_then(char::from_u32) == Some(expected) {
-        return true;
+    if let Some(shifted) = shifted_codepoint.and_then(char::from_u32) {
+        return shifted == expected;
     }
     matches!(actual_code, KeyCode::Char(actual) if actual == expected && is_shifted_punctuation(expected))
 }
@@ -1521,8 +1621,8 @@ prefix = "ö"
         )
         .unwrap();
         assert_eq!(
-            config.prefix_key(),
-            (KeyCode::Char('ö'), KeyModifiers::empty())
+            config.prefix_keys(),
+            vec![(KeyCode::Char('ö'), KeyModifiers::empty())]
         );
         assert!(config.collect_diagnostics().is_empty());
     }
@@ -1620,41 +1720,6 @@ next_tab = "prefix+n"
     }
 
     #[test]
-    fn swap_workspace_and_tab_keybinds_parse_from_config() {
-        let config: Config = toml::from_str(
-            r#"
-[keys]
-swap_previous_workspace = "prefix+alt+up"
-swap_next_workspace = "prefix+alt+down"
-swap_previous_tab = "prefix+alt+left"
-swap_next_tab = "prefix+alt+right"
-"#,
-        )
-        .unwrap();
-
-        let diagnostics = config.collect_diagnostics();
-        let kb = config.keybinds();
-
-        assert!(diagnostics.is_empty(), "{diagnostics:?}");
-        assert_eq!(
-            binding_triggers(&kb.swap_previous_workspace),
-            vec![BindingTrigger::Prefix((KeyCode::Up, KeyModifiers::ALT))]
-        );
-        assert_eq!(
-            binding_triggers(&kb.swap_next_workspace),
-            vec![BindingTrigger::Prefix((KeyCode::Down, KeyModifiers::ALT))]
-        );
-        assert_eq!(
-            binding_triggers(&kb.swap_previous_tab),
-            vec![BindingTrigger::Prefix((KeyCode::Left, KeyModifiers::ALT))]
-        );
-        assert_eq!(
-            binding_triggers(&kb.swap_next_tab),
-            vec![BindingTrigger::Prefix((KeyCode::Right, KeyModifiers::ALT))]
-        );
-    }
-
-    #[test]
     fn array_bindings_allow_prefix_and_modified_direct() {
         let config: Config = toml::from_str(
             r#"
@@ -1707,7 +1772,7 @@ close_tab = "X"
         for ch in ['ğ', 'ç', 'ş', 'ı', 'é', 'ø'] {
             let bindings = ActionKeybinds::prefix(&ch.to_string());
             assert!(bindings
-                .matches_prefix_key(TerminalKey::new(KeyCode::Char(ch), KeyModifiers::empty(),)));
+                .matches_prefix_key(&TerminalKey::new(KeyCode::Char(ch), KeyModifiers::empty(),)));
         }
     }
 
@@ -1717,7 +1782,7 @@ close_tab = "X"
         {
             let bindings = ActionKeybinds::prefix(&format!("shift+{base}"));
             assert!(bindings.matches_prefix_key(
-                TerminalKey::new(KeyCode::Char(base), KeyModifiers::SHIFT)
+                &TerminalKey::new(KeyCode::Char(base), KeyModifiers::SHIFT)
                     .with_shifted_codepoint(shifted as u32)
             ));
         }
@@ -1733,20 +1798,20 @@ close_tab = "X"
     fn shifted_letter_binding_matches_legacy_uppercase_key_event() {
         let bindings = ActionKeybinds::prefix("shift+n");
         assert!(bindings
-            .matches_prefix_key(TerminalKey::new(KeyCode::Char('N'), KeyModifiers::empty(),)));
+            .matches_prefix_key(&TerminalKey::new(KeyCode::Char('N'), KeyModifiers::empty(),)));
     }
 
     #[test]
     fn shifted_letter_direct_binding_matches_legacy_uppercase_key_event() {
         let bindings = ActionKeybinds::direct("shift+n");
         assert!(bindings
-            .matches_direct_key(TerminalKey::new(KeyCode::Char('N'), KeyModifiers::empty(),)));
+            .matches_direct_key(&TerminalKey::new(KeyCode::Char('N'), KeyModifiers::empty(),)));
     }
 
     #[test]
     fn shifted_letter_binding_matches_modern_modified_key_event() {
         let bindings = ActionKeybinds::direct("cmd+shift+j");
-        assert!(bindings.matches_direct_key(TerminalKey::new(
+        assert!(bindings.matches_direct_key(&TerminalKey::new(
             KeyCode::Char('J'),
             KeyModifiers::SUPER | KeyModifiers::SHIFT,
         )));
@@ -1756,32 +1821,32 @@ close_tab = "X"
     fn legacy_uppercase_key_event_does_not_match_unshifted_letter_binding() {
         let bindings = ActionKeybinds::prefix("n");
         assert!(!bindings
-            .matches_prefix_key(TerminalKey::new(KeyCode::Char('N'), KeyModifiers::empty(),)));
+            .matches_prefix_key(&TerminalKey::new(KeyCode::Char('N'), KeyModifiers::empty(),)));
     }
 
     #[test]
     fn legacy_uppercase_shift_fallback_is_limited_to_ascii_letters() {
         let shifted_number = ActionKeybinds::prefix("shift+1");
         assert!(!shifted_number
-            .matches_prefix_key(TerminalKey::new(KeyCode::Char('!'), KeyModifiers::empty(),)));
+            .matches_prefix_key(&TerminalKey::new(KeyCode::Char('!'), KeyModifiers::empty(),)));
 
         let shifted_non_ascii = ActionKeybinds::prefix("shift+ö");
         assert!(!shifted_non_ascii
-            .matches_prefix_key(TerminalKey::new(KeyCode::Char('Ö'), KeyModifiers::empty(),)));
+            .matches_prefix_key(&TerminalKey::new(KeyCode::Char('Ö'), KeyModifiers::empty(),)));
     }
 
     #[test]
     fn shifted_tab_inputs_match_backtab_canonical_binding() {
         let bindings = ActionKeybinds::prefix("shift+tab");
         assert!(
-            bindings.matches_prefix_key(TerminalKey::new(KeyCode::BackTab, KeyModifiers::empty()))
+            bindings.matches_prefix_key(&TerminalKey::new(KeyCode::BackTab, KeyModifiers::empty()))
         );
         assert!(
-            bindings.matches_prefix_key(TerminalKey::new(KeyCode::BackTab, KeyModifiers::SHIFT))
+            bindings.matches_prefix_key(&TerminalKey::new(KeyCode::BackTab, KeyModifiers::SHIFT))
         );
-        assert!(bindings.matches_prefix_key(TerminalKey::new(KeyCode::Tab, KeyModifiers::SHIFT)));
+        assert!(bindings.matches_prefix_key(&TerminalKey::new(KeyCode::Tab, KeyModifiers::SHIFT)));
         assert!(!ActionKeybinds::prefix("tab")
-            .matches_prefix_key(TerminalKey::new(KeyCode::Tab, KeyModifiers::SHIFT)));
+            .matches_prefix_key(&TerminalKey::new(KeyCode::Tab, KeyModifiers::SHIFT)));
         assert_eq!(
             normalize_key_combo((KeyCode::Tab, KeyModifiers::CONTROL | KeyModifiers::SHIFT)),
             (KeyCode::BackTab, KeyModifiers::CONTROL)
@@ -1803,15 +1868,15 @@ close_tab = "X"
     #[test]
     fn shifted_punctuation_matches_enhanced_input() {
         let help = ActionKeybinds::prefix("?");
-        assert!(help.matches_prefix_key(TerminalKey::new(KeyCode::Char('?'), KeyModifiers::SHIFT)));
+        assert!(help.matches_prefix_key(&TerminalKey::new(KeyCode::Char('?'), KeyModifiers::SHIFT)));
         assert!(help.matches_prefix_key(
-            TerminalKey::new(KeyCode::Char('/'), KeyModifiers::SHIFT)
+            &TerminalKey::new(KeyCode::Char('/'), KeyModifiers::SHIFT)
                 .with_shifted_codepoint('?' as u32)
         ));
 
         let bang = ActionKeybinds::prefix("!");
         assert!(bang.matches_prefix_key(
-            TerminalKey::new(KeyCode::Char('1'), KeyModifiers::SHIFT)
+            &TerminalKey::new(KeyCode::Char('1'), KeyModifiers::SHIFT)
                 .with_shifted_codepoint('!' as u32)
         ));
     }
@@ -1846,6 +1911,84 @@ help = "prefix+ctrl+b"
     }
 
     #[test]
+    fn multiple_prefix_keys_parse_reserve_and_share_prefix_bindings() {
+        let config: Config = toml::from_str(
+            r#"
+[keys]
+prefix = ["ctrl+space", "ctrl+s"]
+help = "prefix+?"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.prefix_keys(),
+            vec![
+                (KeyCode::Char(' '), KeyModifiers::CONTROL),
+                (KeyCode::Char('s'), KeyModifiers::CONTROL),
+            ]
+        );
+        assert!(config.collect_diagnostics().is_empty());
+
+        // A prefix action works regardless of which prefix key started prefix mode.
+        let help = &config.keybinds().help;
+        assert!(
+            help.matches_prefix_key(&TerminalKey::new(KeyCode::Char('?'), KeyModifiers::empty()))
+        );
+
+        // Every prefix key is reserved as a prefix-mode right-hand side.
+        let reserved: Config = toml::from_str(
+            r#"
+[keys]
+prefix = ["ctrl+space", "ctrl+s"]
+help = "prefix+ctrl+s"
+"#,
+        )
+        .unwrap();
+        assert!(reserved.keybinds().help.bindings.is_empty());
+        assert!(reserved
+            .collect_diagnostics()
+            .iter()
+            .any(|diag| diag.contains("reserved keybinding")));
+    }
+
+    #[test]
+    fn invalid_prefix_entries_are_dropped_while_valid_ones_survive() {
+        let config: Config = toml::from_str(
+            r#"
+[keys]
+prefix = ["ctrl+a", "wat"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.prefix_keys(),
+            vec![(KeyCode::Char('a'), KeyModifiers::CONTROL)]
+        );
+        assert!(config
+            .collect_diagnostics()
+            .iter()
+            .any(|diag| diag.contains("keys.prefix") && diag.contains("ignoring prefix")));
+    }
+
+    #[test]
+    fn empty_prefix_list_is_rejected_and_keeps_the_fallback() {
+        let config: Config = toml::from_str(
+            r#"
+[keys]
+prefix = []
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.prefix_keys(), vec![DEFAULT_PREFIX]);
+        assert!(config
+            .collect_diagnostics()
+            .iter()
+            .any(|diag| diag.contains("keys.prefix")));
+        // A reload treats the empty list as invalid and keeps the current keybinds.
+        assert!(config.live_keybinds_with_diagnostics().is_err());
+    }
+
+    #[test]
     fn navigate_bindings_allow_plain_keys_and_reject_local_conflicts() {
         let config: Config = toml::from_str(
             r#"
@@ -1862,12 +2005,12 @@ navigate_pane_down = "ctrl+j"
         assert!(keybinds
             .navigate
             .workspace_up
-            .matches_direct_key(TerminalKey::new(KeyCode::Char('j'), KeyModifiers::empty())));
+            .matches_direct_key(&TerminalKey::new(KeyCode::Char('j'), KeyModifiers::empty())));
         assert!(keybinds.navigate.workspace_down.bindings.is_empty());
         assert!(keybinds
             .navigate
             .pane_down
-            .matches_direct_key(TerminalKey::new(KeyCode::Char('j'), KeyModifiers::CONTROL)));
+            .matches_direct_key(&TerminalKey::new(KeyCode::Char('j'), KeyModifiers::CONTROL)));
         assert!(diagnostics.iter().any(|diag| {
             diag.contains("kept keys.navigate_workspace_up")
                 && diag.contains("disabled keys.navigate_workspace_down")
@@ -1919,11 +2062,11 @@ command = "echo hi"
         assert!(keybinds
             .navigate
             .workspace_down
-            .matches_direct_key(TerminalKey::new(KeyCode::Char('n'), KeyModifiers::empty())));
+            .matches_direct_key(&TerminalKey::new(KeyCode::Char('n'), KeyModifiers::empty())));
         assert!(keybinds
             .navigate
             .workspace_down
-            .matches_direct_key(TerminalKey::new(KeyCode::Char('f'), KeyModifiers::empty())));
+            .matches_direct_key(&TerminalKey::new(KeyCode::Char('f'), KeyModifiers::empty())));
         assert!(!keybinds.custom_commands.is_empty());
         assert!(!diagnostics.iter().any(|diag| {
             diag.contains("disabled keys.navigate_workspace_down")
@@ -1945,7 +2088,7 @@ navigate_pane_down = "j"
         assert!(keybinds
             .navigate
             .pane_down
-            .matches_direct_key(TerminalKey::new(KeyCode::Char('j'), KeyModifiers::empty())));
+            .matches_direct_key(&TerminalKey::new(KeyCode::Char('j'), KeyModifiers::empty())));
     }
 
     #[test]

@@ -21,6 +21,10 @@ main() {
         *)      err "unsupported OS: $OS" ;;
     esac
 
+    if [ "$OS" = "Linux" ] && [ "$(uname -o 2>/dev/null || true)" = "Android" ]; then
+        err "Android/Termux is not currently supported by Herdr release binaries. SSH to a supported host instead: https://herdr.dev/docs/how-to-work/#work-from-your-phone"
+    fi
+
     ARCH="$(uname -m)"
     case "$ARCH" in
         x86_64|amd64)   arch="x86_64" ;;
@@ -50,10 +54,36 @@ main() {
             exit
         }
     ')"
+    SHA256="$(printf '%s\n' "$MANIFEST" | awk -v target="\"${TARGET}\"" '
+        /^[[:space:]]*"sha256"[[:space:]]*:/ { in_sha256 = 1; next }
+        in_sha256 && /^[[:space:]]*}/ { exit }
+        in_sha256 && index($0, target) {
+            sub(/^.*:[[:space:]]*"/, "")
+            sub(/".*$/, "")
+            print
+            exit
+        }
+    ')"
     VERSION="$(printf '%s\n' "$MANIFEST" | awk -F '"' '/^[[:space:]]*"version"[[:space:]]*:/ { print $4; exit }')"
 
     if [ -z "$URL" ]; then
         err "release manifest does not include a binary for ${TARGET}"
+    fi
+    SHA256_TOOL=""
+    if [ -n "$SHA256" ]; then
+        if [ "${#SHA256}" -ne 64 ] || ! printf '%s\n' "$SHA256" | awk '/[^0-9A-Fa-f]/ { exit 1 }'; then
+            err "release manifest includes an invalid SHA-256 checksum for ${TARGET}"
+        fi
+        SHA256="$(printf '%s\n' "$SHA256" | awk '{ print tolower($0) }')"
+        if command -v sha256sum >/dev/null 2>&1; then
+            SHA256_TOOL="sha256sum"
+        elif command -v shasum >/dev/null 2>&1; then
+            SHA256_TOOL="shasum"
+        elif command -v openssl >/dev/null 2>&1; then
+            SHA256_TOOL="openssl"
+        else
+            err "SHA-256 verification requires sha256sum, shasum, or openssl"
+        fi
     fi
 
     if [ -n "$VERSION" ]; then
@@ -66,6 +96,17 @@ main() {
 
     if ! curl -fsSL --retry 3 --connect-timeout 10 --max-time 120 "$URL" -o "${TMP}/${BIN}"; then
         err "download failed from ${URL}"
+    fi
+
+    if [ -n "$SHA256" ]; then
+        case "$SHA256_TOOL" in
+            sha256sum) ACTUAL_SHA256="$(sha256sum < "${TMP}/${BIN}" | awk '{ print $1 }')" ;;
+            shasum)    ACTUAL_SHA256="$(shasum -a 256 < "${TMP}/${BIN}" | awk '{ print $1 }')" ;;
+            openssl)   ACTUAL_SHA256="$(openssl dgst -sha256 < "${TMP}/${BIN}" | awk '{ print $NF }')" ;;
+        esac
+        if [ "$ACTUAL_SHA256" != "$SHA256" ]; then
+            err "downloaded Herdr checksum did not match"
+        fi
     fi
 
     # install

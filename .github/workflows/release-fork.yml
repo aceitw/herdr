@@ -35,6 +35,9 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-15
             name: herdr-macos-aarch64
+          - target: x86_64-pc-windows-msvc
+            os: windows-2022
+            name: herdr-windows-x86_64.zip
 
     runs-on: ${{ matrix.os }}
     env:
@@ -44,6 +47,7 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
           persist-credentials: false
 
       - name: Install Rust
@@ -52,19 +56,10 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
           targets: ${{ matrix.target }}
 
-      - name: Install Zig (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          curl -fsSL https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz -o /tmp/zig.tar.xz
-          tar -xf /tmp/zig.tar.xz -C /tmp
-          echo "/tmp/zig-x86_64-linux-0.15.2" >> $GITHUB_PATH
-
-      - name: Install Zig (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          curl -fsSL https://ziglang.org/download/0.15.2/zig-aarch64-macos-0.15.2.tar.xz -o /tmp/zig.tar.xz
-          tar -xf /tmp/zig.tar.xz -C /tmp
-          echo "/tmp/zig-aarch64-macos-0.15.2" >> $GITHUB_PATH
+      - name: Install Zig
+        uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
+        with:
+          version: 0.16.0
 
       - name: Prefer official Ubuntu mirrors over Azure
         if: runner.os == 'Linux'
@@ -86,13 +81,28 @@ jobs:
         run: echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
 
       - name: Remove Zig caches
+        shell: bash
         run: rm -rf .zig-cache vendor/libghostty-vt/.zig-cache vendor/libghostty-vt/zig-out
 
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Rename binary
+      - name: Package Unix artifact
+        if: runner.os != 'Windows'
+        shell: bash
         run: cp target/${{ matrix.target }}/release/herdr ${{ matrix.name }}
+
+      - name: Package Windows artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $package = Join-Path $env:RUNNER_TEMP "Microsoft.Windows.Console.ConPTY.nupkg"
+          $stage = Join-Path $env:RUNNER_TEMP "herdr-windows-x86_64"
+          .\scripts\package_windows_conpty.ps1 `
+            -HerdrExe target\${{ matrix.target }}\release\herdr.exe `
+            -PackagePath $package `
+            -StageDir $stage `
+            -OutputPath ${{ matrix.name }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -118,27 +128,44 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
         with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: |
             herdr-linux-x86_64/herdr-linux-x86_64
             herdr-linux-aarch64/herdr-linux-aarch64
             herdr-macos-x86_64/herdr-macos-x86_64
             herdr-macos-aarch64/herdr-macos-aarch64
+            herdr-windows-x86_64.zip/herdr-windows-x86_64.zip
 
       - name: Update latest.json
         run: |
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
           VERSION="${TAG#v}"
           BASE="https://github.com/aceitw/herdr/releases/download/${TAG}"
+          export SHA_LINUX_X86_64="$(sha256sum herdr-linux-x86_64/herdr-linux-x86_64 | awk '{print $1}')"
+          export SHA_LINUX_AARCH64="$(sha256sum herdr-linux-aarch64/herdr-linux-aarch64 | awk '{print $1}')"
+          export SHA_MACOS_X86_64="$(sha256sum herdr-macos-x86_64/herdr-macos-x86_64 | awk '{print $1}')"
+          export SHA_MACOS_AARCH64="$(sha256sum herdr-macos-aarch64/herdr-macos-aarch64 | awk '{print $1}')"
+          export SHA_WINDOWS_X86_64="$(sha256sum herdr-windows-x86_64.zip/herdr-windows-x86_64.zip | awk '{print $1}')"
           python3 - <<EOF
-          import json
+          import json, os
           with open('latest.json') as f:
               manifest = json.load(f)
           manifest['version'] = '${VERSION}'
+          manifest['protocol'] = 22
+          manifest['endpoint_generation'] = 1
           manifest['assets'] = {
               'linux-x86_64':  '${BASE}/herdr-linux-x86_64',
               'linux-aarch64': '${BASE}/herdr-linux-aarch64',
               'macos-x86_64':  '${BASE}/herdr-macos-x86_64',
               'macos-aarch64': '${BASE}/herdr-macos-aarch64',
+              'windows-x86_64': '${BASE}/herdr-windows-x86_64.zip',
+          }
+          manifest['sha256'] = {
+              'linux-x86_64': os.environ['SHA_LINUX_X86_64'],
+              'linux-aarch64': os.environ['SHA_LINUX_AARCH64'],
+              'macos-x86_64': os.environ['SHA_MACOS_X86_64'],
+              'macos-aarch64': os.environ['SHA_MACOS_AARCH64'],
+              'windows-x86_64': os.environ['SHA_WINDOWS_X86_64'],
           }
           with open('latest.json', 'w') as f:
               json.dump(manifest, f, indent=2)
