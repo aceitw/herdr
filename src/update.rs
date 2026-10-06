@@ -1,6 +1,14 @@
 //! Self-update mechanism.
 //!
-//! Checks the hosted herdr.dev update manifest for newer versions.
+//! Checks the hosted update manifest for newer versions.
+//!
+//! Living-fork digest: this fork publishes its own release manifests (and no
+//! previews), so self-updates must come from this repository, never from
+//! upstream herdr.dev. An upstream binary shipped over this fork would lose the
+//! HerdrUp api-bridge and every other living-fork feature, so the stable URL
+//! points at this fork's manifest and the preview URL reuses the same stable
+//! manifest, whose `channel: stable` makes a preview-channel update fail
+//! loudly instead of silently replacing the fork build.
 //! Manual `herdr update` downloads and installs the binary.
 //! Background checks only surface availability and release notes.
 //! Uses `curl` as a subprocess for HTTP — no additional Rust HTTP dependencies.
@@ -22,8 +30,13 @@ use std::time::{Duration, Instant};
 use interprocess::local_socket::traits::Stream as _;
 use serde::{Deserialize, Deserializer};
 
-const STABLE_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
-const PREVIEW_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/preview.json";
+const STABLE_UPDATE_MANIFEST_URL: &str =
+    "https://raw.githubusercontent.com/aceitw/herdr/master/latest.json";
+/// The fork publishes no preview manifests. Reusing the stable manifest keeps a
+/// configured-preview install from silently receiving upstream preview binaries;
+/// `release_info_from_preview_manifest` rejects its stable `channel` outright.
+const PREVIEW_UPDATE_MANIFEST_URL: &str =
+    "https://raw.githubusercontent.com/aceitw/herdr/master/latest.json";
 const HOMEBREW_FORMULA_API_URL: &str = "https://formulae.brew.sh/api/formula/herdr.json";
 const HERDR_UPDATE_COMMAND: &str = "herdr update";
 const HOMEBREW_UPDATE_COMMAND: &str = "brew update && brew upgrade herdr";

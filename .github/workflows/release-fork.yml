@@ -147,7 +147,7 @@ jobs:
           export SHA_MACOS_AARCH64="$(sha256sum herdr-macos-aarch64/herdr-macos-aarch64 | awk '{print $1}')"
           export SHA_WINDOWS_X86_64="$(sha256sum herdr-windows-x86_64.zip/herdr-windows-x86_64.zip | awk '{print $1}')"
           python3 - <<EOF
-          import json, os
+          import json, os, re
           with open('latest.json') as f:
               manifest = json.load(f)
           manifest['version'] = '${VERSION}'
@@ -167,7 +167,37 @@ jobs:
               'macos-aarch64': os.environ['SHA_MACOS_AARCH64'],
               'windows-x86_64': os.environ['SHA_WINDOWS_X86_64'],
           }
+          # The updater shows this section to users on `herdr update`, so the
+          # released version must carry its own notes. Fall back to the previous
+          # notes rather than block a release on a changelog miss.
+          previous_notes = manifest['notes']
+          section = None
+          if os.path.exists('CHANGELOG.md'):
+              with open('CHANGELOG.md') as f:
+                  changelog = f.read()
+              match = re.search(
+                  r'(?ms)^## \[' + re.escape('${VERSION}') + r'\][^\n]*\n(.*?)(?=^## \[|\Z)',
+                  changelog,
+              )
+              if match:
+                  section = match.group(1).strip() or None
+          if section:
+              manifest['notes'] = section
+              manifest['releases']['${VERSION}'] = {
+                  'notes': section,
+                  'protocol': manifest['protocol'],
+                  'assets': dict(manifest['assets']),
+                  'sha256': dict(manifest['sha256']),
+              }
+          else:
+              print("warning: CHANGELOG.md has no section for ${VERSION}; keeping previous notes")
+          # Keep the checked-in distribution manifest identical: the updater
+          # schema test validates distribution/latest.json, and this repo's
+          # installer reads latest.json. Drift between the two would make the
+          # test pass on stale content.
           with open('latest.json', 'w') as f:
+              json.dump(manifest, f, indent=2)
+          with open('distribution/latest.json', 'w') as f:
               json.dump(manifest, f, indent=2)
           EOF
 
@@ -177,6 +207,6 @@ jobs:
           VERSION="${TAG#v}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add latest.json
+          git add latest.json distribution/latest.json
           git diff --cached --quiet || git commit -m "docs: update latest.json for v${VERSION}"
           git push origin master
