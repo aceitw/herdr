@@ -3,11 +3,11 @@
   "protocol": 22,
   "notes": "This is a hotfix release for v0.9.2. See the v0.9.2 notes for the full feature release: https://github.com/herdrdev/herdr/releases/tag/v0.9.2\n\n### Added (fork)\n- Added the `herdr api-bridge` subcommand for the HerdrUp iOS app. The phone opens one SSH channel per request and runs `herdr [--session <name>] api-bridge '<base64 chunk>' '<chunk>' ...` against this machine; the bridge forwards the decoded JSON request to the active session's API socket, streams every reply line back on stdout, folds transport failures into a correlated `transport_error` envelope the app recognizes, and releases the daemon socket the moment the reply channel closes, so the app's streaming subscriptions terminate cleanly. Installing this fork makes HerdrUp connect without its \"herdr here is too old\" screen. Ported from jerryfane/herdr's api-bridge.\n\n### Changed (fork)\n- `herdr update` reads this fork's release manifest (`aceitw/herdr` master `latest.json`) instead of `herdr.dev`, so updates install fork binaries and never replace them with upstream builds. A fork install with `[update].channel = \"preview\"` now fails loudly on the manifest's stable channel instead of silently receiving an upstream preview binary.\n- Release CI now extracts each release's own changelog section into the manifest `notes` and refreshes `distribution/latest.json` in the same commit as `latest.json`, keeping the installer, `herdr update`, and the updater-schema test aligned on one manifest shape.\n\n### Fixed\n- Terminal shortcuts that send Escape followed by a key work again in panes. On macOS, Option+Left/Right and Option+Backspace from Ghostty's defaults or iTerm2's Natural Text Editing preset move and delete by word again, instead of typing `b` and `f` or deleting one character. Escape-based Shift+Enter bindings insert a newline in Claude Code instead of submitting. Clicking a pane still doesn't send a stray Escape. (#4751)\n- Alt+[ followed quickly by another key no longer merges into a different key. (#4751)",
   "assets": {
-    "linux-x86_64": "https://github.com/aceitw/herdr/releases/download/v0.9.3-fork/herdr-linux-x86_64",
-    "linux-aarch64": "https://github.com/aceitw/herdr/releases/download/v0.9.3-fork/herdr-linux-aarch64",
-    "macos-x86_64": "https://github.com/aceitw/herdr/releases/download/v0.9.3-fork/herdr-macos-x86_64",
-    "macos-aarch64": "https://github.com/aceitw/herdr/releases/download/v0.9.3-fork/herdr-macos-aarch64",
-    "windows-x86_64": "https://github.com/aceitw/herdr/releases/download/v0.9.3-fork/herdr-windows-x86_64.zip"
+    "linux-x86_64": "https://github.com/aceitw/herdr/releases/download/v0.9.3-fork3/herdr-linux-x86_64",
+    "linux-aarch64": "https://github.com/aceitw/herdr/releases/download/v0.9.3-fork3/herdr-linux-aarch64",
+    "macos-x86_64": "https://github.com/aceitw/herdr/releases/download/v0.9.3-fork3/herdr-macos-x86_64",
+    "macos-aarch64": "https://github.com/aceitw/herdr/releases/download/v0.9.3-fork3/herdr-macos-aarch64",
+    "windows-x86_64": "https://github.com/aceitw/herdr/releases/download/v0.9.3-fork3/herdr-windows-x86_64.zip"
   },
   "releases": {
     "0.7.0": {
@@ -465,27 +465,27 @@
       "notes": "This is a hotfix release for v0.9.2. See the v0.9.2 notes for the full feature release: https://github.com/herdrdev/herdr/releases/tag/v0.9.2\n\n### Added (fork)\n- Added the `herdr api-bridge` subcommand for the HerdrUp iOS app. The phone opens one SSH channel per request and runs `herdr [--session <name>] api-bridge '<base64 chunk>' '<chunk>' ...` against this machine; the bridge forwards the decoded JSON request to the active session's API socket, streams every reply line back on stdout, folds transport failures into a correlated `transport_error` envelope the app recognizes, and releases the daemon socket the moment the reply channel closes, so the app's streaming subscriptions terminate cleanly. Installing this fork makes HerdrUp connect without its \"herdr here is too old\" screen. Ported from jerryfane/herdr's api-bridge.\n\n### Changed (fork)\n- `herdr update` reads this fork's release manifest (`aceitw/herdr` master `latest.json`) instead of `herdr.dev`, so updates install fork binaries and never replace them with upstream builds. A fork install with `[update].channel = \"preview\"` now fails loudly on the manifest's stable channel instead of silently receiving an upstream preview binary.\n- Release CI now extracts each release's own changelog section into the manifest `notes` and refreshes `distribution/latest.json` in the same commit as `latest.json`, keeping the installer, `herdr update`, and the updater-schema test aligned on one manifest shape.\n\n### Fixed\n- Terminal shortcuts that send Escape followed by a key work again in panes. On macOS, Option+Left/Right and Option+Backspace from Ghostty's defaults or iTerm2's Natural Text Editing preset move and delete by word again, instead of typing `b` and `f` or deleting one character. Escape-based Shift+Enter bindings insert a newline in Claude Code instead of submitting. Clicking a pane still doesn't send a stray Escape. (#4751)\n- Alt+[ followed quickly by another key no longer merges into a different key. (#4751)",
       "protocol": 22,
       "assets": {
-        "linux-x86_64": "https://github.com/aceitw/herdr/releases/download/v0.9.3-fork/herdr-linux-x86_64",
-        "linux-aarch64": "https://github.com/aceitw/herdr/releases/download/v0.9.3-fork/herdr-linux-aarch64",
-        "macos-x86_64": "https://github.com/aceitw/herdr/releases/download/v0.9.3-fork/herdr-macos-x86_64",
-        "macos-aarch64": "https://github.com/aceitw/herdr/releases/download/v0.9.3-fork/herdr-macos-aarch64",
-        "windows-x86_64": "https://github.com/aceitw/herdr/releases/download/v0.9.3-fork/herdr-windows-x86_64.zip"
+        "linux-x86_64": "https://github.com/aceitw/herdr/releases/download/v0.9.3-fork3/herdr-linux-x86_64",
+        "linux-aarch64": "https://github.com/aceitw/herdr/releases/download/v0.9.3-fork3/herdr-linux-aarch64",
+        "macos-x86_64": "https://github.com/aceitw/herdr/releases/download/v0.9.3-fork3/herdr-macos-x86_64",
+        "macos-aarch64": "https://github.com/aceitw/herdr/releases/download/v0.9.3-fork3/herdr-macos-aarch64",
+        "windows-x86_64": "https://github.com/aceitw/herdr/releases/download/v0.9.3-fork3/herdr-windows-x86_64.zip"
       },
       "sha256": {
-        "linux-x86_64": "85f17e96645398fd7a8e3567601015debf12c81e762fe226ecdb14b8bbf678aa",
-        "linux-aarch64": "9ad60e05e1cfc6888d523ee4b6d04286e5dc14849c0a86cbeaa2450f1b8351a7",
-        "macos-x86_64": "128ea0ece17ba42b971845353efb43913d81d46a5db4cbdba4a6809491a74916",
-        "macos-aarch64": "2f1a81655cf6c7e90ea866765e4951e5ff6d7b0b19f167926c2293d3bb8e34ab",
-        "windows-x86_64": "99a7bbcb41ef4bd06f669913847bf1c0bcf024de80a7e1d22b7b51b175eeebe6"
+        "linux-x86_64": "11226be274a35e05eaf4fcc49382a8e89bc3a9f907121525bbba8a9df1c0b6f9",
+        "linux-aarch64": "3c0ed12778be9c9f6c94c33f2c1a75ee1e712c28dd05c1a567612f4b344c403f",
+        "macos-x86_64": "c4c5b31fbf29a1a80ac905122672a48a6957b730289037a1c0c8418782bc1ddc",
+        "macos-aarch64": "0f9187b7dafea8439ebaf28bf94f319efe07a8ebd4f0a8ecb51a3a7a159e8b28",
+        "windows-x86_64": "80225eb64c601f83823bb0ec84d2b8c97c9938c61bfdffcf044f9d1980a7171f"
       }
     }
   },
   "endpoint_generation": 1,
   "sha256": {
-    "linux-x86_64": "85f17e96645398fd7a8e3567601015debf12c81e762fe226ecdb14b8bbf678aa",
-    "linux-aarch64": "9ad60e05e1cfc6888d523ee4b6d04286e5dc14849c0a86cbeaa2450f1b8351a7",
-    "macos-x86_64": "128ea0ece17ba42b971845353efb43913d81d46a5db4cbdba4a6809491a74916",
-    "macos-aarch64": "2f1a81655cf6c7e90ea866765e4951e5ff6d7b0b19f167926c2293d3bb8e34ab",
-    "windows-x86_64": "99a7bbcb41ef4bd06f669913847bf1c0bcf024de80a7e1d22b7b51b175eeebe6"
+    "linux-x86_64": "11226be274a35e05eaf4fcc49382a8e89bc3a9f907121525bbba8a9df1c0b6f9",
+    "linux-aarch64": "3c0ed12778be9c9f6c94c33f2c1a75ee1e712c28dd05c1a567612f4b344c403f",
+    "macos-x86_64": "c4c5b31fbf29a1a80ac905122672a48a6957b730289037a1c0c8418782bc1ddc",
+    "macos-aarch64": "0f9187b7dafea8439ebaf28bf94f319efe07a8ebd4f0a8ecb51a3a7a159e8b28",
+    "windows-x86_64": "80225eb64c601f83823bb0ec84d2b8c97c9938c61bfdffcf044f9d1980a7171f"
   }
 }
