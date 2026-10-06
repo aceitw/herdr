@@ -6,6 +6,13 @@
 
 This is a hotfix release for v0.9.2. See the v0.9.2 notes for the full feature release: https://github.com/herdrdev/herdr/releases/tag/v0.9.2
 
+### Added (fork)
+- Added the `herdr api-bridge` subcommand for the HerdrUp iOS app. The phone opens one SSH channel per request and runs `herdr [--session <name>] api-bridge '<base64 chunk>' '<chunk>' ...` against this machine; the bridge forwards the decoded JSON request to the active session's API socket, streams every reply line back on stdout, folds transport failures into a correlated `transport_error` envelope the app recognizes, and releases the daemon socket the moment the reply channel closes, so the app's streaming subscriptions terminate cleanly. Installing this fork makes HerdrUp connect without its "herdr here is too old" screen. Ported from jerryfane/herdr's api-bridge.
+
+### Changed (fork)
+- `herdr update` reads this fork's release manifest (`aceitw/herdr` master `latest.json`) instead of `herdr.dev`, so updates install fork binaries and never replace them with upstream builds. A fork install with `[update].channel = "preview"` now fails loudly on the manifest's stable channel instead of silently receiving an upstream preview binary.
+- Release CI now extracts each release's own changelog section into the manifest `notes` and refreshes `distribution/latest.json` in the same commit as `latest.json`, keeping the installer, `herdr update`, and the updater-schema test aligned on one manifest shape.
+
 ### Fixed
 - Terminal shortcuts that send Escape followed by a key work again in panes. On macOS, Option+Left/Right and Option+Backspace from Ghostty's defaults or iTerm2's Natural Text Editing preset move and delete by word again, instead of typing `b` and `f` or deleting one character. Escape-based Shift+Enter bindings insert a newline in Claude Code instead of submitting. Clicking a pane still doesn't send a stray Escape. (#4751)
 - Alt+[ followed quickly by another key no longer merges into a different key. (#4751)
