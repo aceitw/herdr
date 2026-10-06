@@ -139,7 +139,12 @@ jobs:
       - name: Update latest.json
         run: |
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          # Fork tags may carry a suffix (e.g. v0.9.3-fork) while the manifest
+          # version stays the base semver: the updater's Version::parse only
+          # accepts exactly three integer components, and old installs keep
+          # seeing `version` 0.9.3 as up to date unless they rerun install.sh.
           VERSION="${TAG#v}"
+          VERSION="${VERSION%%-*}"
           BASE="https://github.com/aceitw/herdr/releases/download/${TAG}"
           export SHA_LINUX_X86_64="$(sha256sum herdr-linux-x86_64/herdr-linux-x86_64 | awk '{print $1}')"
           export SHA_LINUX_AARCH64="$(sha256sum herdr-linux-aarch64/herdr-linux-aarch64 | awk '{print $1}')"

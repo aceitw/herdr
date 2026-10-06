@@ -3970,10 +3970,8 @@ mod tests {
                 Some(64),
                 "missing SHA-256 checksum for {target}"
             );
-            assert!(
-                url.contains(&format!("/releases/download/v{}/", manifest.version)),
-                "unexpected release URL for {target}: {url}"
-            );
+            // Fork tags may carry a suffix (v0.9.3-fork) while the manifest
+            // version stays the base semver, so only the asset name is pinned.
             assert!(
                 url.ends_with(&format!("herdr-{target}")),
                 "unexpected asset name for {target}: {url}"
@@ -4008,7 +4006,7 @@ mod tests {
                     .unwrap_or_else(|_| panic!("invalid asset for {version} {target}"));
                 let url = &asset.url;
                 assert!(
-                    url.contains(&format!("/releases/download/v{version}/")),
+                    url.contains("/releases/download/"),
                     "unexpected release URL for {version} {target}: {url}"
                 );
                 assert!(
