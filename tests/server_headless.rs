@@ -102,7 +102,23 @@ fn spawn_server(
     config_home: &Path,
     runtime_dir: &Path,
     api_socket_path: &Path,
+    client_socket_path: &Path,
+) -> SpawnedHerdr {
+    spawn_server_with_relay(
+        config_home,
+        runtime_dir,
+        api_socket_path,
+        client_socket_path,
+        None,
+    )
+}
+
+fn spawn_server_with_relay(
+    config_home: &Path,
+    runtime_dir: &Path,
+    api_socket_path: &Path,
     _client_socket_path: &Path,
+    relay_socket: Option<&Path>,
 ) -> SpawnedHerdr {
     fs::create_dir_all(config_home.join("herdr")).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
@@ -130,6 +146,11 @@ fn spawn_server(
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("HERDR_ENV");
+    if let Some(socket) = relay_socket {
+        cmd.env("HERDR_GRAM_REVERSE_SOCKET", socket);
+    } else {
+        cmd.env_remove("HERDR_GRAM_REVERSE_SOCKET");
+    }
 
     let child = pair.slave.spawn_command(cmd).unwrap();
     register_spawned_herdr_pid(child.process_id());
@@ -151,6 +172,20 @@ fn ping_socket(socket_path: &Path) -> String {
     let mut response = String::new();
     reader.read_line(&mut response).unwrap();
     response.trim().to_string()
+}
+
+/// Send one JSON request line over the API socket and parse the single-line reply.
+fn api_request(socket_path: &Path, request: &str) -> serde_json::Value {
+    let mut stream = UnixStream::connect(socket_path).expect("should connect to API socket");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    writeln!(stream, "{request}").unwrap();
+
+    let mut reader = BufReader::new(stream);
+    let mut response = String::new();
+    reader.read_line(&mut response).unwrap();
+    serde_json::from_str(response.trim()).expect("API reply should be valid JSON")
 }
 
 // ---------------------------------------------------------------------------
@@ -230,6 +265,343 @@ fn server_api_responds_to_ping() {
     assert!(
         response.contains("pong"),
         "API should respond to ping: {response}"
+    );
+
+    cleanup_spawned_herdr(spawned, base);
+}
+
+#[test]
+fn gram_file_round_trip_upload_download_delete() {
+    use base64::Engine as _;
+
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+
+    // Upload "hello world" in two chunks under one upload id, exercising the
+    // offset-continuation path (chunk 1 must start where chunk 0 ended).
+    let upload_id = "int-upload-1";
+    let chunk0 = base64::engine::general_purpose::STANDARD.encode(b"hello ");
+    let chunk1 = base64::engine::general_purpose::STANDARD.encode(b"world");
+    let r0 = api_request(
+        &api_socket,
+        &format!(
+            r#"{{"id":"u0","method":"gram.upload_chunk","params":{{"upload_id":"{upload_id}","offset":0,"data_base64":"{chunk0}"}}}}"#
+        ),
+    );
+    assert_eq!(
+        r0["result"]["type"], "ok",
+        "chunk 0 should be accepted: {r0}"
+    );
+    let r1 = api_request(
+        &api_socket,
+        &format!(
+            r#"{{"id":"u1","method":"gram.upload_chunk","params":{{"upload_id":"{upload_id}","offset":6,"data_base64":"{chunk1}"}}}}"#
+        ),
+    );
+    assert_eq!(
+        r1["result"]["type"], "ok",
+        "chunk 1 should be accepted: {r1}"
+    );
+
+    // Attach the assembled upload to an owner post.
+    let post = api_request(
+        &api_socket,
+        &format!(
+            r#"{{"id":"p","method":"gram.post","params":{{"text":"here","file":{{"upload_id":"{upload_id}","name":"greeting.txt","mime":"text/plain"}}}}}}"#
+        ),
+    );
+    assert_eq!(
+        post["result"]["type"], "gram_sent",
+        "post should succeed: {post}"
+    );
+    let file = &post["result"]["message"]["file"];
+    assert_eq!(file["name"], "greeting.txt");
+    assert_eq!(file["size"].as_u64(), Some(11));
+    assert_eq!(file["mime"], "text/plain");
+    // sha256("hello world")
+    assert_eq!(
+        file["sha256"],
+        "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+    );
+    let message_id = post["result"]["message"]["id"]
+        .as_str()
+        .expect("message id")
+        .to_string();
+
+    // The bounded API returns exact bytes and the digest of the complete file.
+    let got = api_request(
+        &api_socket,
+        &format!(
+            r#"{{"id":"g","method":"gram.get_file_chunk","params":{{"id":"{message_id}","offset":0}}}}"#
+        ),
+    );
+    assert_eq!(
+        got["result"]["type"], "gram_file_chunk",
+        "get_file_chunk failed: {got}"
+    );
+    assert_eq!(got["result"]["size"], 11);
+    assert_eq!(got["result"]["offset"], 0);
+    assert_eq!(got["result"]["sha256"], file["sha256"]);
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(got["result"]["data_base64"].as_str().expect("data_base64"))
+        .unwrap();
+    assert_eq!(bytes, b"hello world");
+
+    // The bytes live on disk under the message id. A debug build namespaces the
+    // config dir as `herdr-dev`, matching the spawned binary.
+    let app_dir = if cfg!(debug_assertions) {
+        "herdr-dev"
+    } else {
+        "herdr"
+    };
+    let file_dir = config_home.join(format!("{app_dir}/gram-files/{message_id}"));
+    assert!(
+        file_dir.join("greeting.txt").exists(),
+        "file bytes should exist at {file_dir:?}"
+    );
+
+    // Delete the message (owner authority) and confirm the bytes are purged.
+    let del = api_request(
+        &api_socket,
+        &format!(r#"{{"id":"d","method":"gram.delete","params":{{"id":"{message_id}"}}}}"#),
+    );
+    assert_eq!(del["result"]["type"], "ok", "delete should succeed: {del}");
+    let gone = api_request(
+        &api_socket,
+        &format!(
+            r#"{{"id":"g2","method":"gram.get_file_chunk","params":{{"id":"{message_id}","offset":0}}}}"#
+        ),
+    );
+    assert!(
+        gone.get("error").is_some(),
+        "get_file after delete should error: {gone}"
+    );
+    assert!(
+        !file_dir.exists(),
+        "file bytes should be purged after delete: {file_dir:?}"
+    );
+
+    cleanup_spawned_herdr(spawned, base);
+}
+
+#[test]
+fn opted_in_remote_gram_refuses_methods_outside_restricted_relay() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    let relay_socket = base.join("absent-relay.sock");
+    let spawned = spawn_server_with_relay(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &client_socket,
+        Some(&relay_socket),
+    );
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+
+    let ping = api_request(&api_socket, r#"{"id":"ping","method":"ping","params":{}}"#);
+    assert_eq!(
+        ping["result"]["type"], "pong",
+        "server should be healthy: {ping}"
+    );
+    let post = api_request(
+        &api_socket,
+        r#"{"id":"post","method":"gram.post","params":{"text":"must not enter a second store"}}"#,
+    );
+    assert_eq!(
+        post["error"]["code"], "gram_relay_unsupported",
+        "owner post must not silently write the remote store: {post}"
+    );
+    let list = api_request(
+        &api_socket,
+        r#"{"id":"list","method":"gram.list","params":{}}"#,
+    );
+    assert_eq!(
+        list["error"]["code"], "gram_relay_unavailable",
+        "supported methods must use the absent coordinator, not the remote store: {list}"
+    );
+
+    cleanup_spawned_herdr(spawned, base);
+}
+
+#[test]
+fn gram_download_refuses_late_credentials_without_reveal() {
+    use base64::Engine as _;
+    use std::process::Command;
+
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+
+    let mut bytes = vec![b'a'; 512 * 1024];
+    bytes.extend(std::iter::repeat_n(b'b', 300_000));
+    let synthetic_token = format!("{}{}", "ghp_", "0a1b2c3d4e".repeat(4));
+    bytes.extend_from_slice(format!(" {synthetic_token}\n").as_bytes());
+    let upload_id = "late-secret-upload";
+    for (index, chunk) in bytes.chunks(256 * 1024).enumerate() {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(chunk);
+        let offset = index * 256 * 1024;
+        let response = api_request(
+            &api_socket,
+            &format!(
+                r#"{{"id":"upload-{index}","method":"gram.upload_chunk","params":{{"upload_id":"{upload_id}","offset":{offset},"data_base64":"{encoded}"}}}}"#
+            ),
+        );
+        assert_eq!(
+            response["result"]["type"], "ok",
+            "upload failed: {response}"
+        );
+    }
+    let post = api_request(
+        &api_socket,
+        &format!(
+            r#"{{"id":"post","method":"gram.post","params":{{"text":"attachment","file":{{"upload_id":"{upload_id}","name":"report.txt","mime":"text/plain"}}}}}}"#
+        ),
+    );
+    assert_eq!(post["result"]["type"], "gram_sent", "post failed: {post}");
+    let id = post["result"]["message"]["id"]
+        .as_str()
+        .expect("message id");
+    let out = base.join("download.txt");
+    let run_download = |reveal: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_herdr"));
+        command
+            .args(["gram", "get-file", id, "--out"])
+            .arg(&out)
+            .env("HERDR_SOCKET_PATH", &api_socket)
+            .env("XDG_CONFIG_HOME", &config_home)
+            .env_remove("HERDR_PANE_ID")
+            .env("XDG_RUNTIME_DIR", &runtime_dir);
+        if reveal {
+            command.arg("--reveal");
+        }
+        command.output().expect("gram get-file CLI")
+    };
+    let refused = run_download(false);
+    assert_eq!(
+        refused.status.code(),
+        Some(3),
+        "unexpected result: {refused:?}"
+    );
+    assert!(!out.exists(), "refusal must leave no partial download");
+    let allowed = run_download(true);
+    assert!(
+        allowed.status.success(),
+        "explicit reveal failed: {allowed:?}"
+    );
+    assert_eq!(fs::read(&out).unwrap(), bytes);
+
+    cleanup_spawned_herdr(spawned, base);
+}
+
+#[test]
+fn gram_file_rejects_oversized_mime_and_unknown_caller() {
+    use base64::Engine as _;
+
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+
+    // An over-long mime is rejected. Crucially, use a VALID staged upload so the
+    // ONLY thing that can reject the post is the mime cap — otherwise the finalize
+    // step would reject an unknown upload_id with the same invalid_params code and
+    // the test would pass even if the mime cap were removed.
+    let chunk = base64::engine::general_purpose::STANDARD.encode(b"secret-key");
+    let up_mime = api_request(
+        &api_socket,
+        &format!(
+            r#"{{"id":"um","method":"gram.upload_chunk","params":{{"upload_id":"mimecap","offset":0,"data_base64":"{chunk}"}}}}"#
+        ),
+    );
+    assert_eq!(
+        up_mime["result"]["type"], "ok",
+        "mime-cap upload: {up_mime}"
+    );
+    let big_mime = "x".repeat(300);
+    let bad_mime = api_request(
+        &api_socket,
+        &format!(
+            r#"{{"id":"m","method":"gram.post","params":{{"text":"","file":{{"upload_id":"mimecap","name":"x.txt","mime":"{big_mime}"}}}}}}"#
+        ),
+    );
+    assert_eq!(
+        bad_mime["error"]["code"], "invalid_params",
+        "an oversized mime must be rejected: {bad_mime}"
+    );
+    let mime_msg = bad_mime["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        mime_msg.contains("mime"),
+        "the rejection must be the mime cap, not a different invalid_params: {bad_mime}"
+    );
+
+    // Upload + post a real file to get a message id.
+    let up = api_request(
+        &api_socket,
+        &format!(
+            r#"{{"id":"u","method":"gram.upload_chunk","params":{{"upload_id":"u1","offset":0,"data_base64":"{chunk}"}}}}"#
+        ),
+    );
+    assert_eq!(up["result"]["type"], "ok", "upload: {up}");
+    let post = api_request(
+        &api_socket,
+        r#"{"id":"p","method":"gram.post","params":{"text":"","file":{"upload_id":"u1","name":"k.txt","mime":"text/plain"}}}"#,
+    );
+    let message_id = post["result"]["message"]["id"]
+        .as_str()
+        .expect("message id")
+        .to_string();
+
+    // A caller_pane_id that names no live pane is rejected as unknown_caller — NOT
+    // silently treated as the owner — so an agent cannot bypass the audience check
+    // by supplying a bogus pane. (An omitted caller_pane_id is still the owner;
+    // that cooperative-filtering boundary is documented, not authenticated.)
+    let denied = api_request(
+        &api_socket,
+        &format!(
+            r#"{{"id":"d","method":"gram.get_file","params":{{"id":"{message_id}","caller_pane_id":"w9:p9"}}}}"#
+        ),
+    );
+    assert_eq!(
+        denied["error"]["code"], "unknown_caller",
+        "a bogus caller pane must not fall through to owner authority: {denied}"
+    );
+    let denied_chunk = api_request(
+        &api_socket,
+        &format!(
+            r#"{{"id":"dc","method":"gram.get_file_chunk","params":{{"id":"{message_id}","offset":0,"caller_pane_id":"w9:p9"}}}}"#
+        ),
+    );
+    assert_eq!(denied_chunk["error"]["code"], "unknown_caller");
+
+    // The owner (no caller pane) can still read it.
+    let owner = api_request(
+        &api_socket,
+        &format!(r#"{{"id":"o","method":"gram.get_file","params":{{"id":"{message_id}"}}}}"#),
+    );
+    assert_eq!(
+        owner["result"]["type"], "gram_file_content",
+        "the owner can read the file: {owner}"
     );
 
     cleanup_spawned_herdr(spawned, base);

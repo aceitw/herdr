@@ -129,6 +129,8 @@ fn test_headless_server_with_event_hub(event_hub: api::EventHub) -> HeadlessServ
         handoff_in_progress: false,
         #[cfg(unix)]
         pending_handoff_repaint_nudge: false,
+        #[cfg(unix)]
+        guest_link: None,
         should_quit,
         server_event_rx,
         server_event_tx,
@@ -776,6 +778,7 @@ async fn completion_guard_endpoint_pairs_runtime_completions_with_snapshots() {
         for state in [first_state, crate::detect::AgentState::Idle] {
             server.app.state.handle_app_event(AppEvent::StateChanged {
                 pane_id,
+                runtime_epoch: None,
                 agent: Some(crate::detect::Agent::Pi),
                 state,
                 visible_blocker: false,
@@ -2694,6 +2697,7 @@ async fn public_agent_focus_replaces_a_diverged_client_shell_projection() {
             pane_id: first_pane,
             agent: crate::detect::Agent::Claude,
             observed_at: Instant::now(),
+            runtime_epoch: None,
         })
         .unwrap();
     let (respond_to, response_rx) = std::sync::mpsc::channel();
@@ -4693,6 +4697,7 @@ async fn host_shutdown_preserves_panes_from_queued_and_selected_death_events() {
     server.app.state.active = Some(0);
     let event = || AppEvent::PaneDied {
         pane_id,
+        runtime_epoch: None,
         exit_reason: crate::platform::ChildExitReason::Exited,
     };
     server.app.event_tx.try_send(event()).unwrap();
@@ -4751,7 +4756,8 @@ async fn pane_death_reconciles_each_client_view_and_focus() {
     assert!(
         server.handle_internal_event_with_forwarding(AppEvent::PaneDied {
             pane_id: dead_pane,
-            exit_reason: crate::platform::ChildExitReason::Exited
+            exit_reason: crate::platform::ChildExitReason::Exited,
+            runtime_epoch: None,
         })
     );
 
@@ -4820,7 +4826,8 @@ async fn pane_death_reapplies_controller_geometry() {
     assert!(
         server.handle_internal_event_with_forwarding(AppEvent::PaneDied {
             pane_id: dead_pane,
-            exit_reason: crate::platform::ChildExitReason::Exited
+            exit_reason: crate::platform::ChildExitReason::Exited,
+            runtime_epoch: None,
         })
     );
 
@@ -5005,7 +5012,8 @@ fn expected_worktree_runtime_exit_does_not_release_agent() {
     assert!(
         server.handle_internal_event_with_forwarding(AppEvent::PaneDied {
             pane_id,
-            exit_reason: crate::platform::ChildExitReason::Exited
+            exit_reason: crate::platform::ChildExitReason::Exited,
+            runtime_epoch: None,
         })
     );
 
@@ -5663,6 +5671,8 @@ fn headless_scheduled_tasks_expire_agent_metadata() {
             pane_id,
             source: "custom:pi".into(),
             agent_label: "pi".into(),
+            process_pid: None,
+            session_cursor: None,
             state: crate::detect::AgentState::Working,
             message: None,
             seq: None,
@@ -7320,6 +7330,8 @@ fn api_report_agent_stores_valid_resume_argv_and_rejects_invalid() {
             seq: Some(1),
             agent_session_id: Some("01a0".into()),
             agent_session_path: None,
+            agent_session_cursor: None,
+            agent_process_pid: None,
             resume_argv: Some(resume_argv.into_iter().map(String::from).collect()),
         })
     };
@@ -7379,6 +7391,8 @@ fn api_report_agent_stores_valid_resume_argv_and_rejects_invalid() {
                     seq: None,
                     agent_session_id: None,
                     agent_session_path: None,
+                    agent_session_cursor: None,
+                    agent_process_pid: None,
                     session_start_source: None,
                     resume_argv: Some(vec!["intruder".into()]),
                 },
@@ -7410,6 +7424,7 @@ fn api_resume_argv_is_ignored_when_its_session_report_is_refused() {
         .clone();
     server.handle_internal_event_with_forwarding(AppEvent::AgentProcessDetected {
         pane_id,
+        runtime_epoch: None,
         agent: crate::detect::Agent::Claude,
         observed_at: Instant::now(),
     });
@@ -7421,6 +7436,8 @@ fn api_resume_argv_is_ignored_when_its_session_report_is_refused() {
             seq: None,
             agent_session_id: Some(session.into()),
             agent_session_path: None,
+            agent_session_cursor: None,
+            agent_process_pid: None,
             session_start_source: None,
             resume_argv: Some(vec!["claude".into(), "--resume".into(), session.into()]),
         })
@@ -7474,6 +7491,7 @@ fn completion_guard_api_startup_blocker_respects_suppression() {
     let (mut server, pane_id) = completion_guard_server(writer);
     server.handle_internal_event_with_forwarding(AppEvent::AgentProcessDetected {
         pane_id,
+        runtime_epoch: None,
         agent: crate::detect::Agent::Pi,
         observed_at: Instant::now(),
     });
@@ -7496,6 +7514,8 @@ fn completion_guard_api_startup_blocker_respects_suppression() {
                 seq: Some(seq as u64 + 1),
                 agent_session_id: None,
                 agent_session_path: None,
+                agent_session_cursor: None,
+                agent_process_pid: None,
                 resume_argv: None,
             }),
         );
@@ -7560,6 +7580,8 @@ fn completion_guard_api_session_replacement_does_not_notify_finished() {
                     seq: Some(11),
                     agent_session_id: None,
                     agent_session_path: Some(new_session.clone()),
+                    agent_session_cursor: None,
+                    agent_process_pid: None,
                     resume_argv: None,
                     session_start_source: Some(reason.into()),
                 }),
@@ -7573,6 +7595,8 @@ fn completion_guard_api_session_replacement_does_not_notify_finished() {
                 seq: Some(12),
                 agent_session_id: None,
                 agent_session_path: Some(new_session.clone()),
+                agent_session_cursor: None,
+                agent_process_pid: None,
                 resume_argv: None,
             };
             completion_guard_api_report(&mut server, Method::PaneReportAgent(report.clone()));
@@ -7638,6 +7662,7 @@ fn startup_idle_does_not_forward_completion() {
             pane_id,
             agent: crate::detect::Agent::Pi,
             observed_at: Instant::now(),
+            runtime_epoch: None,
         })
     );
 
@@ -7662,6 +7687,7 @@ fn startup_idle_does_not_forward_completion() {
     assert!(
         server.handle_internal_event_with_forwarding(AppEvent::StateChanged {
             pane_id,
+            runtime_epoch: None,
             agent: Some(crate::detect::Agent::Pi),
             state: crate::detect::AgentState::Idle,
             visible_blocker: false,
@@ -7758,6 +7784,8 @@ fn stale_api_agent_report_does_not_forward_done_sound() {
             method: api::schema::Method::PaneReportAgent(api::schema::PaneReportAgentParams {
                 pane_id: public_pane_id,
                 source: "herdr:pi".into(),
+                agent_process_pid: None,
+                agent_session_cursor: None,
                 agent: "pi".into(),
                 state: api::schema::PaneAgentState::Idle,
                 message: None,

@@ -22,13 +22,18 @@ macro_rules! println {
     }};
 }
 
+mod accounts;
 mod agent;
 mod api;
 mod completion;
 mod gram;
+mod guest;
 mod integration;
 mod machine;
+mod machine_federation;
 mod notification;
+mod pair;
+mod pair_qr;
 mod pane;
 mod plugin;
 mod protocol_guard;
@@ -116,6 +121,7 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
             exit_code
         }
         "api" => api::run_api_command(&args[2..])?,
+        "accounts" => accounts::run_accounts_command(&args[2..])?,
         "status" => status::run_status_command(&args[2..])?,
         "completion" | "completions" => completion::run_completion_command(&args[2..])?,
         "config" => run_config_command(&args[2..])?,
@@ -125,13 +131,15 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
         "worktree" => worktree::run_worktree_command(&args[2..])?,
         "tab" => tab::run_tab_command(&args[2..])?,
         "notification" => notification::run_notification_command(&args[2..])?,
+        "gram" => gram::run_gram_command(&args[2..])?,
+        "guest" => guest::run_guest_command(&args[2..])?,
         "agent" => agent::run_agent_command(&args[2..])?,
         "terminal" => run_terminal_command(&args[2..])?,
+        "pair" => pair::run_pair_command(&args[2..])?,
         "pane" => pane::run_pane_command(&args[2..])?,
         "plugin" => plugin::run_plugin_command(&args[2..])?,
         "integration" => integration::run_integration_command(&args[2..])?,
         "session" => run_session_command(&args[2..])?,
-        "gram" => gram::run_gram_command(&args[2..])?,
         _ => return Ok(CommandOutcome::NotCli),
     };
 
@@ -236,15 +244,14 @@ fn parse_channel_set_arg(args: &[String]) -> Option<&str> {
     }
 }
 
-fn channel_set_rejection(
-    channel: &str,
-    install_rejection: Option<&'static str>,
-) -> Option<&'static str> {
-    if channel == "preview" {
-        return install_rejection;
+/// Refuse before persisting a channel the update will not follow: HerdrUp publishes
+/// no stable channel, so writing `stable` would only make every later update refuse.
+fn channel_set_rejection(channel: &str, install_rejection: Option<&'static str>) -> Option<String> {
+    if channel == "stable" {
+        return Some(crate::update::stable_channel_refusal());
     }
 
-    None
+    install_rejection.map(str::to_string)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1000,7 +1007,9 @@ fn print_session_table(sessions: &[crate::session::SessionInfo]) {
         println!(
             "{:<20} {:<8} {:<48} {}",
             session.name,
-            if session.running {
+            if session.connection_error.is_some() {
+                "unavailable"
+            } else if session.running {
                 "running"
             } else {
                 "stopped"
@@ -1008,6 +1017,9 @@ fn print_session_table(sessions: &[crate::session::SessionInfo]) {
             session.session_dir,
             session.socket_path
         );
+        if let Some(error) = &session.connection_error {
+            println!("  {error}");
+        }
     }
 }
 
@@ -1073,16 +1085,18 @@ mod tests {
     }
 
     #[test]
-    fn channel_set_only_applies_package_rejection_to_preview() {
+    fn channel_set_refuses_stable_and_applies_package_rejection_to_preview() {
         assert_eq!(
-            super::channel_set_rejection("preview", Some("no preview")),
+            super::channel_set_rejection("preview", Some("no preview")).as_deref(),
             Some("no preview")
         );
-        assert_eq!(
-            super::channel_set_rejection("stable", Some("no preview")),
-            None
-        );
         assert_eq!(super::channel_set_rejection("preview", None), None);
+        let stable = super::channel_set_rejection("stable", None)
+            .expect("HerdrUp publishes no stable channel to switch to");
+        assert!(
+            stable.contains(crate::update::FORK_INSTALL_COMMAND),
+            "stable refusal does not name the fork installer: {stable}"
+        );
     }
 
     #[test]

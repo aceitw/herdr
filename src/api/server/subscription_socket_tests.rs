@@ -3,7 +3,7 @@ use crate::api::schema::{
     AgentStatus, EventData, EventEnvelope, EventKind, PaneInfo, PaneReadResult, ReadFormat,
     ReadSource,
 };
-use crate::ipc::{poll_local_stream_read_count, LocalStreamReadCount};
+use crate::ipc::{poll_local_stream_read_count, set_local_stream_polling, LocalStreamReadCount};
 use interprocess::local_socket::traits::Listener as _;
 use serde_json::{json, Value};
 use std::sync::atomic::AtomicU64;
@@ -232,10 +232,17 @@ fn reply_to_probe(request: ApiRequestMessage) {
                 terminal_title_stripped: None,
                 display_agent: None,
                 agent_status: AgentStatus::Working,
+                input_pending: false,
+                input_prompt_kind: None,
+                composer: Default::default(),
                 state_labels: Default::default(),
                 tokens: Default::default(),
                 agent_session: None,
+                last_completed_turn: None,
+                turn: None,
+                turn_epoch: None,
                 scroll: None,
+                alternate_screen: false,
                 revision: 0,
             },
         },
@@ -295,7 +302,8 @@ fn assert_subscription_history_loss(agent_status: bool) {
     // Hold the setup probe after the server pins its subscription cursor.
     let probe = test.app_request();
     assert!(probe.request.id.ends_with(":probe"));
-    for index in 0..600 {
+    // Overflow the retained ring so the pinned cursor falls out of history.
+    for index in 0..EventHub::MAX_EVENTS + 88 {
         test.hub.push(renamed_event(index));
     }
     reply_to_probe(probe);
@@ -324,10 +332,15 @@ fn lagging_subscription_closes_without_interrupting_other_clients() {
     let paused_read = test.app_request();
     assert_eq!(paused_read.request.id, "slow:sub:1:read");
     assert!(matches!(paused_read.request.method, Method::PaneRead(_)));
-    // All five batches must finish before the held app request can time out.
+    // Five quarter-ring batches overflow the retained ring behind the paused
+    // cursor while the healthy reader drains each batch before the next. Each
+    // batch costs one connection poll interval, so all five finish well before
+    // the held app request can time out.
+    const BATCH: usize = EventHub::MAX_EVENTS / 4;
+    let batches = EventHub::MAX_EVENTS / BATCH + 1;
     let deadline = Instant::now() + RESPONSE_TIMEOUT;
-    for batch in 0..5 {
-        let indices = batch * 128..(batch + 1) * 128;
+    for batch in 0..batches {
+        let indices = batch * BATCH..(batch + 1) * BATCH;
         for index in indices.clone() {
             test.hub.push(renamed_event(index));
         }
@@ -336,8 +349,9 @@ fn lagging_subscription_closes_without_interrupting_other_clients() {
 
     reply_to_probe(paused_read);
     slow.assert_history_lost("slow");
-    test.hub.push(renamed_event(640));
-    healthy.assert_renames(640..641, Instant::now() + RESPONSE_TIMEOUT);
+    let next = batches * BATCH;
+    test.hub.push(renamed_event(next));
+    healthy.assert_renames(next..next + 1, Instant::now() + RESPONSE_TIMEOUT);
 
     let mut ordinary = test.connect();
     ordinary.send(json!({"id": "ordinary", "method": "workspace.list", "params": {}}));

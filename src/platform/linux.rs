@@ -325,6 +325,14 @@ pub(crate) fn interactive_shell_command(argv: &[String], shell_name: &str) -> Op
     super::interactive_unix_shell_command(argv, shell_name, shell_quote)
 }
 
+pub(crate) fn managed_resume_shell_command(
+    argv: &[String],
+    shell_name: &str,
+    replace_shell: bool,
+) -> Option<String> {
+    super::managed_unix_resume_shell_command(argv, shell_name, replace_shell, shell_quote)
+}
+
 fn shell_quote(value: &str) -> String {
     if !value.is_empty()
         && value.chars().all(|ch| {
@@ -795,6 +803,10 @@ pub fn read_clipboard_text() -> Option<String> {
     None
 }
 
+pub fn clipboard_text_matches(_bytes: &[u8]) -> Option<bool> {
+    None
+}
+
 pub fn open_url(url: &str) -> std::io::Result<Option<std::process::Child>> {
     Command::new("xdg-open")
         .arg(url)
@@ -803,6 +815,39 @@ pub fn open_url(url: &str) -> std::io::Result<Option<std::process::Child>> {
         .stderr(Stdio::null())
         .spawn()
         .map(Some)
+}
+
+pub(crate) fn open_path(path: &std::path::Path) -> std::io::Result<Option<std::process::Child>> {
+    Command::new("xdg-open")
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(Some)
+}
+
+pub(crate) fn tailscale_cli_candidates() -> Vec<super::TailscaleCliCandidate> {
+    vec![super::TailscaleCliCandidate::new("tailscale")]
+}
+
+pub(crate) fn private_lan_ipv4() -> std::io::Result<Option<std::net::Ipv4Addr>> {
+    let out = Command::new("hostname").arg("-I").output()?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .filter_map(|token| token.parse::<std::net::Ipv4Addr>().ok())
+        .find(|addr| crate::pairing::is_private_address(*addr) && !addr.is_loopback()))
+}
+
+pub(crate) fn lan_pairing_help() -> &'static str {
+    "Pair over a private local network instead of Tailscale (RFC1918 only; a public address is refused)"
+}
+
+pub(crate) fn ssh_pairing_setup_hint() -> &'static str {
+    "Start the SSH server (sshd), then run `herdr pair` again."
 }
 
 pub fn read_clipboard_image() -> Option<ClipboardImage> {

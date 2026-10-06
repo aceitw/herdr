@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-use super::agents::AgentInfo;
-use super::common::{ClientWindowTitleReason, NotificationShowReason};
+use super::agents::{AgentInfo, AgentPromptDelivery};
+use super::common::{ClientWindowTitleReason, NotificationShowReason, NotificationsStatusState};
 use super::events::EventEnvelope;
 use super::gram::GramMessageInfo;
 use super::integrations::{
@@ -10,7 +10,7 @@ use super::integrations::{
 use super::panes::{
     LayoutDescription, PaneEdgesResult, PaneFocusDirectionResult, PaneInfo, PaneLayoutSnapshot,
     PaneMoveResult, PaneNeighborResult, PaneProcessInfo, PaneReadResult, PaneResizeResult,
-    PaneSwapResult, PaneTextPoint, PaneTextRange, PaneZoomResult,
+    PaneSwapResult, PaneTextPoint, PaneTextRange, PaneTurnsResult, PaneZoomResult,
 };
 use super::plugins::{
     InstalledPluginInfo, PluginActionInfo, PluginCommandLogInfo, PluginInvocationContext,
@@ -104,9 +104,38 @@ pub enum ResponseResult {
     },
     AgentPrompted {
         agent: AgentInfo,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery: Option<AgentPromptDelivery>,
     },
     AgentList {
         agents: Vec<AgentInfo>,
+        /// Install-stable identity of the daemon that produced this response.
+        /// Older peers omit it. It is a pinning value, not an authenticator.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_machine_id: Option<String>,
+        /// Opaque identity of the daemon process that produced this response.
+        /// Changes on restart and fences replies from an earlier remote boot.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_boot_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_version: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_protocol: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_capabilities: Option<ServerCapabilities>,
+    },
+    MachineStatus {
+        machines: std::collections::BTreeMap<String, super::CoordinatorMachineStatus>,
+    },
+    AccountsList {
+        accounts: Vec<super::accounts::AccountInfo>,
+    },
+    AgentKinds {
+        kinds: Vec<AgentKindInfo>,
+    },
+    DirList {
+        path: String,
+        entries: Vec<DirEntryInfo>,
     },
     AgentView {
         active: bool,
@@ -123,6 +152,9 @@ pub enum ResponseResult {
     },
     PaneCurrent {
         pane: PaneInfo,
+    },
+    PaneTurns {
+        turns: PaneTurnsResult,
     },
     PaneSwap {
         swap: PaneSwapResult,
@@ -160,6 +192,20 @@ pub enum ResponseResult {
     PaneResize {
         resize: PaneResizeResult,
     },
+    PanePtySize {
+        pane_id: String,
+        cols: u16,
+        rows: u16,
+        locked: bool,
+    },
+    StreamStarted {
+        pane_id: String,
+        epoch: u64,
+        cols: u16,
+        rows: u16,
+        base_seq: u64,
+        resync: bool,
+    },
     PaneRead {
         read: PaneReadResult,
     },
@@ -185,7 +231,12 @@ pub enum ResponseResult {
     AgentExplain {
         explain: serde_json::Value,
     },
-    SubscriptionStarted {},
+    SubscriptionStarted {
+        /// Entries an `events_v2` request skipped because their pane does not
+        /// exist. Omitted when every entry was subscribed.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        rejected: Vec<super::events::SubscriptionRejection>,
+    },
     WaitMatched {
         event: EventEnvelope,
     },
@@ -198,6 +249,58 @@ pub enum ResponseResult {
     NotificationShow {
         shown: bool,
         reason: NotificationShowReason,
+    },
+    /// A new guest invite. The secret exists only inside the two links.
+    GuestInviteCreated {
+        invite: super::guest::GuestInviteInfo,
+        url: String,
+        web_url: String,
+    },
+    /// Guests, invites and relay link state. Never includes secrets or keys.
+    GuestList {
+        guests: Vec<super::guest::GuestInfo>,
+        invites: Vec<super::guest::GuestInviteInfo>,
+        link: super::guest::GuestLinkInfo,
+    },
+    GuestRevoked {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        guest_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        invite_id: Option<String>,
+        /// Live guest streams closed by this revoke.
+        closed_streams: usize,
+    },
+    /// The guest after `guest.update`.
+    GuestUpdated {
+        guest: super::guest::GuestInfo,
+    },
+    GuestAudit {
+        entries: Vec<super::guest::GuestAuditEntry>,
+    },
+    /// Internal: the guest gate's agent lookup plus its live-agent check.
+    #[cfg(unix)]
+    #[schemars(skip)]
+    GuestAgentProbed {
+        /// Public pane id currently showing the terminal.
+        pane_id: String,
+        /// `None` when the pane no longer hosts an agent.
+        agent: Option<AgentInfo>,
+        running: bool,
+    },
+    /// Effective Gram relay policy for both roles. Never includes secrets.
+    GramRelayStatus {
+        coordinator: super::gram::GramRelayCoordinatorStatus,
+        remote: super::gram::GramRelayRemoteStatus,
+    },
+    /// Remote push readiness. Counts only; never tokens, capabilities, or key material.
+    NotificationsStatus {
+        state: NotificationsStatusState,
+        mode: crate::config::PushMode,
+        relay_url: String,
+        /// Registered push devices.
+        devices: u64,
+        /// Registered devices that carry a relay capability.
+        relay_devices: u64,
     },
     ClientWindowTitle {
         changed: bool,
@@ -279,28 +382,36 @@ pub enum ResponseResult {
         projection_revision: u64,
     },
     GramSent {
-        /// The stored message as clients see it.
         message: GramMessageInfo,
-        /// Install-stable identity of the store this send landed in.
+        /// Install-stable identity of the store this send landed in (the responding
+        /// daemon's `machine` id). Lets a sender see WHICH store its gram was
+        /// written to, so a send that lands where the owner never reads becomes
+        /// visible instead of silent. See issue #98.
         store_id: String,
     },
     GramList {
         messages: Vec<GramMessageInfo>,
-        /// Install-stable identity of the store these messages were read from.
-        /// Present even when `messages` is empty.
+        /// Install-stable identity of the store these messages were read from (the
+        /// responding daemon's `machine` id). Present even when `messages` is empty,
+        /// so a reader can tell which store it is looking at when it appears empty.
         store_id: String,
-        /// Fingerprint of the whole filtered list this answer was cut from — NOT
-        /// of the page. Send it back as `if_unchanged_digest` to make the next
-        /// HEAD-style poll conditional.
+        /// Fingerprint of the whole filtered list this answer was cut from — NOT of
+        /// the page. Send it back as `if_unchanged_digest` to make the next head poll
+        /// conditional. Computed over the serialized messages themselves, so it
+        /// changes exactly when the answer would differ and there is no field list to
+        /// keep in step as `GramMessageInfo` grows.
         digest: String,
         /// Whether messages older than this page remain. Always `false` for an
-        /// unpaged answer.
+        /// unpaged answer, which by definition already reaches the oldest message.
         has_more: bool,
-        /// Unread count over the WHOLE filtered list, never just the page.
+        /// Unread count over the WHOLE filtered list, never just the page: the app's
+        /// badge and its Read-all affordance must stay correct while the reader holds
+        /// only the newest window.
         unread_count: usize,
     },
     /// `gram.list` with an `if_unchanged_digest` that still matches: nothing has
-    /// changed, so the messages are omitted entirely.
+    /// changed, so the messages are omitted entirely. A client holding that digest
+    /// already has the list; one that never sent the parameter never receives this.
     GramListUnchanged {
         store_id: String,
         digest: String,
@@ -308,7 +419,60 @@ pub enum ResponseResult {
     GramGrabbed {
         message: GramMessageInfo,
     },
+    GramFileContent {
+        name: String,
+        mime: String,
+        size: u64,
+        data_base64: String,
+    },
+    /// One bounded range of an attachment. `sha256` and `size` describe the
+    /// complete committed file, so a downloader can reject truncation/corruption.
+    GramFileChunk {
+        name: String,
+        mime: String,
+        size: u64,
+        sha256: String,
+        offset: u64,
+        data_base64: String,
+    },
+    /// `server.staged_update` — the running daemon version/protocol/commit, plus the staged (built
+    /// but not-yet-running) build if one is available. `staged` present with a `sha` different from
+    /// `running_sha` means an update is ready to apply. `running_sha` is the running binary's short
+    /// git commit, absent on a build with no git context.
+    StagedUpdate {
+        running_version: String,
+        running_protocol: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        running_sha: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        staged: Option<StagedBuildInfo>,
+    },
     Ok {},
+}
+
+/// A staged (built, not-yet-running) daemon build, as returned to a client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct StagedBuildInfo {
+    pub version: String,
+    pub sha: String,
+    pub built_at: String,
+}
+
+/// One known agent kind and whether its interactive harness binary is installed
+/// on the daemon's `$PATH`, as returned by `agent.kinds`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentKindInfo {
+    pub kind: String,
+    pub installed: bool,
+}
+
+/// One entry in a directory listing returned by `fs.list_dir`. `name` is the
+/// entry's file name only (not a full path); `is_dir` is resolved through
+/// symlinks, so a symlink to a directory reports `true`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DirEntryInfo {
+    pub name: String,
+    pub is_dir: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -316,6 +480,10 @@ pub struct AgentManifestInfo {
     pub agent: String,
     pub source: String,
     pub source_kind: String,
+    /// The active manifest declares a composer observation region; runtime
+    /// visibility can still prevent confirmation of a particular submission.
+    #[serde(default)]
+    pub submission_verification_supported: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

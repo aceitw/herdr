@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use crate::api::client::{parse_response_value, ApiClientError};
 use crate::api::schema::{Method, Request, ResponseResult, ServerSshAgentRegisterParams};
-use crate::ipc::{LocalStream, LocalStreamRead, LocalStreamReadCount};
+use crate::ipc::{LocalStream, LocalStreamReadCount};
 
 pub(super) struct Registration {
     stop: Arc<AtomicBool>,
@@ -37,8 +37,8 @@ impl Registration {
             while !worker_stop.load(Ordering::Relaxed) {
                 if let Some(connection) = stream.as_mut() {
                     if !matches!(
-                        crate::ipc::poll_local_stream_read(connection, &mut byte),
-                        Ok(LocalStreamRead::Pending)
+                        crate::ipc::poll_local_stream_read_count(connection, &mut byte),
+                        Ok(LocalStreamReadCount::Pending)
                     ) {
                         stream = None;
                     }

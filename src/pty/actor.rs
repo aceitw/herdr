@@ -1,3 +1,23 @@
+pub(crate) const SUBMISSION_TEXT_UNWRITTEN: std::io::ErrorKind = std::io::ErrorKind::NotConnected;
+
+pub(crate) fn submission_text_unwritten(source: &std::io::Error) -> std::io::Error {
+    std::io::Error::new(SUBMISSION_TEXT_UNWRITTEN, source.to_string())
+}
+
+#[derive(Clone)]
+pub(crate) struct SubmissionGuard {
+    pub(crate) occupant_unchanged: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+    pub(crate) watch: Option<std::sync::Arc<crate::terminal::PromptSubmitWatch>>,
+}
+
+impl std::fmt::Debug for SubmissionGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SubmissionGuard")
+            .field("watch", &self.watch.is_some())
+            .finish()
+    }
+}
+
 #[cfg(unix)]
 mod unix;
 
@@ -6,6 +26,7 @@ pub(crate) use unix::*;
 
 #[cfg(windows)]
 mod windows {
+    use super::SubmissionGuard;
     use std::io::{Read, Write};
     use std::sync::{mpsc as std_mpsc, Arc, Mutex};
     use std::time::{Duration, Instant};
@@ -50,6 +71,7 @@ mod windows {
             enter: Bytes,
             delay: Duration,
             deadline: Option<Instant>,
+            guard: Option<SubmissionGuard>,
             reply: std_mpsc::Sender<std::io::Result<()>>,
         },
     }
@@ -107,12 +129,13 @@ mod windows {
                 })
         }
 
-        pub(crate) fn queue_user_input_submission(
+        pub(crate) fn queue_user_input_submission_guarded(
             &self,
             text: Bytes,
             enter: Bytes,
             delay: Duration,
             deadline: Option<Instant>,
+            guard: Option<SubmissionGuard>,
         ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
             let accepting = self
                 .accepting
@@ -132,6 +155,7 @@ mod windows {
                     delay,
                     deadline,
                     reply: reply_tx,
+                    guard,
                 })
                 .map_err(|err| match err {
                     mpsc::error::TrySendError::Full(_) => std::io::Error::new(
@@ -225,6 +249,7 @@ mod windows {
             {
                 let write_tx = write_tx.clone();
                 let response_order = Arc::clone(&response_order);
+                let accepting = Arc::clone(&accepting);
                 std::thread::spawn(move || {
                     let mut buf = [0u8; 8192];
                     loop {
@@ -246,6 +271,9 @@ mod windows {
                                 break;
                             }
                         }
+                    }
+                    if let Ok(mut accepting) = accepting.lock() {
+                        *accepting = false;
                     }
                     if let Some(on_reader_exit) = on_reader_exit {
                         on_reader_exit();
@@ -340,6 +368,7 @@ mod windows {
                     delay,
                     deadline,
                     reply,
+                    guard,
                 } => {
                     let result = if deadline.is_some_and(|deadline| {
                         deadline.saturating_duration_since(Instant::now()) <= delay
@@ -348,22 +377,70 @@ mod windows {
                     } else {
                         let text_deadline =
                             deadline.and_then(|deadline| deadline.checked_sub(delay));
-                        write_submission_part(&write_tx, text, text_deadline).and_then(|()| {
-                            // A started text write is committed. Finish Enter even if the caller
-                            // stops waiting so a timeout cannot leave a partial prompt.
-                            std::thread::sleep(delay);
-                            let accepting = accepting
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner());
-                            if !*accepting {
-                                return Err(pty_actor_closed());
-                            }
-                            write_submission_part(&write_tx, enter, None)
-                        })
+                        write_submission_part(&write_tx, text, text_deadline)
+                            .map_err(|err| {
+                                if err.kind() == std::io::ErrorKind::TimedOut {
+                                    err
+                                } else {
+                                    super::submission_text_unwritten(&err)
+                                }
+                            })
+                            .and_then(|()| {
+                                // A started text write is committed. Finish Enter even if the caller
+                                // stops waiting so a timeout cannot leave a partial prompt.
+                                std::thread::sleep(delay);
+                                let accepting = accepting
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                if !*accepting {
+                                    return Err(pty_actor_closed());
+                                }
+                                if let Some(guard) = guard.as_ref() {
+                                    if !(guard.occupant_unchanged)() {
+                                        if let Some(watch) = guard.watch.as_ref() {
+                                            watch.abandoned.store(
+                                                true,
+                                                std::sync::atomic::Ordering::SeqCst,
+                                            );
+                                        }
+                                        tracing::warn!(
+                                            event = "pty.submission.withheld",
+                                            subsystem = "pty",
+                                            "delayed PTY input withheld: pane occupant changed during the submit delay"
+                                        );
+                                        return Err(std::io::Error::new(
+                                            std::io::ErrorKind::Interrupted,
+                                            "pane occupant changed before prompt submission",
+                                        ));
+                                    }
+                                }
+                                let written = write_submission_part(&write_tx, enter, None);
+                                if written.is_ok() {
+                                    if let Some(watch) =
+                                        guard.as_ref().and_then(|guard| guard.watch.as_ref())
+                                    {
+                                        watch.submitted.store(
+                                            true,
+                                            std::sync::atomic::Ordering::SeqCst,
+                                        );
+                                    }
+                                }
+                                written
+                            })
                     };
-                    let failed = result
-                        .as_ref()
-                        .is_err_and(|err| err.kind() != std::io::ErrorKind::TimedOut);
+                    if result.is_err() {
+                        if let Some(watch) = guard.as_ref().and_then(|guard| guard.watch.as_ref()) {
+                            watch
+                                .abandoned
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
+                    let failed = result.as_ref().is_err_and(|err| {
+                        !matches!(
+                            err.kind(),
+                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::Interrupted
+                        )
+                    });
                     let _ = reply.send(result);
                     if failed {
                         break;
@@ -459,6 +536,7 @@ mod windows {
                     enter: Bytes::from_static(b"\r"),
                     delay,
                     deadline,
+                    guard: None,
                     reply: reply_tx,
                 })
                 .unwrap();
@@ -530,6 +608,65 @@ mod windows {
         }
 
         #[test]
+        fn withheld_submission_keeps_forwarding_later_input() {
+            let (flushed_tx, _flushed_rx) = std_mpsc::channel();
+            let mut writer = RecordingWriter {
+                writes: Vec::new(),
+                flushes: Vec::new(),
+                fail_after: None,
+                flushed: flushed_tx,
+            };
+            let (data_tx, mut data_rx) = mpsc::channel(2);
+            let (write_tx, write_rx) = std_mpsc::channel();
+            let (reply_tx, reply_rx) = std_mpsc::channel();
+            let watch = Arc::new(crate::terminal::PromptSubmitWatch::default());
+            let accepting = Arc::new(Mutex::new(true));
+            data_tx
+                .try_send(PtyIoDataCommand::SubmitUserInput {
+                    text: Bytes::from_static(b"prompt"),
+                    enter: Bytes::from_static(b"\r"),
+                    delay: Duration::ZERO,
+                    deadline: None,
+                    guard: Some(SubmissionGuard {
+                        occupant_unchanged: Arc::new(|| false),
+                        watch: Some(Arc::clone(&watch)),
+                    }),
+                    reply: reply_tx,
+                })
+                .unwrap();
+            data_tx
+                .try_send(PtyIoDataCommand::WriteUserInput(Bytes::from_static(
+                    b"user",
+                )))
+                .unwrap();
+
+            let writer_thread = std::thread::spawn(move || {
+                run_writer(&mut writer, write_rx);
+                writer
+            });
+            let input_write_tx = write_tx.clone();
+            let input_thread = std::thread::spawn(move || {
+                run_input_forwarder(&mut data_rx, input_write_tx, accepting)
+            });
+            let err = reply_rx.recv().unwrap().unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+            assert!(watch.abandoned.load(std::sync::atomic::Ordering::SeqCst));
+
+            drop(data_tx);
+            input_thread.join().unwrap();
+            drop(write_tx);
+            let writer = writer_thread.join().unwrap();
+            assert_eq!(
+                writer
+                    .writes
+                    .iter()
+                    .map(|write| write.0.as_slice())
+                    .collect::<Vec<_>>(),
+                vec![b"prompt".as_slice(), b"user".as_slice()]
+            );
+        }
+
+        #[test]
         fn expired_queued_submission_is_not_written() {
             let (flushed_tx, _flushed_rx) = std_mpsc::channel();
             let mut writer = RecordingWriter {
@@ -549,6 +686,7 @@ mod windows {
                     enter: Bytes::from_static(b"\r"),
                     delay: Duration::from_millis(30),
                     deadline: None,
+                    guard: None,
                     reply: first_reply_tx,
                 })
                 .unwrap();
@@ -558,6 +696,7 @@ mod windows {
                     enter: Bytes::from_static(b"\r"),
                     delay: Duration::ZERO,
                     deadline: Some(Instant::now() + Duration::from_millis(10)),
+                    guard: None,
                     reply: expired_reply_tx,
                 })
                 .unwrap();
@@ -586,6 +725,113 @@ mod windows {
                     .collect::<Vec<_>>(),
                 vec![b"first".as_slice(), b"\r".as_slice()]
             );
+        }
+
+        struct ChunkedWriter {
+            bytes: Vec<u8>,
+            flushes: usize,
+            max_chunk: usize,
+        }
+
+        impl Write for ChunkedWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let written = bytes.len().min(self.max_chunk);
+                self.bytes.extend_from_slice(&bytes[..written]);
+                Ok(written)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.flushes += 1;
+                Ok(())
+            }
+        }
+
+        fn test_handle(
+            data_tx: mpsc::Sender<PtyIoDataCommand>,
+            accepting: Arc<Mutex<bool>>,
+        ) -> PtyIoActorHandle {
+            let (control_tx, _control_rx) = std_mpsc::channel();
+            let (write_tx, _write_rx) = std_mpsc::channel();
+            PtyIoActorHandle {
+                data_tx,
+                control_tx,
+                write_tx,
+                response_order: Arc::new(Mutex::new(())),
+                accepting,
+            }
+        }
+
+        /// A ConPTY writer may accept fewer bytes than offered. Acknowledging before
+        /// the tail is written would report a prompt as delivered while part of it
+        /// never reached the child.
+        #[test]
+        fn submission_part_completes_partial_writes_before_acknowledging() {
+            let mut writer = ChunkedWriter {
+                bytes: Vec::new(),
+                flushes: 0,
+                max_chunk: 3,
+            };
+            let (write_tx, write_rx) = std_mpsc::channel();
+            let (reply, completion) = std_mpsc::channel();
+            write_tx
+                .send(PtyIoWriteCommand::SubmissionPart {
+                    bytes: Bytes::from_static(b"complete partial batch"),
+                    deadline: None,
+                    reply,
+                })
+                .unwrap();
+            drop(write_tx);
+
+            run_writer(&mut writer, write_rx);
+
+            completion
+                .recv()
+                .expect("the writer reports the submission part")
+                .expect("partial writes complete before acknowledgement");
+            assert_eq!(writer.bytes, b"complete partial batch");
+            assert_eq!(writer.flushes, 1);
+        }
+
+        /// Refusing a submission must be observable: a dropped submission would leave
+        /// text stranded in a composer after the caller was told it was accepted.
+        #[test]
+        fn queued_submission_reports_backpressure_and_a_closed_actor() {
+            let (data_tx, _data_rx) = mpsc::channel(1);
+            let accepting = Arc::new(Mutex::new(true));
+            let handle = test_handle(data_tx, Arc::clone(&accepting));
+            handle
+                .queue_user_input_submission_guarded(
+                    Bytes::from_static(b"first"),
+                    Bytes::from_static(b"\r"),
+                    Duration::ZERO,
+                    None,
+                    None,
+                )
+                .expect("the first submission is queued");
+
+            let full = handle
+                .queue_user_input_submission_guarded(
+                    Bytes::from_static(b"second"),
+                    Bytes::from_static(b"\r"),
+                    Duration::ZERO,
+                    None,
+                    None,
+                )
+                .expect_err("a full input queue must not silently drop a submission");
+            assert_eq!(full.kind(), std::io::ErrorKind::WouldBlock);
+
+            let (closed_tx, closed_rx) = mpsc::channel(1);
+            drop(closed_rx);
+            let closed = test_handle(closed_tx, accepting)
+                .queue_user_input_submission_guarded(
+                    Bytes::from_static(b"prompt"),
+                    Bytes::from_static(b"\r"),
+                    Duration::ZERO,
+                    None,
+                    None,
+                )
+                .expect_err("an exited actor must reject a queued submission");
+            assert_eq!(closed.kind(), std::io::ErrorKind::BrokenPipe);
         }
     }
 }

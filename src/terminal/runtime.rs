@@ -17,6 +17,10 @@ use crate::layout::PaneId;
 pub struct TerminalRuntime(crate::pane::PaneRuntime);
 
 impl TerminalRuntime {
+    pub(crate) fn epoch(&self) -> u64 {
+        self.0.epoch()
+    }
+
     pub fn shutdown(self) {
         self.0.shutdown();
     }
@@ -249,6 +253,17 @@ impl TerminalRuntime {
         self.0.set_full_lifecycle_authority_active(active);
     }
 
+    pub(crate) fn attach_output_stream(
+        &self,
+        capacity: usize,
+    ) -> std::sync::Arc<crate::pane::OutputRing> {
+        self.0.attach_output_stream(capacity)
+    }
+
+    pub(crate) fn detach_output_stream(&self) -> usize {
+        self.0.detach_output_stream()
+    }
+
     pub fn set_self_reported_agent_active(&self, active: bool) {
         self.0.set_self_reported_agent_active(active);
     }
@@ -344,6 +359,14 @@ impl TerminalRuntime {
         self.0.alternate_screen_active()
     }
 
+    pub fn active_screen(&self) -> Option<crate::ghostty::ActiveScreen> {
+        self.0.active_screen()
+    }
+
+    pub fn normalize_alternate_screen_on_exit(&self) -> bool {
+        self.0.normalize_alternate_screen_on_exit()
+    }
+
     pub fn cursor_state(
         &self,
         area: Rect,
@@ -370,6 +393,14 @@ impl TerminalRuntime {
 
     pub fn detection_text(&self) -> String {
         self.0.detection_text()
+    }
+
+    pub(crate) fn composer_frame(&self) -> (crate::pane::TerminalComposerFrame, u64) {
+        self.0.composer_frame()
+    }
+
+    pub(crate) fn detection_content_seq(&self) -> u64 {
+        self.0.detection_content_seq()
     }
 
     pub fn terminal_title(&self) -> Option<String> {
@@ -478,15 +509,16 @@ impl TerminalRuntime {
         self.0.try_send_bytes(bytes)
     }
 
-    pub fn queue_user_input_submission(
+    pub fn queue_user_input_submission_guarded(
         &self,
         text: Bytes,
         enter: Bytes,
         delay: std::time::Duration,
         deadline: Option<std::time::Instant>,
+        guard: Option<crate::pty::SubmissionGuard>,
     ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
         self.0
-            .queue_user_input_submission(text, enter, delay, deadline)
+            .queue_user_input_submission_guarded(text, enter, delay, deadline, guard)
     }
 
     pub fn try_send_paste(&self, text: String) -> Result<(), mpsc::error::TrySendError<Bytes>> {

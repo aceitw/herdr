@@ -11,8 +11,14 @@ pub(crate) use agents::{AGENT_START_SETTLE_DELAY, MAX_AGENT_START_TIMEOUT};
 mod api;
 #[cfg(test)]
 pub(crate) use api::test_support::exiting_test_command;
+#[cfg(unix)]
+pub(crate) use api::{gram_push_notification, registered_device};
 mod api_helpers;
 pub(crate) use api_helpers::limit_snapshot_lines;
+// Claude config-home layout, shared with the CLI so `herdr accounts prepare` writes the
+// same file the readiness gate reads — including the default-config-home sibling rule
+// (issue #94), which must not be re-derived anywhere.
+pub(crate) use api::agents::{claude_account_has_credentials, claude_config_file};
 mod creation;
 mod custom_commands;
 mod git_refresh;
@@ -28,7 +34,7 @@ mod theme_sync;
 mod window_title;
 mod worktrees;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 #[cfg(unix)]
 use std::io;
 use std::sync::Arc;
@@ -102,8 +108,30 @@ impl AppPolicy {
 
 pub struct App {
     pub state: AppState,
+    /// Cache of remote federation peers' agents, written by the outbound poll
+    /// threads and merged into `agent.list`. Empty (and shared with no threads)
+    /// unless a peer has an `endpoint`; see `crate::api::federation_store`.
+    pub(crate) federation: Arc<std::sync::Mutex<crate::api::federation_store::FederationStore>>,
+    /// The outbound federation peer manager, shared with the API server. `Some`
+    /// only on a real daemon start (see `set_federation_manager`); the
+    /// `reload-config` handler then reconciles the peer set live against it.
+    /// `None` in tests and the no-federation path, where the reconcile is a
+    /// no-op.
+    pub(crate) federation_manager:
+        Option<Arc<crate::api::federation_manager::FederationPeerManager>>,
+    /// What the app loop last saw of remote agents, so each remote transition
+    /// is pushed once (see `sync_remote_agent_notifications`).
+    pub(crate) remote_push: api::remote_push::RemotePushTracker,
+    client_endpoint_statuses:
+        HashMap<u64, HashMap<String, crate::api::schema::MachineEndpointStatus>>,
+    pub(crate) no_session: bool,
     pub(crate) pixel_mouse_available: bool,
     pub(crate) terminal_runtimes: crate::terminal::TerminalRuntimeRegistry,
+    /// One-shot identity of a runtime Herdr intentionally removed while its
+    /// child-exit event is still in flight. This lets that exact event drive a
+    /// managed respawn without accepting unrelated retired-runtime exits during
+    /// the no-runtime replacement window.
+    pub(crate) expected_pane_exit_epochs: HashMap<crate::layout::PaneId, u64>,
     pub event_tx: mpsc::Sender<AppEvent>,
     pub(crate) event_rx: mpsc::Receiver<AppEvent>,
     pub(crate) api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
@@ -113,16 +141,24 @@ pub struct App {
     pub(crate) config_diagnostic_deadline: Option<Instant>,
     pub(crate) toast_deadline: Option<Instant>,
     pub(crate) last_api_notification_at: Option<Instant>,
-    /// True only for a server context with no persistent SessionStore — gram storage
-    /// requires the shared session/agent registry, so those contexts answer
-    /// `gram_unavailable`. Always `false` in the default TUI/server path.
-    pub(crate) no_session: bool,
-    pub(crate) last_git_remote_status_refresh: Instant,
+    /// When the remote-status refresh last ran. `None` means it never has, which
+    /// is DUE NOW - the state `App::new` starts in. Representing it as `None`
+    /// rather than a backdated `Instant` is what makes this correct on Windows,
+    /// where `Instant` is boot-relative and `now - interval` underflows on a
+    /// freshly booted host.
+    pub(crate) last_git_remote_status_refresh: Option<Instant>,
     pub(crate) last_git_repo_discovery_refresh: Instant,
     pub(crate) git_refresh_in_flight: bool,
     pub(crate) git_refresh_due_after_in_flight: bool,
     pub(crate) git_identity_refresh_requested: bool,
     pub(crate) git_status_cache: HashMap<std::path::PathBuf, crate::workspace::GitStatusCacheEntry>,
+    /// Per-account live-usage cache, written by background fetch threads via
+    /// `AppEvent::UsageRefreshed` and read (with a per-kind TTL) by the sync
+    /// `accounts.list` handler. Holds only usage NUMBERS — never a credential.
+    pub(crate) usage_cache: HashMap<String, api::usage_fetch::CachedUsage>,
+    /// Account ids with a live-usage fetch currently in flight, so the sync
+    /// handler kicks at most one background fetch per account at a time.
+    pub(crate) usage_refresh_inflight: HashSet<String>,
     pub(crate) pending_api_worktree_creates: HashMap<std::path::PathBuf, u64>,
     pub(crate) worktree_read_slots: std::sync::Arc<tokio::sync::Semaphore>,
     pub(crate) pending_api_worktree_removes: HashMap<String, u64>,
@@ -135,6 +171,9 @@ pub struct App {
     pub(crate) update_version_check_enabled: bool,
     pub(crate) update_manifest_check_enabled: bool,
     pub(crate) loaded_host_cursor: crate::config::HostCursorModeConfig,
+    /// Configured credential/config-home accounts, refreshed on config reload.
+    /// Holds only directory paths and labels — never a credential value.
+    pub(crate) loaded_accounts: Vec<crate::config::AccountConfig>,
     pub(crate) agent_metadata_deadline: Option<Instant>,
     pub(crate) pending_agent_resume_deadline: Option<Instant>,
     startup_per_agent_delay: Duration,
@@ -374,6 +413,8 @@ impl App {
         // Try to restore previous session
         let mut restored_terminals = std::collections::HashMap::new();
         let mut restored_terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        // Archived agents own no pane, so they bypass workspace restore.
+        let mut restored_archived_agents: Vec<crate::persist::ArchivedAgentSnapshot> = Vec::new();
         let snapshot = policy.restore_session.then(crate::persist::load).flatten();
         let session_writer = Arc::new(std::sync::Mutex::new(crate::persist::SessionWriter::new(
             policy.restore_session && snapshot.is_none(),
@@ -399,6 +440,7 @@ impl App {
             );
             restored_terminals = terminals;
             restored_terminal_runtimes = terminal_runtimes.into();
+            restored_archived_agents = snap.archived_agents.clone();
             if ws.is_empty() {
                 crate::logging::session_restored(0, "empty");
                 (Vec::new(), None, 0)
@@ -450,6 +492,9 @@ impl App {
         let mut state = AppState {
             terminals: std::collections::HashMap::new(),
             direct_attach_resize_locks: std::collections::HashSet::new(),
+            pty_width_leases: std::collections::HashMap::new(),
+            pty_stream_viewers: std::collections::HashMap::new(),
+            pty_pending_shrinks: std::collections::HashMap::new(),
             pane_id_aliases: std::collections::HashMap::new(),
             public_pane_id_aliases: std::collections::HashMap::new(),
             workspaces,
@@ -509,6 +554,7 @@ impl App {
             pane_scrollback_limit_bytes: config.advanced.scrollback_limit_bytes,
             sound: config.ui.sound.clone(),
             toast_config: config.ui.toast.clone(),
+            push_config: config.push.clone(),
             keybinds: config.keybinds(),
             palette: theme_palette,
             theme_name,
@@ -528,6 +574,7 @@ impl App {
             host_cell_size: crate::kitty_graphics::HostCellSize::default(),
             session_dirty: false,
             terminal_runtime_shutdowns: Vec::new(),
+            archived_agents: restored_archived_agents,
         };
 
         state.terminals = restored_terminals;
@@ -573,18 +620,33 @@ impl App {
             config_diagnostic_deadline: None,
             toast_deadline: None,
             last_api_notification_at: None,
-            no_session: false,
             state,
+            // Empty by default; production startup shares the store the outbound
+            // federation client writes into via `set_federation_store`.
+            federation: Arc::new(std::sync::Mutex::new(
+                crate::api::federation_store::FederationStore::default(),
+            )),
+            // Shared in on production startup via `set_federation_manager`; the
+            // no-federation path and every test keep this `None`.
+            federation_manager: None,
+            remote_push: api::remote_push::RemotePushTracker::default(),
+            client_endpoint_statuses: HashMap::new(),
+
+            no_session: false,
             pixel_mouse_available: false,
             terminal_runtimes: restored_terminal_runtimes,
+            expected_pane_exit_epochs: HashMap::new(),
             event_tx,
             event_rx,
-            last_git_remote_status_refresh: Instant::now() - GIT_REMOTE_STATUS_REFRESH_INTERVAL,
+            // Never refreshed, so the first remote-status refresh is due at once.
+            last_git_remote_status_refresh: None,
             last_git_repo_discovery_refresh: Instant::now(),
             git_refresh_in_flight: false,
             git_refresh_due_after_in_flight: false,
             git_identity_refresh_requested: false,
             git_status_cache: HashMap::new(),
+            usage_cache: HashMap::new(),
+            usage_refresh_inflight: HashSet::new(),
             pending_api_worktree_creates: HashMap::new(),
             worktree_read_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
             pending_api_worktree_removes: HashMap::new(),
@@ -599,6 +661,7 @@ impl App {
             update_version_check_enabled: config.update.version_check,
             update_manifest_check_enabled: config.update.manifest_check,
             loaded_host_cursor: config.ui.host_cursor,
+            loaded_accounts: config.accounts.clone(),
             agent_metadata_deadline: None,
             pending_agent_resume_deadline: None,
             startup_per_agent_delay: Duration::from_millis(
@@ -635,6 +698,73 @@ impl App {
         app
     }
 
+    /// Share the federation store the outbound client manager writes into, so
+    /// `agent.list` merges remote peers. Production startup only; the empty
+    /// default constructed in `new` is what every test and the no-federation
+    /// path keep.
+    pub fn set_federation_store(
+        &mut self,
+        store: Arc<std::sync::Mutex<crate::api::federation_store::FederationStore>>,
+    ) {
+        self.federation = store;
+    }
+
+    /// Share the outbound federation peer manager the API server owns, so
+    /// `reload-config` can add/remove/change peers live. Production startup only;
+    /// the `None` default kept in `new` makes the reconcile a no-op everywhere
+    /// else (tests, no-federation path).
+    pub fn set_federation_manager(
+        &mut self,
+        manager: Arc<crate::api::federation_manager::FederationPeerManager>,
+    ) {
+        self.federation_manager = Some(manager);
+    }
+
+    pub(crate) fn record_client_endpoint_status(
+        &mut self,
+        client_id: u64,
+        profile_id: String,
+        status: crate::api::schema::MachineEndpointStatus,
+    ) {
+        self.client_endpoint_statuses
+            .entry(client_id)
+            .or_default()
+            .insert(profile_id, status);
+    }
+
+    pub(crate) fn remove_client_endpoint_statuses(&mut self, client_id: u64) {
+        self.client_endpoint_statuses.remove(&client_id);
+    }
+
+    pub(crate) fn endpoint_statuses(
+        &self,
+    ) -> HashMap<String, crate::api::schema::MachineEndpointStatus> {
+        fn rank(status: crate::api::schema::MachineEndpointStatus) -> u8 {
+            use crate::api::schema::MachineEndpointStatus::*;
+            match status {
+                Disabled => 0,
+                Attention => 1,
+                Reconnecting => 2,
+                Connecting => 3,
+                Online => 4,
+            }
+        }
+        let mut statuses = HashMap::new();
+        for client in self.client_endpoint_statuses.values() {
+            for (profile_id, status) in client {
+                statuses
+                    .entry(profile_id.clone())
+                    .and_modify(|current| {
+                        if rank(*status) > rank(*current) {
+                            *current = *status;
+                        }
+                    })
+                    .or_insert(*status);
+            }
+        }
+        statuses
+    }
+
     #[cfg(unix)]
     pub fn new_from_handoff(
         config: &Config,
@@ -669,6 +799,7 @@ impl App {
         app.state.pane_id_aliases = pane_id_aliases;
         app.state.workspaces = workspaces;
         app.state.terminals = terminals;
+        app.state.archived_agents = snapshot.archived_agents.clone();
         app.terminal_runtimes = runtimes.into();
         app.state.active = snapshot
             .active
@@ -800,6 +931,16 @@ impl App {
         let invalid_section =
             |section: &str| invalid_sections.iter().any(|invalid| invalid == section);
 
+        if !invalid_section("accounts") {
+            self.loaded_accounts = config.accounts.clone();
+            // Give every pane whose resume was refused for an unresolved account another
+            // chance: the registry just changed, so the account it wants may now exist.
+            // Without this, re-adding an account leaves the agent blocked until restart.
+            for terminal in self.state.terminals.values_mut() {
+                terminal.account_resume_blocked = None;
+            }
+        }
+
         if !invalid_section("keys") {
             match config.live_keybinds_with_diagnostics() {
                 Ok((live, keybind_diagnostics)) => {
@@ -881,6 +1022,9 @@ impl App {
                     .into(),
             );
         }
+        if !invalid_section("push") {
+            self.state.push_config = config.push.clone();
+        }
 
         if !invalid_section("experimental") {
             self.state.reveal_hidden_cursor_for_cjk_ime =
@@ -955,6 +1099,28 @@ impl App {
             self.refresh_effective_app_theme();
         }
 
+        // Reconcile the OUTBOUND federation peer set against the freshly parsed
+        // config: add a poller + proxy route for a new peer, stop + evict a
+        // removed one, respawn a changed one — with no daemon restart. `None`
+        // (tests, no-federation path) makes this a no-op; `reconcile` with an
+        // empty peer list is a clean full teardown. The inbound listener is bound
+        // at boot and is intentionally NOT touched here.
+        // Gram relay consent first, so this reconcile starts gateways for newly
+        // allowed peers and tears down gateways of revoked ones. A refused
+        // section keeps the previous effective consent.
+        if invalid_section("gram_relay") {
+            let message = diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.starts_with("invalid gram relay config"))
+                .map_or("invalid gram relay config", String::as_str);
+            crate::api::gram_relay::policy().reject(message);
+        } else {
+            crate::api::gram_relay::apply_config(&config.gram_relay);
+        }
+        if let Some(manager) = &self.federation_manager {
+            manager.reconcile_config(&config.federation);
+        }
+
         let status = if diagnostics.is_empty() {
             crate::config::ConfigReloadStatus::Applied
         } else {
@@ -994,6 +1160,7 @@ impl App {
         }
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1054,7 +1221,7 @@ mod tests {
         app.state.workspaces.push(Workspace::test_new("one"));
         app.git_refresh_in_flight = true;
 
-        assert_eq!(app.git_refresh_deadline(), None);
+        assert_eq!(app.git_refresh_deadline(Instant::now()), None);
     }
 
     #[test]
@@ -1106,8 +1273,9 @@ mod tests {
     fn git_status_event_clears_in_flight_refresh() {
         let mut app = test_app();
         app.git_refresh_in_flight = true;
-        let previous_refresh = Instant::now() - Duration::from_secs(10);
-        app.last_git_remote_status_refresh = previous_refresh;
+        // "Never refreshed" is the state under test here - a completed refresh must
+        // move it forward - and it needs no clock arithmetic to express.
+        app.last_git_remote_status_refresh = None;
 
         app.handle_internal_event(AppEvent::GitStatusRefreshed {
             results: Vec::new(),
@@ -1115,7 +1283,7 @@ mod tests {
         });
 
         assert!(!app.git_refresh_in_flight);
-        assert!(app.last_git_remote_status_refresh > previous_refresh);
+        assert!(app.last_git_remote_status_refresh.is_some());
     }
 
     #[test]
@@ -1652,13 +1820,19 @@ mod tests {
 
         crate::release_notes::save_pending(env!("CARGO_PKG_VERSION"), "### Changed\n- One")
             .unwrap();
-        crate::product_announcements::save_manifest_announcement(
-            env!("CARGO_PKG_VERSION"),
-            Some(&crate::product_announcements::ManifestAnnouncement {
-                id: "startup-announcement".into(),
-                title: Some("Startup announcement".into()),
-                body: "### Announcement\n- One".into(),
-            }),
+        let announcements = crate::product_announcements::store_path();
+        std::fs::create_dir_all(announcements.parent().unwrap()).unwrap();
+        std::fs::write(
+            &announcements,
+            serde_json::json!({
+                "latest": {
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "id": "startup-announcement",
+                    "title": "Startup announcement",
+                    "body": "### Announcement\n- One",
+                },
+            })
+            .to_string(),
         )
         .unwrap();
 
@@ -2150,7 +2324,7 @@ mod tests {
         let read_only = crate::api::schema::Request {
             id: "req_1".into(),
             method: crate::api::schema::Method::WorkspaceList(
-                crate::api::schema::EmptyParams::default(),
+                crate::api::schema::WorkspaceListParams::default(),
             ),
         };
         let mutating = crate::api::schema::Request {
@@ -2835,6 +3009,7 @@ mod tests {
                 pane_id,
                 args: Vec::new(),
                 timeout_ms: Some(1_000),
+                account: None,
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -2877,6 +3052,7 @@ mod tests {
                 pane_id: pane_id.clone(),
                 args: vec!["resume".into(), "codex-session".into()],
                 timeout_ms: Some(4_000),
+                account: None,
             }),
         };
         let response = app.handle_api_request(request());
@@ -3145,10 +3321,12 @@ mod tests {
         app.handle_internal_event(AppEvent::PaneDied {
             pane_id: first_pane,
             exit_reason: crate::platform::ChildExitReason::Interrupted,
+            runtime_epoch: None,
         });
         app.handle_internal_event(AppEvent::PaneDied {
             pane_id: second_pane,
             exit_reason: crate::platform::ChildExitReason::Interrupted,
+            runtime_epoch: None,
         });
         assert!(app.state.workspaces.is_empty());
         assert!(app.ensure_default_workspace());
@@ -3181,6 +3359,7 @@ mod tests {
         app.handle_internal_event(AppEvent::PaneDied {
             pane_id,
             exit_reason: crate::platform::ChildExitReason::Interrupted,
+            runtime_epoch: None,
         });
         assert!(crate::persist::load().is_some());
 
@@ -3215,6 +3394,7 @@ mod tests {
             app.handle_internal_event(AppEvent::PaneDied {
                 pane_id,
                 exit_reason: crate::platform::ChildExitReason::Interrupted,
+                runtime_epoch: None,
             });
             app.state.workspaces = vec![Workspace::test_new("newer")];
             app.state.active = Some(0);
@@ -3224,6 +3404,7 @@ mod tests {
                 app.handle_internal_event(AppEvent::PaneDied {
                     pane_id: app.state.workspaces[0].tabs[0].root_pane,
                     exit_reason: crate::platform::ChildExitReason::Interrupted,
+                    runtime_epoch: None,
                 });
             }
             app.save_session_on_shutdown();
@@ -3255,6 +3436,7 @@ mod tests {
             .attached_terminal_id
             .clone();
         app.handle_internal_event(AppEvent::StateChanged {
+            runtime_epoch: None,
             pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Working,
@@ -3279,6 +3461,7 @@ mod tests {
 
         let tx = app.event_tx.clone();
         let send = tx.send(AppEvent::StateChanged {
+            runtime_epoch: None,
             pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Idle,

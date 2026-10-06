@@ -1,4 +1,8 @@
-use std::{collections::BTreeSet, num::NonZeroUsize};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    num::NonZeroUsize,
+    path::{Path, PathBuf},
+};
 
 use crossterm::event::KeyModifiers;
 use serde::{de, Deserialize, Deserializer, Serialize};
@@ -47,11 +51,14 @@ impl Default for UpdateConfig {
 }
 
 fn default_update_channel() -> UpdateChannelConfig {
-    default_update_channel_for_build(cfg!(windows), crate::build_info::is_preview())
+    default_update_channel_for_build(crate::build_info::is_preview())
 }
 
-fn default_update_channel_for_build(is_windows: bool, is_preview: bool) -> UpdateChannelConfig {
-    if is_windows && is_preview {
+fn default_update_channel_for_build(is_preview: bool) -> UpdateChannelConfig {
+    // A direct preview binary must keep following the preview manifest on every
+    // platform. Defaulting a macOS/Linux preview install back to stable can
+    // replace the herdrup-compatible fork with an upstream stable binary.
+    if is_preview {
         UpdateChannelConfig::Preview
     } else {
         UpdateChannelConfig::Stable
@@ -323,6 +330,217 @@ pub struct Config {
     pub advanced: AdvancedConfig,
     pub experimental: ExperimentalConfig,
     pub remote: RemoteConfig,
+    pub push: PushConfig,
+    pub federation: FederationConfig,
+    pub gram_relay: GramRelayConfig,
+    pub guest: GuestConfig,
+    pub accounts: Vec<AccountConfig>,
+}
+
+/// A per-harness credential/config-home account.
+///
+/// An account points a coding-agent harness at an alternate config-home
+/// directory (Claude Code `CLAUDE_CONFIG_DIR`, Codex `CODEX_HOME`, Kimi
+/// `KIMI_CODE_HOME`), so a single herdr install can run several subscriptions of
+/// the same harness side by side and swap between them per agent. Only the
+/// directory PATH is recorded here — never a token or credential value.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct AccountConfig {
+    /// Stable identifier used to select this account on `agent.start` /
+    /// `agent.restart` and to key it in `accounts.list`.
+    pub id: String,
+    /// Harness this account belongs to: `claude`, `codex`, `omp`, or `kimi`.
+    pub kind: String,
+    /// Human-facing label shown in listings.
+    pub label: String,
+    /// Filesystem path to the harness config-home directory for this account.
+    pub config_dir: String,
+}
+
+/// The config-home environment variable a harness reads to locate its
+/// config/credentials directory, or `None` for a kind that has no such lever.
+pub fn env_var_for_kind(kind: &str) -> Option<&'static str> {
+    match kind {
+        "claude" => Some("CLAUDE_CONFIG_DIR"),
+        "codex" => Some("CODEX_HOME"),
+        "omp" => Some("PI_CODING_AGENT_DIR"),
+        "kimi" => Some("KIMI_CODE_HOME"),
+        _ => None,
+    }
+}
+
+/// The environment variables that applying a config-home override for `kind`
+/// must CLEAR so the selected account is authoritative. A machine-global
+/// `CLAUDE_CODE_OAUTH_TOKEN` otherwise overrides every per-account credential
+/// regardless of `CLAUDE_CONFIG_DIR`. OMP's profile selectors similarly override
+/// `PI_CODING_AGENT_DIR`, including the account's credentials and extensions.
+/// Empty for kinds with no such overriding lever today (codex/kimi/unknown).
+pub fn auth_env_vars_to_clear(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "claude" => &["CLAUDE_CODE_OAUTH_TOKEN"],
+        "omp" => &["OMP_PROFILE", "PI_PROFILE"],
+        _ => &[],
+    }
+}
+
+/// The harness kind whose config-home lever is `var` (the reverse of
+/// [`env_var_for_kind`]), or `None` when `var` is not a config-home override.
+/// Lets a launch surface that only sees the resolved env vars decide which auth
+/// tokens to clear alongside the config-dir it is applying.
+pub fn kind_for_config_env_var(var: &str) -> Option<&'static str> {
+    match var {
+        "CLAUDE_CONFIG_DIR" => Some("claude"),
+        "CODEX_HOME" => Some("codex"),
+        "PI_CODING_AGENT_DIR" => Some("omp"),
+        "KIMI_CODE_HOME" => Some("kimi"),
+        _ => None,
+    }
+}
+
+/// The default config-home directory a harness uses with no override
+/// (`$HOME/.claude`, `$HOME/.codex`, `$HOME/.omp/agent`,
+/// `$HOME/.kimi-code`). OMP honors its two native directory overrides so the
+/// integration installer, transcript verifier, and launched runtime all resolve
+/// one authoritative account home. `None` when a home-relative path needs an
+/// unset `HOME`, or the kind has no config-home lever.
+pub fn default_config_dir(kind: &str) -> Option<PathBuf> {
+    if kind == "omp" {
+        if let Some(agent_dir) =
+            std::env::var_os("PI_CODING_AGENT_DIR").filter(|value| !value.is_empty())
+        {
+            let agent_dir = PathBuf::from(agent_dir);
+            return Some(if let Ok(relative) = agent_dir.strip_prefix("~") {
+                PathBuf::from(std::env::var_os("HOME")?).join(relative)
+            } else {
+                agent_dir
+            });
+        }
+        let config_dir = std::env::var_os("PI_CONFIG_DIR")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(".omp"));
+        return Some(if config_dir.is_absolute() {
+            config_dir.join("agent")
+        } else {
+            PathBuf::from(std::env::var_os("HOME")?)
+                .join(config_dir)
+                .join("agent")
+        });
+    }
+    let sub = match kind {
+        "claude" => ".claude",
+        "codex" => ".codex",
+        "kimi" => ".kimi-code",
+        _ => return None,
+    };
+    let home = std::env::var_os("HOME")?;
+    Some(Path::new(&home).join(sub))
+}
+
+/// Resolve OMP's transcript trust root from its complete agent directory.
+/// `PI_CODING_AGENT_DIR` relocates config, credentials, extensions, and sessions
+/// together; native OMP does not use `XDG_DATA_HOME` for its session files.
+pub(crate) fn omp_sessions_dir(agent_dir: &Path) -> PathBuf {
+    agent_dir.join("sessions")
+}
+
+/// Whether `config_dir` points at the harness's DEFAULT config-home for `kind`.
+///
+/// A "primary" account registered at this directory must inject NO env override:
+/// some harnesses (Claude Code) keep their main config file as a SIBLING of this
+/// directory (`~/.claude.json`), so forcing `CLAUDE_CONFIG_DIR=~/.claude` on a
+/// default install strands that config and boots a blank one. Compares
+/// canonicalized paths when both resolve (so a symlinked `HOME` still matches),
+/// else falls back to a component-wise path comparison. See issue #94.
+pub fn is_default_config_dir(kind: &str, config_dir: &str) -> bool {
+    let Some(default) = default_config_dir(kind) else {
+        return false;
+    };
+    let candidate = Path::new(config_dir);
+    match (candidate.canonicalize(), default.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => candidate == default.as_path(),
+    }
+}
+
+/// What launching under a selected account must do to the child's environment.
+///
+/// Two INDEPENDENT halves, and conflating them was a live routing bug. `vars` is
+/// empty for a primary account on the harness default config-home (issue #94),
+/// but `clear` is populated for EVERY selected account of a kind that has an auth
+/// lever. Deriving "which tokens to clear" from "which vars were set" means a
+/// default-config-home account clears nothing and a machine-global
+/// `CLAUDE_CODE_OAUTH_TOKEN` silently outranks the selection — the exact mechanism
+/// that re-homed this fleet's agents onto the wrong account.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccountLaunchEnv {
+    /// Config-home overrides to SET. Empty means "this account needs no override",
+    /// never "no account was selected".
+    pub vars: Vec<(String, String)>,
+    /// Auth variables to REMOVE so the selected account's own credentials are
+    /// authoritative. Independent of `vars` being empty.
+    pub clear_vars: Vec<String>,
+}
+
+impl AccountLaunchEnv {
+    /// The launch env for a pane that selected no account: change nothing.
+    pub fn unselected() -> Self {
+        Self::default()
+    }
+
+    /// Wrap already-resolved override vars, deriving the clear-list from the
+    /// config-home levers they set. For env that was resolved earlier and stored
+    /// without its account (a pending `agent.restart` env), this is the most that
+    /// can be recovered — it cannot see an account whose override set was empty.
+    pub fn from_resolved_vars(vars: Vec<(String, String)>) -> Self {
+        let clear_vars = vars
+            .iter()
+            .filter_map(|(key, _)| kind_for_config_env_var(key))
+            .flat_map(|kind| {
+                auth_env_vars_to_clear(kind)
+                    .iter()
+                    .map(|var| (*var).to_string())
+            })
+            .collect();
+        Self { vars, clear_vars }
+    }
+
+    /// Whether this selects an account at all (anything to set or to clear).
+    pub fn is_empty(&self) -> bool {
+        self.vars.is_empty() && self.clear_vars.is_empty()
+    }
+}
+
+impl AccountConfig {
+    /// The launch env that points this account's harness at its config-home and
+    /// clears credentials that would outrank it. `None` when the kind has no
+    /// config-home lever (an unknown/misconfigured kind).
+    ///
+    /// A primary account whose `config_dir` is the harness DEFAULT config-home
+    /// sets NO override: it stays selectable/rememberable while launching exactly
+    /// as a default install, because injecting the override would strand a harness
+    /// whose config file is a sibling of the dir rather than inside it (issue #94).
+    /// It still CLEARS conflicting auth tokens — clearing a token that authenticates
+    /// as a different account strands nothing, and skipping it is what let a global
+    /// token override an explicit selection of the primary account.
+    pub fn launch_env(&self) -> Option<AccountLaunchEnv> {
+        let env_var = env_var_for_kind(&self.kind)?;
+        let clear_vars = auth_env_vars_to_clear(&self.kind)
+            .iter()
+            .map(|var| (*var).to_string())
+            .collect();
+        if is_default_config_dir(&self.kind, &self.config_dir) {
+            return Some(AccountLaunchEnv {
+                vars: Vec::new(),
+                clear_vars,
+            });
+        }
+        Some(AccountLaunchEnv {
+            vars: vec![(env_var.to_string(), self.config_dir.clone())],
+            clear_vars,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -1109,6 +1327,406 @@ impl Default for RemoteConfig {
     }
 }
 
+/// Remote push notifications (APNs) for registered mobile devices.
+///
+/// The `.p8` signing key at `key_path` is read only when a push is sent; its
+/// contents are never persisted to Herdr state and never logged. `key_id`,
+/// `team_id`, and `topic` are Apple developer identifiers (not secrets) but are
+/// still host configuration rather than repository constants.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct PushConfig {
+    /// How pushes reach devices: `auto` (direct APNs when the key config is
+    /// complete, else the HerdrUp relay), `direct`, `relay`, or `off`. Default: auto.
+    pub mode: PushMode,
+    /// Base URL of the HerdrUp push relay used by `relay` (and `auto` without a key).
+    pub relay_url: String,
+    /// Master switch for direct APNs delivery. Relay delivery needs no key. Default: false.
+    pub enabled: bool,
+    /// Filesystem path to the APNs auth key (`.p8`, PKCS#8 PEM). Read at send time only.
+    pub key_path: Option<String>,
+    /// APNs auth key ID (the 10-character Key ID issued by Apple).
+    pub key_id: Option<String>,
+    /// Apple developer Team ID used as the JWT issuer.
+    pub team_id: Option<String>,
+    /// APNs topic — the app bundle identifier, e.g. com.example.herdr.
+    pub topic: Option<String>,
+    /// Deliver through the APNs sandbox host instead of production. Default: false.
+    pub sandbox: bool,
+}
+
+pub const DEFAULT_PUSH_RELAY_URL: &str = "https://push.herdrup.themartian.app";
+
+/// `[guest]`: guest access through the HerdrUp guest relay (unix only).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct GuestConfig {
+    /// Base URL of the HerdrUp guest relay. Invites carry it, and the daemon
+    /// links to it only while a guest or an unexpired invite exists.
+    #[cfg_attr(not(unix), allow(dead_code))] // Guest access is unix only.
+    pub relay_url: String,
+}
+
+pub const DEFAULT_GUEST_RELAY_URL: &str = "https://guest.herdrup.themartian.app";
+
+impl Default for GuestConfig {
+    fn default() -> Self {
+        Self {
+            relay_url: DEFAULT_GUEST_RELAY_URL.to_string(),
+        }
+    }
+}
+
+impl Default for PushConfig {
+    fn default() -> Self {
+        Self {
+            mode: PushMode::default(),
+            relay_url: DEFAULT_PUSH_RELAY_URL.to_string(),
+            enabled: false,
+            key_path: None,
+            key_id: None,
+            team_id: None,
+            topic: None,
+            sandbox: false,
+        }
+    }
+}
+
+/// Delivery path for remote push. `Auto` prefers direct APNs when the key config
+/// is complete and otherwise uses the relay for capability-bearing devices.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PushMode {
+    #[default]
+    Auto,
+    Direct,
+    Relay,
+    Off,
+}
+
+/// Capability tier granted to a federation peer's shared token.
+///
+/// The tiers are ordered so a higher tier includes every capability of the
+/// lower ones: `Admin` ⊇ `Interact` ⊇ `Observe`. A method exposed to federation
+/// at some tier is reachable by any peer at that tier or above; everything not
+/// explicitly exposed stays denied to every tier (default-deny). Only inbound
+/// TCP federation connections are filtered by tier — the local unix socket and
+/// the SSH control path are unaffected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityTier {
+    /// Read-only: list/read/inspect panes, agents, events, layout. Default.
+    #[default]
+    Observe,
+    /// Observe plus driving agents and panes (prompts, keystrokes, text).
+    Interact,
+    /// Interact plus focus, rename, and input/authority mutations.
+    Admin,
+}
+
+/// Durable, default-off consent for the machine-scoped Gram file relay.
+///
+/// Independent of `[federation]` reverse agent access and per-agent grants.
+/// Same-user processes on a trusted machine can impersonate that machine's
+/// panes; this is not per-process isolation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct GramRelayConfig {
+    /// Coordinator: saved-machine profile ids whose pinned SSH peer may relay
+    /// Gram through a restricted reverse gateway. Unset grants nothing; a
+    /// present empty list explicitly grants nothing and overrides the legacy
+    /// environment variable instead of deferring to it.
+    #[serde(deserialize_with = "deserialize_gram_relay_peers")]
+    pub peers: Option<Vec<String>>,
+    /// Remote: install id of the trusted coordinator. The reverse socket path is
+    /// derived from it and this daemon's own install id. Unset grants nothing;
+    /// an empty string explicitly disables the relay, like an empty list above.
+    #[serde(deserialize_with = "deserialize_gram_relay_coordinator")]
+    pub coordinator_machine_id: Option<String>,
+}
+
+fn deserialize_gram_relay_peers<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let peers = Vec::<String>::deserialize(deserializer)?;
+    for peer in &peers {
+        crate::client::endpoint::ProfileId::parse(peer.clone()).map_err(|_| {
+            de::Error::custom(format!(
+                "gram_relay.peers entry {peer:?} must be a saved-machine profile id (32 lowercase hex characters)"
+            ))
+        })?;
+    }
+    Ok(Some(peers))
+}
+
+fn deserialize_gram_relay_coordinator<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let machine_id = Option::<String>::deserialize(deserializer)?;
+    if let Some(machine_id) = &machine_id {
+        if !machine_id.is_empty() && !is_install_machine_id(machine_id) {
+            return Err(de::Error::custom(
+                "gram_relay.coordinator_machine_id must be \"machine_\" followed by 32 lowercase hex characters, or \"\" to disable the relay explicitly",
+            ));
+        }
+    }
+    Ok(machine_id)
+}
+
+/// Shape of a persisted Herdr install identity (`persist::machine`).
+pub(crate) fn is_install_machine_id(machine_id: &str) -> bool {
+    machine_id.strip_prefix("machine_").is_some_and(|hex| {
+        hex.len() == 32
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+/// Peer-to-peer federation between Herdr daemons.
+///
+/// The listener, outbound transports (TCP/SSH), and peer connection handling
+/// land in later parts of the federation work; these fields are declared now so
+/// the `[federation]` config section parses and defaults cleanly.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct FederationConfig {
+    /// Accept inbound federation connections. Default: false.
+    pub listen: bool,
+    /// Opt this daemon into coordinator behavior for saved-machine federation.
+    /// Remote daemons do not federate saved profiles back unless explicitly
+    /// configured as coordinators themselves.
+    pub coordinator: bool,
+    /// Remote-side explicit trusted-machine opt-in. The coordinator's SSH reverse
+    /// socket is accepted only when its install identity matches this pin.
+    /// Same-user processes can impersonate a granted pane; this is not process isolation.
+    pub reverse_coordinator_machine_id: Option<String>,
+    /// Address the federation listener binds to when `listen` is enabled.
+    pub listen_addr: Option<String>,
+    /// Federation peers configured directly by endpoint and alias. SSH peers
+    /// must use `saved_machines`; this list accepts TCP and inbound-only peers.
+    #[serde(default, deserialize_with = "deserialize_explicit_federation_peers")]
+    pub peers: Vec<FederationPeer>,
+    /// Coordinator policy for saved SSH machines, keyed by the immutable
+    /// upstream profile id. Connection details, labels, sessions, and enabled
+    /// state remain owned by the endpoint catalog.
+    #[serde(default, deserialize_with = "deserialize_saved_machine_policies")]
+    pub saved_machines: BTreeMap<crate::client::endpoint::ProfileId, FederationSavedMachinePolicy>,
+    /// Named sessions (`herdr --session <name>`) that federate like the default
+    /// session. Every session reads this machine-wide config, so by default
+    /// only the default session coordinates saved machines, polls outbound
+    /// peers, and binds `listen_addr`; other named sessions remain reachable
+    /// as a remote coordinator's SSH target. `"default"` is accepted and
+    /// redundant.
+    #[serde(default, deserialize_with = "deserialize_federation_named_sessions")]
+    pub named_sessions: Vec<String>,
+}
+
+impl FederationConfig {
+    /// Whether the server for `session` (`None` = default session) runs this
+    /// federation config: the default session always does, a named session
+    /// only when listed in `named_sessions`.
+    pub(crate) fn federates_session(&self, session: Option<&str>) -> bool {
+        session.is_none_or(|name| {
+            name == crate::session::DEFAULT_SESSION_NAME
+                || self.named_sessions.iter().any(|listed| listed == name)
+        })
+    }
+
+    /// The federation config the server for `session` actually runs.
+    ///
+    /// A named session that is not listed in `named_sessions` keeps no
+    /// coordinator role, no outbound explicit peers, and no inbound listener:
+    /// the default session's server already polls every saved machine and owns
+    /// `listen_addr`. Remote-side settings such as
+    /// `reverse_coordinator_machine_id` stay in effect. Returns
+    /// `Cow::Owned` only when the session rule actually suppressed something.
+    pub(crate) fn for_session(&self, session: Option<&str>) -> std::borrow::Cow<'_, Self> {
+        let suppresses = self.coordinator
+            || self.listen
+            || self.peers.iter().any(|peer| peer.endpoint.is_some());
+        if !suppresses || self.federates_session(session) {
+            return std::borrow::Cow::Borrowed(self);
+        }
+        std::borrow::Cow::Owned(Self {
+            listen: false,
+            coordinator: false,
+            peers: self
+                .peers
+                .iter()
+                .filter(|peer| peer.endpoint.is_none())
+                .cloned()
+                .collect(),
+            reverse_coordinator_machine_id: self.reverse_coordinator_machine_id.clone(),
+            listen_addr: self.listen_addr.clone(),
+            saved_machines: self.saved_machines.clone(),
+            named_sessions: self.named_sessions.clone(),
+        })
+    }
+}
+
+fn deserialize_federation_named_sessions<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let sessions = Vec::<String>::deserialize(deserializer)?;
+    for session in &sessions {
+        crate::session::validate_name(session).map_err(|error| {
+            de::Error::custom(format!(
+                "federation.named_sessions entry {session:?} is invalid: {error}"
+            ))
+        })?;
+    }
+    Ok(sessions)
+}
+
+fn deserialize_explicit_federation_peers<'de, D>(
+    deserializer: D,
+) -> Result<Vec<FederationPeer>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let peers = Vec::<FederationPeer>::deserialize(deserializer)?;
+    if peers.iter().any(|peer| {
+        peer.endpoint
+            .as_deref()
+            .is_some_and(|endpoint| endpoint.starts_with("ssh://"))
+            || peer.profile_id.is_some()
+            || peer.remote_session.is_some()
+    }) {
+        return Err(de::Error::custom(
+            "SSH federation peers must use federation.saved_machines keyed by an existing saved profile ID; federation.peers accepts only TCP or inbound-only peers",
+        ));
+    }
+    Ok(peers)
+}
+
+/// Federation-only policy attached to one saved SSH profile.
+///
+/// Presence opts the profile into coordinator federation. SSH remains a
+/// full-control OpenSSH trust boundary; no token or private-key setting is
+/// accepted here.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FederationSavedMachinePolicy {
+    /// Persisted install identity expected from the remote Herdr daemon.
+    /// Required so catalog reconciliation fails closed on a missing or changed
+    /// machine identity.
+    pub expected_machine_id: String,
+    /// Selected live agents allowed through the coordinator's restricted reverse
+    /// gateway. Empty by default; a saved profile alone grants no reverse access.
+    #[serde(default)]
+    pub agent_grants: Vec<FederationAgentGrant>,
+}
+
+/// A trusted-machine grant bound to the observed pane and harness session,
+/// including its mutable label so a rename/reuse fails closed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FederationAgentGrant {
+    pub terminal_id: String,
+    pub session: crate::api::schema::AgentSessionInfo,
+    pub name: Option<String>,
+    #[serde(default)]
+    pub observe: bool,
+    #[serde(default)]
+    pub interact: bool,
+    /// Other peer aliases whose agents may be observed, in addition to the
+    /// coordinator. This never delegates those peers' own federation rosters.
+    #[serde(default)]
+    pub observe_peers: Vec<String>,
+    /// Other peer aliases whose agents may receive prompts.
+    #[serde(default)]
+    pub interact_peers: Vec<String>,
+}
+fn deserialize_saved_machine_policies<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<crate::client::endpoint::ProfileId, FederationSavedMachinePolicy>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let policies =
+        BTreeMap::<crate::client::endpoint::ProfileId, FederationSavedMachinePolicy>::deserialize(
+            deserializer,
+        )?;
+    for (profile_id, policy) in &policies {
+        crate::client::endpoint::ProfileId::parse(profile_id.to_string())
+            .map_err(de::Error::custom)?;
+        validate_expected_machine_id(&policy.expected_machine_id).map_err(de::Error::custom)?;
+        let mut granted = std::collections::HashSet::new();
+        for grant in &policy.agent_grants {
+            if grant.terminal_id.is_empty()
+                || grant.session.value.is_empty()
+                || !granted.insert(&grant.terminal_id)
+                || !grant.observe && !grant.interact
+                || grant
+                    .observe_peers
+                    .iter()
+                    .chain(&grant.interact_peers)
+                    .any(|alias| {
+                        alias.is_empty() || alias == &profile_id.to_string() || alias.contains('/')
+                    })
+            {
+                return Err(de::Error::custom(
+                    "invalid or duplicate saved federation agent grant",
+                ));
+            }
+        }
+    }
+    Ok(policies)
+}
+
+fn validate_expected_machine_id(machine_id: &str) -> Result<(), String> {
+    if machine_id.is_empty()
+        || machine_id.len() > 128
+        || machine_id.trim() != machine_id
+        || machine_id.chars().any(char::is_control)
+    {
+        return Err(
+            "saved federation machine expected_machine_id must be 1-128 visible bytes with no surrounding whitespace"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// A directly configured federation peer.
+///
+/// `profile_id` and `remote_session` are populated only by the coordinator's
+/// saved-profile adapter. Config deserialization rejects either field and every
+/// `ssh://` endpoint in `federation.peers`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct FederationPeer {
+    /// Local alias used to refer to this peer.
+    pub alias: String,
+    /// Mutable display label. Routing continues to use `alias`.
+    pub display_label: Option<String>,
+    /// TCP endpoint to reach an explicitly configured peer.
+    pub endpoint: Option<String>,
+    /// Immutable saved-machine profile id synthesized by the coordinator.
+    pub profile_id: Option<String>,
+    /// Named remote session synthesized by the coordinator.
+    pub remote_session: Option<String>,
+    /// Filesystem path to the shared auth token for this peer.
+    pub token_file: Option<String>,
+    /// Expected per-install identity for this peer. Inbound connections must
+    /// present it in their authenticated hello; outbound polls must report it in
+    /// `agent.list`. A missing or changed value fails closed. Optional — omit to
+    /// authenticate by the shared token or OpenSSH alone.
+    ///
+    /// Only pin peers running a build that reports an install identity. Older
+    /// peers omit it and are rejected when a pin is configured.
+    pub expected_node_id: Option<String>,
+    /// Capability tier this peer's token grants over inbound TCP federation.
+    /// Default: `observe` (read-only).
+    pub capability: CapabilityTier,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct ExperimentalConfig {
@@ -1376,6 +1994,424 @@ impl Default for AdvancedConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn saved_federation_machine_policy_is_keyed_by_valid_profile_id() {
+        let profile_id = "0123456789abcdef0123456789abcdef";
+        let config: FederationConfig = toml::from_str(&format!(
+            r#"
+                [saved_machines."{profile_id}"]
+                expected_machine_id = "machine_0123456789abcdef0123456789abcdef"
+            "#
+        ))
+        .unwrap();
+
+        let key = crate::client::endpoint::ProfileId::parse(profile_id).unwrap();
+        assert_eq!(
+            config.saved_machines[&key].expected_machine_id,
+            "machine_0123456789abcdef0123456789abcdef"
+        );
+    }
+
+    #[test]
+    fn saved_federation_machine_policy_fails_closed_without_identity() {
+        let missing_identity = toml::from_str::<FederationConfig>(
+            r#"
+                [saved_machines."0123456789abcdef0123456789abcdef"]
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(missing_identity.contains("expected_machine_id"));
+
+        let invalid_profile = toml::from_str::<FederationConfig>(
+            r#"
+                [saved_machines.not-a-profile-id]
+                expected_machine_id = "machine_0123456789abcdef0123456789abcdef"
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(invalid_profile.contains("32 lowercase hexadecimal"));
+    }
+
+    #[test]
+    fn saved_federation_machine_policy_rejects_credentials() {
+        let error = toml::from_str::<FederationConfig>(
+            r#"
+                [saved_machines."0123456789abcdef0123456789abcdef"]
+                expected_machine_id = "machine_0123456789abcdef0123456789abcdef"
+                token_file = "/secret/token"
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("unknown field"));
+    }
+
+    #[test]
+    fn explicit_ssh_federation_peer_requires_saved_machine_policy() {
+        let error = toml::from_str::<FederationConfig>(
+            r#"
+                coordinator = true
+                [[peers]]
+                alias = "build"
+                endpoint = "ssh://dev@build.example"
+                profile_id = "0123456789abcdef0123456789abcdef"
+                remote_session = "agent-work"
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("must use federation.saved_machines"));
+    }
+
+    fn coordinator_federation_config(named_sessions: &str) -> FederationConfig {
+        toml::from_str(&format!(
+            r#"
+                coordinator = true
+                listen = true
+                listen_addr = "127.0.0.1:7020"
+                reverse_coordinator_machine_id = "machine_0123456789abcdef0123456789abcdef"
+                named_sessions = {named_sessions}
+
+                [[peers]]
+                alias = "laptop"
+                token_file = "/etc/herdr/peers/laptop.token"
+
+                [[peers]]
+                alias = "build"
+                endpoint = "tcp://build.internal:7020"
+                token_file = "/etc/herdr/peers/build.token"
+
+                [saved_machines."0123456789abcdef0123456789abcdef"]
+                expected_machine_id = "machine_0123456789abcdef0123456789abcdef"
+            "#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn federation_for_unlisted_named_session_drops_coordinator_outbound_and_listener() {
+        let config = coordinator_federation_config(r#"["ops"]"#);
+        let effective = config.for_session(Some("work"));
+
+        assert!(matches!(effective, std::borrow::Cow::Owned(_)));
+        assert!(!effective.coordinator);
+        assert!(!effective.listen);
+        assert_eq!(
+            effective
+                .peers
+                .iter()
+                .map(|peer| peer.alias.as_str())
+                .collect::<Vec<_>>(),
+            ["laptop"],
+            "only the inbound-only peer survives; no outbound polling"
+        );
+        // Remote-side acceptance and trust policy stay, so the session remains
+        // a valid SSH target and `machine status` reads "coordinator disabled".
+        assert_eq!(
+            effective.reverse_coordinator_machine_id,
+            config.reverse_coordinator_machine_id
+        );
+        assert_eq!(effective.saved_machines, config.saved_machines);
+    }
+
+    #[test]
+    fn federation_for_listed_named_session_is_unchanged() {
+        let config = coordinator_federation_config(r#"["ops", "work"]"#);
+        let effective = config.for_session(Some("work"));
+
+        assert!(matches!(effective, std::borrow::Cow::Borrowed(_)));
+        assert!(effective.coordinator && effective.listen);
+        assert_eq!(effective.peers.len(), 2);
+    }
+
+    #[test]
+    fn federation_for_default_session_is_unchanged() {
+        let config = coordinator_federation_config("[]");
+        for session in [None, Some(crate::session::DEFAULT_SESSION_NAME)] {
+            let effective = config.for_session(session);
+            assert!(matches!(effective, std::borrow::Cow::Borrowed(_)));
+            assert!(effective.coordinator && effective.listen);
+            assert_eq!(effective.peers.len(), 2);
+        }
+
+        // `"default"` in the list is redundant and harmless.
+        let redundant = coordinator_federation_config(r#"["default"]"#);
+        assert!(redundant.federates_session(None));
+        assert!(!redundant.federates_session(Some("work")));
+    }
+
+    #[test]
+    fn federation_session_rule_is_silent_when_nothing_is_suppressed() {
+        let config: FederationConfig = toml::from_str(
+            r#"
+                reverse_coordinator_machine_id = "machine_0123456789abcdef0123456789abcdef"
+                [[peers]]
+                alias = "laptop"
+                token_file = "/etc/herdr/peers/laptop.token"
+            "#,
+        )
+        .unwrap();
+        assert!(matches!(
+            config.for_session(Some("work")),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn federation_named_sessions_reject_invalid_names() {
+        let error = toml::from_str::<FederationConfig>(r#"named_sessions = ["../escape"]"#)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("federation.named_sessions"), "{error}");
+        assert!(toml::from_str::<FederationConfig>(r#"named_sessions = [""]"#).is_err());
+    }
+
+    #[test]
+    fn env_var_for_kind_maps_supported_harnesses() {
+        assert_eq!(env_var_for_kind("claude"), Some("CLAUDE_CONFIG_DIR"));
+        assert_eq!(env_var_for_kind("codex"), Some("CODEX_HOME"));
+        assert_eq!(env_var_for_kind("omp"), Some("PI_CODING_AGENT_DIR"));
+        assert_eq!(env_var_for_kind("kimi"), Some("KIMI_CODE_HOME"));
+        assert_eq!(env_var_for_kind("gemini"), None);
+        assert_eq!(env_var_for_kind(""), None);
+    }
+
+    #[test]
+    fn auth_env_vars_to_clear_covers_account_overrides() {
+        assert_eq!(
+            auth_env_vars_to_clear("claude"),
+            &["CLAUDE_CODE_OAUTH_TOKEN"]
+        );
+        assert_eq!(auth_env_vars_to_clear("codex"), &[] as &[&str]);
+        assert_eq!(
+            auth_env_vars_to_clear("omp"),
+            &["OMP_PROFILE", "PI_PROFILE"]
+        );
+        assert_eq!(auth_env_vars_to_clear("kimi"), &[] as &[&str]);
+        assert_eq!(auth_env_vars_to_clear("gemini"), &[] as &[&str]);
+        assert_eq!(auth_env_vars_to_clear(""), &[] as &[&str]);
+    }
+
+    #[test]
+    fn kind_for_config_env_var_is_the_reverse_of_env_var_for_kind() {
+        for kind in ["claude", "codex", "omp", "kimi"] {
+            let var = env_var_for_kind(kind).expect("supported kind has a config var");
+            assert_eq!(kind_for_config_env_var(var), Some(kind));
+        }
+        assert_eq!(kind_for_config_env_var("PATH"), None);
+        assert_eq!(kind_for_config_env_var(""), None);
+    }
+
+    #[test]
+    fn account_launch_env_builds_config_home_pair() {
+        let account = AccountConfig {
+            id: "work".into(),
+            kind: "codex".into(),
+            label: "Work".into(),
+            config_dir: "/home/x/.codex-work".into(),
+        };
+        assert_eq!(
+            account.launch_env(),
+            Some(AccountLaunchEnv {
+                vars: vec![("CODEX_HOME".to_string(), "/home/x/.codex-work".to_string())],
+                // codex has no auth-token lever today, so nothing to clear.
+                clear_vars: Vec::new(),
+            })
+        );
+
+        let omp = AccountConfig {
+            id: "omp-work".into(),
+            kind: "omp".into(),
+            label: "OMP Work".into(),
+            config_dir: "/home/x/.omp-work/agent".into(),
+        };
+        let omp_env = AccountLaunchEnv {
+            vars: vec![(
+                "PI_CODING_AGENT_DIR".to_string(),
+                "/home/x/.omp-work/agent".to_string(),
+            )],
+            clear_vars: vec!["OMP_PROFILE".to_string(), "PI_PROFILE".to_string()],
+        };
+        assert_eq!(omp.launch_env(), Some(omp_env.clone()));
+        assert_eq!(
+            AccountLaunchEnv::from_resolved_vars(omp_env.vars.clone()),
+            omp_env
+        );
+
+        let unknown = AccountConfig {
+            kind: "gemini".into(),
+            ..omp
+        };
+        assert_eq!(unknown.launch_env(), None);
+    }
+
+    fn restore_home(prev: Option<std::ffi::OsString>) {
+        match prev {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    fn default_config_dir_is_home_relative_per_kind() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let previous = ["HOME", "PI_CODING_AGENT_DIR", "PI_CONFIG_DIR"]
+            .map(|key| (key, std::env::var_os(key)));
+        std::env::set_var("HOME", "/home/tester");
+        std::env::remove_var("PI_CODING_AGENT_DIR");
+        std::env::remove_var("PI_CONFIG_DIR");
+        assert_eq!(
+            default_config_dir("claude"),
+            Some(PathBuf::from("/home/tester/.claude"))
+        );
+        assert_eq!(
+            default_config_dir("codex"),
+            Some(PathBuf::from("/home/tester/.codex"))
+        );
+        assert_eq!(
+            default_config_dir("kimi"),
+            Some(PathBuf::from("/home/tester/.kimi-code"))
+        );
+        assert_eq!(
+            default_config_dir("omp"),
+            Some(PathBuf::from("/home/tester/.omp/agent"))
+        );
+        assert_eq!(default_config_dir("gemini"), None);
+        for (key, value) in previous {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    #[test]
+    fn omp_default_config_dir_honors_native_overrides() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let previous = ["HOME", "PI_CODING_AGENT_DIR", "PI_CONFIG_DIR"]
+            .map(|key| (key, std::env::var_os(key)));
+        std::env::set_var("HOME", "/home/tester");
+        std::env::set_var("PI_CODING_AGENT_DIR", "~/omp-work");
+        std::env::remove_var("PI_CONFIG_DIR");
+        assert_eq!(
+            default_config_dir("omp"),
+            Some(PathBuf::from("/home/tester/omp-work"))
+        );
+
+        std::env::remove_var("PI_CODING_AGENT_DIR");
+        std::env::set_var("PI_CONFIG_DIR", ".omp-alt");
+        assert_eq!(
+            default_config_dir("omp"),
+            Some(PathBuf::from("/home/tester/.omp-alt/agent"))
+        );
+
+        for (key, value) in previous {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    #[test]
+    fn omp_session_root_is_below_the_complete_agent_directory() {
+        let agent_dir = PathBuf::from("/home/tester/.omp/agent");
+        assert_eq!(omp_sessions_dir(&agent_dir), agent_dir.join("sessions"));
+    }
+
+    #[test]
+    fn primary_default_dir_account_injects_no_env_but_secondary_does() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", "/home/tester");
+
+        // Primary account at the DEFAULT config-home -> NO config-home override, so it
+        // launches like a default install (issue #94) while staying selectable. It still
+        // clears the conflicting auth token: a global CLAUDE_CODE_OAUTH_TOKEN authenticates
+        // as whichever account minted it and would silently outrank this explicit choice.
+        let primary = AccountConfig {
+            id: "claude-main".into(),
+            kind: "claude".into(),
+            label: "main".into(),
+            config_dir: "/home/tester/.claude".into(),
+        };
+        let primary_env = primary
+            .launch_env()
+            .expect("claude has a config-home lever");
+        assert!(
+            primary_env.vars.is_empty(),
+            "injecting the override on a default config-home strands ~/.claude.json (issue #94)"
+        );
+        assert_eq!(
+            primary_env.clear_vars,
+            vec!["CLAUDE_CODE_OAUTH_TOKEN".to_string()],
+            "a selected account must clear credentials that outrank it, even when it sets \
+             no override — skipping this is how a global token silently re-homed the fleet"
+        );
+        assert!(is_default_config_dir("claude", "/home/tester/.claude"));
+        // Trailing slash still resolves as the default (component-wise compare).
+        assert!(is_default_config_dir("claude", "/home/tester/.claude/"));
+        // Kind matters: $HOME/.claude is not codex's default home.
+        assert!(!is_default_config_dir("codex", "/home/tester/.claude"));
+
+        // A distinct secondary dir still injects the override.
+        let secondary = AccountConfig {
+            config_dir: "/home/tester/.claude-2".into(),
+            ..primary.clone()
+        };
+        assert_eq!(
+            secondary.launch_env(),
+            Some(AccountLaunchEnv {
+                vars: vec![(
+                    "CLAUDE_CONFIG_DIR".to_string(),
+                    "/home/tester/.claude-2".to_string()
+                )],
+                clear_vars: vec!["CLAUDE_CODE_OAUTH_TOKEN".to_string()],
+            })
+        );
+        assert!(!is_default_config_dir("claude", "/home/tester/.claude-2"));
+
+        restore_home(prev);
+    }
+
+    #[test]
+    fn accounts_registry_round_trips_from_toml() {
+        let toml = r#"
+[[accounts]]
+id = "work"
+kind = "codex"
+label = "Work"
+config_dir = "/home/x/.codex-work"
+
+[[accounts]]
+id = "personal"
+kind = "claude"
+label = "Personal"
+config_dir = "/home/x/.claude-personal"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.accounts.len(), 2);
+        assert_eq!(config.accounts[0].id, "work");
+        assert_eq!(config.accounts[0].kind, "codex");
+        assert_eq!(config.accounts[0].config_dir, "/home/x/.codex-work");
+        assert_eq!(config.accounts[1].id, "personal");
+        assert_eq!(config.accounts[1].kind, "claude");
+        assert_eq!(
+            config.accounts[1].launch_env(),
+            Some(AccountLaunchEnv {
+                vars: vec![(
+                    "CLAUDE_CONFIG_DIR".to_string(),
+                    "/home/x/.claude-personal".to_string()
+                )],
+                clear_vars: vec!["CLAUDE_CODE_OAUTH_TOKEN".to_string()],
+            })
+        );
+
+        // Absent section defaults to an empty registry.
+        assert!(Config::default().accounts.is_empty());
+    }
 
     #[test]
     fn update_config_defaults_and_parses() {
@@ -1398,17 +2434,55 @@ manifest_check = false
     }
 
     #[test]
-    fn update_channel_default_follows_windows_build_identity() {
+    fn push_config_defaults_off_and_parses() {
+        let default_config = Config::default();
+        assert!(!default_config.push.enabled);
+        assert!(default_config.push.key_path.is_none());
+        assert!(!default_config.push.sandbox);
+        assert_eq!(default_config.push.mode, PushMode::Auto);
+        assert_eq!(default_config.push.relay_url, DEFAULT_PUSH_RELAY_URL);
+
+        // A partial [push] table keeps the relay defaults rather than blanking them.
+        let partial: Config = toml::from_str("[push]\nenabled = true\n").unwrap();
+        assert_eq!(partial.push.mode, PushMode::Auto);
+        assert_eq!(partial.push.relay_url, DEFAULT_PUSH_RELAY_URL);
+
+        let relay: Config =
+            toml::from_str("[push]\nmode = \"relay\"\nrelay_url = \"https://relay.test\"\n")
+                .unwrap();
+        assert_eq!(relay.push.mode, PushMode::Relay);
+        assert_eq!(relay.push.relay_url, "https://relay.test");
+        assert!(toml::from_str::<Config>("[push]\nmode = \"sometimes\"\n").is_err());
+
+        let toml = r#"
+[push]
+enabled = true
+key_path = "~/secrets/AuthKey_ABC123DEFG.p8"
+key_id = "ABC123DEFG"
+team_id = "TEAM123456"
+topic = "com.example.herdr"
+sandbox = true
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.push.enabled);
         assert_eq!(
-            default_update_channel_for_build(true, true),
+            config.push.key_path.as_deref(),
+            Some("~/secrets/AuthKey_ABC123DEFG.p8")
+        );
+        assert_eq!(config.push.key_id.as_deref(), Some("ABC123DEFG"));
+        assert_eq!(config.push.team_id.as_deref(), Some("TEAM123456"));
+        assert_eq!(config.push.topic.as_deref(), Some("com.example.herdr"));
+        assert!(config.push.sandbox);
+    }
+
+    #[test]
+    fn update_channel_default_follows_build_identity_on_every_platform() {
+        assert_eq!(
+            default_update_channel_for_build(true),
             UpdateChannelConfig::Preview
         );
         assert_eq!(
-            default_update_channel_for_build(true, false),
-            UpdateChannelConfig::Stable
-        );
-        assert_eq!(
-            default_update_channel_for_build(false, true),
+            default_update_channel_for_build(false),
             UpdateChannelConfig::Stable
         );
     }

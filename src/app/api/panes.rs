@@ -5,16 +5,17 @@ use crate::api::schema::{
     PaneCopyMotionParams, PaneCopySearchDirection, PaneCopySearchParams, PaneCurrentParams,
     PaneDirection, PaneEdgesParams, PaneEdgesResult, PaneFocusDirectionParams,
     PaneFocusDirectionReason, PaneFocusDirectionResult, PaneInfo, PaneInputSetParams,
-    PaneLayoutPane, PaneLayoutParams, PaneLayoutRect, PaneLayoutSnapshot, PaneLayoutSplit,
-    PaneListParams, PaneMoveDestination, PaneMoveParams, PaneMoveReason, PaneMoveResult,
-    PaneNeighborParams, PaneNeighborResult, PaneProcessInfo, PaneProcessInfoParams,
+    PaneInputStreamParams, PaneLayoutPane, PaneLayoutParams, PaneLayoutRect, PaneLayoutSnapshot,
+    PaneLayoutSplit, PaneListParams, PaneMoveDestination, PaneMoveParams, PaneMoveReason,
+    PaneMoveResult, PaneNeighborParams, PaneNeighborResult, PaneProcessInfo, PaneProcessInfoParams,
     PaneProcessInfoProcess, PaneReadParams, PaneReadResult, PaneReleaseAgentParams,
     PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
     PaneReportMetadataParams, PaneResizeParams, PaneResizeReason, PaneResizeResult,
     PaneScrollParams, PaneSelectionReadParams, PaneSendInputParams, PaneSendKeysParams,
-    PaneSendTextParams, PaneSplitParams, PaneSwapParams, PaneSwapReason, PaneSwapResult,
-    PaneTarget, PaneTextPoint, PaneTextRange, PaneZoomMode, PaneZoomParams, PaneZoomReason,
-    PaneZoomResult, ResponseResult,
+    PaneSendTextParams, PaneSetPtySizeParams, PaneSplitParams, PaneStreamParams, PaneSwapParams,
+    PaneSwapReason, PaneSwapResult, PaneTarget, PaneTextPoint, PaneTextRange, PaneTurnRecord,
+    PaneTurnsParams, PaneTurnsResult, PaneZoomMode, PaneZoomParams, PaneZoomReason, PaneZoomResult,
+    ResponseResult,
 };
 use crate::app::actions::{PaneZoomCommand, PaneZoomNoopReason};
 use crate::app::App;
@@ -165,6 +166,68 @@ impl App {
         };
 
         encode_success(id, ResponseResult::PaneInfo { pane })
+    }
+
+    pub(super) fn handle_pane_turns(&mut self, id: String, params: PaneTurnsParams) -> String {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let Some(public_pane_id) = self.public_pane_id(ws_idx, pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let Some(terminal_id) = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.terminal_id(pane_id))
+        else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let Some(terminal) = self.state.terminals.get(terminal_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let replay = match terminal.replay_turns(params.since, params.expected_epoch) {
+            Ok(replay) => replay,
+            Err(crate::terminal::TurnReplayError::EpochMismatch { expected, actual }) => {
+                return encode_error(
+                    id,
+                    "turn_epoch_mismatch",
+                    format!("expected turn epoch {expected}, current epoch is {actual}"),
+                );
+            }
+            Err(crate::terminal::TurnReplayError::SinceAhead { since, newest }) => {
+                return encode_error(
+                    id,
+                    "invalid_params",
+                    format!("since turn {since} is newer than current turn {newest}"),
+                );
+            }
+        };
+        let records = replay
+            .records
+            .into_iter()
+            .map(|record| PaneTurnRecord {
+                turn: record.turn,
+                turn_epoch: record.turn_epoch,
+                outcome: record.outcome,
+                completed_unix_ms: record.completed_unix_ms,
+                message: record.message,
+                message_truncated: record.message_truncated,
+                agent_session_path: record.agent_session_path,
+            })
+            .collect();
+        encode_success(
+            id,
+            ResponseResult::PaneTurns {
+                turns: PaneTurnsResult {
+                    pane_id: public_pane_id,
+                    turn_epoch: replay.turn_epoch,
+                    records,
+                    truncated: replay.truncated,
+                    oldest_available: replay.oldest_available,
+                },
+            },
+        )
     }
 
     pub(super) fn handle_pane_clear(&mut self, id: String, target: PaneTarget) -> String {
@@ -762,6 +825,270 @@ impl App {
                 },
             },
         )
+    }
+
+    pub(super) fn handle_pane_set_pty_size(
+        &mut self,
+        id: String,
+        params: PaneSetPtySizeParams,
+    ) -> String {
+        let Some((ws_idx, pane_id)) = self.resolve_optional_pane(params.pane_id.as_deref()) else {
+            return encode_error(id, "pane_not_found", "pane not found");
+        };
+        let Some(pane_public_id) = self.public_pane_id(ws_idx, pane_id) else {
+            return encode_error(id, "pane_not_found", "pane not found");
+        };
+        let Some(terminal_id) = self.state.terminal_id_for_pane(ws_idx, pane_id) else {
+            return pane_not_found(id, &pane_public_id);
+        };
+
+        // Validate the pane has a live runtime BEFORE touching any lease, so a
+        // failed request leaves the lease map untouched (otherwise `lock=true`
+        // would strand a lease and `lock=false` would drop an existing lease
+        // despite the request failing).
+        if self
+            .state
+            .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
+            .is_none()
+        {
+            return pane_not_found(id, &pane_public_id);
+        }
+
+        // Upsert/remove this viewer's width lease, then let the arbiter drive the
+        // effective winsize (widest active viewer wins). A narrow request from
+        // one viewer no longer shrinks a pane a wider viewer holds; grows apply
+        // immediately, shrinks are debounced (see `reconcile_pty_lease_size`).
+        // The lease set is API-owned and kept separate from
+        // `direct_attach_resize_locks` so a direct attach client
+        // connecting/disconnecting cannot clear an API lease and vice versa.
+        let now = std::time::Instant::now();
+        let viewer = crate::app::state::AppState::lease_viewer_key(params.viewer_id.as_deref());
+        // Checked here, on the app loop, so a lease cannot land after the
+        // viewer's last stream closed and outlive it.
+        if params.lock
+            && params.require_stream
+            && !self.state.has_stream_viewer(&terminal_id, &viewer)
+        {
+            return encode_error(
+                id,
+                "guest_no_stream",
+                "open the agent's stream before resizing it",
+            );
+        }
+        if params.lock {
+            let ttl = params
+                .ttl_ms
+                .map(|ms| {
+                    std::time::Duration::from_millis(ms.clamp(
+                        crate::app::state::PTY_LEASE_TTL_MIN_MS,
+                        crate::app::state::PTY_LEASE_TTL_MAX_MS,
+                    ))
+                })
+                .unwrap_or(crate::app::state::DEFAULT_PTY_LEASE_TTL);
+            let expires_at = now.checked_add(ttl).unwrap_or(now);
+            self.state.upsert_pty_width_lease(
+                &terminal_id,
+                viewer,
+                crate::app::state::WidthLease {
+                    cols: params.cols,
+                    rows: params.rows,
+                    cell_width_px: params.cell_width_px.unwrap_or(0),
+                    cell_height_px: params.cell_height_px.unwrap_or(0),
+                    expires_at,
+                },
+            );
+            // An explicit `lock:true` set applies the arbiter's effective size
+            // immediately (grow OR shrink) — a single/widest viewer resizing
+            // itself expects the synchronous response to report the size it asked
+            // for. The debounce is reserved for lease drops on the tick.
+            self.reconcile_pty_lease_size(ws_idx, pane_id, &terminal_id, now, true);
+        } else {
+            // Release only this viewer's lease.
+            self.state.remove_pty_width_lease(&terminal_id, &viewer);
+            if self
+                .state
+                .pty_width_leases
+                .get(&terminal_id)
+                .is_some_and(|viewers| !viewers.is_empty())
+            {
+                // Other viewers remain: apply the widest remaining immediately. A
+                // narrow viewer releasing must NOT shrink a pane a wider viewer
+                // still holds (the arbiter keeps the widest).
+                self.reconcile_pty_lease_size(ws_idx, pane_id, &terminal_id, now, true);
+            } else {
+                // No lease remains: apply the caller's requested size once as the
+                // parting handoff and report it. No lock persists, so the TUI
+                // reclaims the layout width via the render gate on the next frame
+                // (this is not an orphan pin). Clear any pending shrink first.
+                self.state.pty_pending_shrinks.remove(&terminal_id);
+                if let Some(runtime) = self.state.runtime_for_pane_in_workspace(
+                    &self.terminal_runtimes,
+                    ws_idx,
+                    pane_id,
+                ) {
+                    runtime.resize(
+                        params.rows,
+                        params.cols,
+                        params.cell_width_px.unwrap_or(0),
+                        params.cell_height_px.unwrap_or(0),
+                    );
+                }
+            }
+        }
+
+        // Report the winsize actually in effect — a superseded caller (a wider
+        // lease exists) sees the real current size, not its own request. The
+        // runtime was validated above, so the fallback (clamped request) is only
+        // a defensive default.
+        let (applied_rows, applied_cols) = self
+            .state
+            .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
+            .map(|runtime| runtime.current_size())
+            .unwrap_or((params.rows.max(2), params.cols.max(4)));
+
+        encode_success(
+            id,
+            ResponseResult::PanePtySize {
+                pane_id: pane_public_id,
+                cols: applied_cols,
+                rows: applied_rows,
+                locked: params.lock,
+            },
+        )
+    }
+
+    /// Internal open for `pane.stream` (dispatched by the stream server, not a
+    /// public method). Lazily creates the pane's bounded output ring, registers
+    /// one viewer, and publishes the ring so the connection thread can drain it
+    /// off the app loop. The seed frame and ack are produced by the server from
+    /// the ring, so this only needs to succeed the attach.
+    pub(super) fn handle_pane_stream_open(
+        &mut self,
+        id: String,
+        params: PaneStreamParams,
+    ) -> String {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let Some(public_pane_id) = self.public_pane_id(ws_idx, pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let Some(runtime) =
+            self.state
+                .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
+        else {
+            return pane_not_found(id, &public_pane_id);
+        };
+        let ring = runtime.attach_output_stream(crate::pane::OUTPUT_RING_CAPACITY_BYTES);
+        crate::api::output_registry::register(&params.pane_id, &ring);
+        // No width-lease state is created at open: a lease is only minted by
+        // `pane.set_pty_size`. The viewer's identity (`params.viewer_id`) is
+        // carried through to the matching close (see the stream server), which is
+        // where the lease liveness tie is honoured by dropping that viewer's lease
+        // once its last stream closes (#137).
+        if let Some(viewer_id) = params.viewer_id.as_deref() {
+            if let Some(terminal_id) = self.state.terminal_id_for_pane(ws_idx, pane_id) {
+                self.state
+                    .open_stream_viewer(&params.pane_id, viewer_id, terminal_id);
+            }
+        }
+        encode_success(id, ResponseResult::Ok {})
+    }
+
+    /// Internal close for `pane.stream`: detaches one viewer and, once the last
+    /// leaves, unpublishes the ring (which also stops the read hot-path tap).
+    /// When the close carries a `viewer_id` (threaded from the open, #137) and
+    /// is that viewer's last open stream on the pane, it also drops the viewer's
+    /// width lease — the PRIMARY liveness signal — and re-runs the arbiter so the
+    /// pane shrinks (debounced) to the next-widest viewer, or the TUI reclaims
+    /// the layout width once the last lease is gone.
+    pub(super) fn handle_pane_stream_close(
+        &mut self,
+        id: String,
+        params: PaneStreamParams,
+    ) -> String {
+        let last_viewer_stream = params
+            .viewer_id
+            .as_deref()
+            .map(|viewer_id| self.state.close_stream_viewer(&params.pane_id, viewer_id));
+        match self.parse_pane_id(&params.pane_id) {
+            Some((ws_idx, pane_id)) => {
+                let remaining = self
+                    .state
+                    .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
+                    .map(|runtime| runtime.detach_output_stream());
+                // Unregister when the last viewer left, or when the runtime is
+                // already gone (the pane was closed out from under the stream).
+                if remaining.is_none_or(|count| count == 0) {
+                    crate::api::output_registry::unregister(&params.pane_id);
+                }
+                if let (Some(viewer_id), Some(true)) =
+                    (params.viewer_id.as_deref(), last_viewer_stream)
+                {
+                    if let Some(terminal_id) = self.state.terminal_id_for_pane(ws_idx, pane_id) {
+                        if self.state.remove_pty_width_lease(&terminal_id, viewer_id) {
+                            // A viewer leaving is a lease DROP: the shrink to the
+                            // next-widest viewer is debounced, not immediate.
+                            self.reconcile_pty_lease_size(
+                                ws_idx,
+                                pane_id,
+                                &terminal_id,
+                                std::time::Instant::now(),
+                                false,
+                            );
+                        }
+                    }
+                }
+            }
+            None => crate::api::output_registry::unregister(&params.pane_id),
+        }
+        encode_success(id, ResponseResult::Ok {})
+    }
+
+    #[cfg(unix)]
+    /// Internal: drop one viewer's width lease wherever it holds one, with the
+    /// same debounced shrink as that viewer's `pane.stream` closing.
+    pub(super) fn handle_pane_pty_lease_release(
+        &mut self,
+        id: String,
+        params: crate::api::schema::PanePtyLeaseReleaseParams,
+    ) -> String {
+        let released: std::collections::HashSet<_> = self
+            .state
+            .pty_width_leases
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .filter(|terminal_id| {
+                self.state
+                    .remove_pty_width_lease(terminal_id, &params.viewer_id)
+            })
+            .collect();
+        let now = std::time::Instant::now();
+        for (ws_idx, pane_id, terminal_id) in self.state.pane_locations_for_terminals(&released) {
+            self.reconcile_pty_lease_size(ws_idx, pane_id, &terminal_id, now, false);
+        }
+        encode_success(id, ResponseResult::Ok {})
+    }
+
+    /// Open handshake for the persistent `pane.input.stream` write channel
+    /// (issue #62). Unlike the output stream there is no ring or registry to
+    /// attach: each frame is dispatched through the normal `pane.send_input`
+    /// path, so this only validates that the pane exists and is live before the
+    /// server upgrades the connection into a held-open frame loop.
+    pub(super) fn handle_pane_input_stream_open(
+        &mut self,
+        id: String,
+        params: PaneInputStreamParams,
+    ) -> String {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        if self.lookup_runtime_sender(ws_idx, pane_id).is_none() {
+            return pane_not_found(id, &params.pane_id);
+        }
+        encode_success(id, ResponseResult::Ok {})
     }
 
     pub(super) fn handle_pane_swap(&mut self, id: String, params: PaneSwapParams) -> String {
@@ -1570,6 +1897,8 @@ impl App {
         self.handle_internal_event(crate::events::AppEvent::HookStateReported {
             pane_id,
             session_ref: session_ref.clone(),
+            session_cursor: params.agent_session_cursor,
+            process_pid: params.agent_process_pid,
             source: params.source.clone(),
             agent_label: agent_label.clone(),
             state: detect_state_from_api(params.state),
@@ -1610,18 +1939,33 @@ impl App {
             &params.source,
             &agent_label,
             params.agent_session_id,
+            params.agent_session_path.clone(),
+        );
+        let session_path = crate::agent_resume::session_path_from_report(
+            &params.source,
+            &agent_label,
             params.agent_session_path,
         );
-        self.handle_internal_event(crate::events::AppEvent::AgentSessionReported {
-            pane_id,
-            session_ref: session_ref.clone(),
-            source: params.source.clone(),
-            agent_label: agent_label.clone(),
-            seq: params.seq,
-            session_start_source: crate::agent_resume::normalize_session_start_source(
-                params.session_start_source,
-            ),
-        });
+        // Use the App-level event wrapper, not the pure AppState dispatcher:
+        // session-transfer completion/rollback is reconciled there after the
+        // official integration report updates terminal ownership. Calling
+        // `handle_internal_event` directly left real socket reports stuck in
+        // AwaitingTarget/RollingBack even though the correct harness was live.
+        self.handle_internal_event_with_render_impact(
+            crate::events::AppEvent::AgentSessionReported {
+                pane_id,
+                session_ref: session_ref.clone(),
+                session_path,
+                session_cursor: params.agent_session_cursor,
+                process_pid: params.agent_process_pid,
+                source: params.source.clone(),
+                agent_label: agent_label.clone(),
+                seq: params.seq,
+                session_start_source: crate::agent_resume::normalize_session_start_source(
+                    params.session_start_source,
+                ),
+            },
+        );
         let applied =
             report_is_newer && self.session_report_applied(ws_idx, pane_id, session_ref.as_ref());
         self.report_agent_resume(
@@ -1913,8 +2257,32 @@ impl App {
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
+        let composer_baseline = runtime.detection_content_seq();
+        let aborts_turn = super::super::api_helpers::api_text_aborts_turn(&params.text);
         if let Err(err) = runtime.try_send_bytes(Bytes::from(params.text)) {
             return encode_error(id, "pane_send_failed", err.to_string());
+        }
+        self.record_pane_composer_write(
+            ws_idx,
+            pane_id,
+            crate::terminal::ComposerInputSource::Api,
+            composer_baseline,
+            true,
+            false,
+        );
+        if aborts_turn {
+            let terminal_id = self
+                .state
+                .workspaces
+                .get(ws_idx)
+                .and_then(|workspace| workspace.terminal_id(pane_id))
+                .cloned();
+            if let Some(terminal) = terminal_id
+                .as_ref()
+                .and_then(|terminal_id| self.state.terminals.get_mut(terminal_id))
+            {
+                terminal.mark_turn_aborted();
+            }
         }
 
         encode_success(id, ResponseResult::Ok {})
@@ -1931,6 +2299,9 @@ impl App {
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
+        let composer_baseline = runtime.detection_content_seq();
+        let aborts_turn = super::super::api_helpers::api_text_aborts_turn(&params.text)
+            || super::super::api_helpers::api_keys_abort_turn(&params.keys);
         let bytes = match super::super::api_helpers::encode_api_input(
             runtime,
             &params.text,
@@ -1941,6 +2312,28 @@ impl App {
         };
         if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
             return encode_error(id, "pane_send_failed", err.to_string());
+        }
+        self.record_pane_composer_write(
+            ws_idx,
+            pane_id,
+            crate::terminal::ComposerInputSource::Api,
+            composer_baseline,
+            !params.text.is_empty(),
+            false,
+        );
+        if aborts_turn {
+            let terminal_id = self
+                .state
+                .workspaces
+                .get(ws_idx)
+                .and_then(|workspace| workspace.terminal_id(pane_id))
+                .cloned();
+            if let Some(terminal) = terminal_id
+                .as_ref()
+                .and_then(|terminal_id| self.state.terminals.get_mut(terminal_id))
+            {
+                terminal.mark_turn_aborted();
+            }
         }
 
         encode_success(id, ResponseResult::Ok {})
@@ -2029,6 +2422,7 @@ impl App {
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
+        let composer_baseline = runtime.detection_content_seq();
         let encoded_keys = match encode_api_keys(runtime, &params.keys) {
             Ok(encoded_keys) => encoded_keys,
             Err(key) => return encode_error(id, "invalid_key", format!("unsupported key {key}")),
@@ -2036,6 +2430,28 @@ impl App {
         for bytes in encoded_keys {
             if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
                 return encode_error(id, "pane_send_failed", err.to_string());
+            }
+        }
+        self.record_pane_composer_write(
+            ws_idx,
+            pane_id,
+            crate::terminal::ComposerInputSource::Api,
+            composer_baseline,
+            false,
+            false,
+        );
+        if super::super::api_helpers::api_keys_abort_turn(&params.keys) {
+            let terminal_id = self
+                .state
+                .workspaces
+                .get(ws_idx)
+                .and_then(|workspace| workspace.terminal_id(pane_id))
+                .cloned();
+            if let Some(terminal) = terminal_id
+                .as_ref()
+                .and_then(|terminal_id| self.state.terminals.get_mut(terminal_id))
+            {
+                terminal.mark_turn_aborted();
             }
         }
 
@@ -2333,6 +2749,77 @@ mod tests {
     }
 
     #[test]
+    fn pane_report_agent_refreshes_omp_runtime_proof_under_the_state_sequence_gate() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+        let session_path = std::env::current_dir()
+            .unwrap()
+            .join("omp-runtime-proof.jsonl")
+            .display()
+            .to_string();
+        let session_ref = crate::agent_resume::AgentSessionRef::path(session_path.clone()).unwrap();
+        {
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.set_detected_state(Some(Agent::Omp), AgentState::Idle);
+            terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "herdr:omp".into(),
+                agent: "omp".into(),
+                session_ref: session_ref.clone(),
+            });
+            terminal.set_reported_agent_session_runtime(
+                "herdr:omp",
+                "omp",
+                &session_ref,
+                Some("stale-leaf".into()),
+                Some(41),
+            );
+        }
+
+        let report =
+            |seq: u64, cursor: Option<&str>, process_pid: Option<u32>| PaneReportAgentParams {
+                pane_id: public_pane_id.clone(),
+                source: "herdr:omp".into(),
+                agent: "omp".into(),
+                state: crate::api::schema::PaneAgentState::Idle,
+                message: None,
+                seq: Some(seq),
+                agent_session_id: None,
+                agent_session_path: Some(session_path.clone()),
+                agent_session_cursor: cursor.map(str::to_string),
+                agent_process_pid: process_pid,
+                resume_argv: None,
+            };
+
+        let response = app
+            .handle_pane_report_agent("fresh".into(), report(10, Some("selected-leaf"), Some(42)));
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let runtime = app.state.terminals[&terminal_id]
+            .reported_agent_session_runtime_for("herdr:omp", "omp", &session_ref)
+            .unwrap();
+        assert_eq!(runtime.cursor.as_deref(), Some("selected-leaf"));
+        assert_eq!(runtime.process_pid, Some(42));
+
+        let response =
+            app.handle_pane_report_agent("stale".into(), report(9, Some("stale-again"), Some(43)));
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let runtime = app.state.terminals[&terminal_id]
+            .reported_agent_session_runtime_for("herdr:omp", "omp", &session_ref)
+            .unwrap();
+        assert_eq!(runtime.cursor.as_deref(), Some("selected-leaf"));
+        assert_eq!(runtime.process_pid, Some(42));
+
+        let response =
+            app.handle_pane_report_agent("missing-cursor".into(), report(11, None, Some(42)));
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let runtime = app.state.terminals[&terminal_id]
+            .reported_agent_session_runtime_for("herdr:omp", "omp", &session_ref)
+            .unwrap();
+        assert_eq!(runtime.cursor, None);
+        assert_eq!(runtime.process_pid, Some(42));
+    }
+
+    #[test]
     fn pane_input_set_changes_only_the_target_pane() {
         let (mut app, public_pane_id) = app_with_test_workspace();
         let target = app.state.workspaces[0].tabs[0].root_pane;
@@ -2387,6 +2874,600 @@ mod tests {
         );
         app.state.insert_test_runtime(pane_id, runtime);
         (app, public_pane_id, pane_id)
+    }
+
+    #[test]
+    fn api_pane_turns_reports_eviction_and_rejects_invalid_watermarks() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        let epoch = terminal.turn_epoch;
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        for completed_unix_ms in 1..=65 {
+            terminal.record_completed_turn(
+                completed_unix_ms,
+                crate::terminal::state::TurnCompletionContext::default(),
+            );
+        }
+        let pane = app.pane_info(0, pane_id).unwrap();
+        assert_eq!(pane.last_completed_turn.map(|turn| turn.turn), Some(65));
+        let agent = app.agent_info(0, pane_id).unwrap();
+        assert_eq!(agent.last_completed_turn.map(|turn| turn.turn), Some(65));
+
+        let response = app.handle_pane_turns(
+            "turns".into(),
+            crate::api::schema::PaneTurnsParams {
+                pane_id: public_pane_id.clone(),
+                since: Some(1),
+                expected_epoch: Some(epoch),
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::PaneTurns { turns } = success.result else {
+            panic!("expected pane turns response");
+        };
+        assert!(!turns.truncated);
+        assert_eq!(turns.oldest_available, Some(2));
+        assert_eq!(turns.records.len(), 64);
+
+        let from_none = app.handle_pane_turns(
+            "none".into(),
+            crate::api::schema::PaneTurnsParams {
+                pane_id: public_pane_id.clone(),
+                since: None,
+                expected_epoch: Some(epoch),
+            },
+        );
+        let from_zero = app.handle_pane_turns(
+            "zero".into(),
+            crate::api::schema::PaneTurnsParams {
+                pane_id: public_pane_id.clone(),
+                since: Some(0),
+                expected_epoch: Some(epoch),
+            },
+        );
+        let from_none: SuccessResponse = serde_json::from_str(&from_none).unwrap();
+        let from_zero: SuccessResponse = serde_json::from_str(&from_zero).unwrap();
+        assert_eq!(from_none.result, from_zero.result);
+        let ResponseResult::PaneTurns { turns } = from_none.result else {
+            panic!("expected pane turns response");
+        };
+        assert!(turns.truncated);
+
+        let newest = app.handle_pane_turns(
+            "newest".into(),
+            crate::api::schema::PaneTurnsParams {
+                pane_id: public_pane_id.clone(),
+                since: Some(65),
+                expected_epoch: Some(epoch),
+            },
+        );
+        let newest: SuccessResponse = serde_json::from_str(&newest).unwrap();
+        let ResponseResult::PaneTurns { turns } = newest.result else {
+            panic!("expected pane turns response");
+        };
+        assert!(!turns.truncated);
+        assert!(turns.records.is_empty());
+
+        let response = app.handle_pane_turns(
+            "ahead".into(),
+            crate::api::schema::PaneTurnsParams {
+                pane_id: public_pane_id.clone(),
+                since: Some(66),
+                expected_epoch: Some(epoch),
+            },
+        );
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "invalid_params");
+
+        let response = app.handle_pane_turns(
+            "epoch".into(),
+            crate::api::schema::PaneTurnsParams {
+                pane_id: public_pane_id,
+                since: None,
+                expected_epoch: Some(epoch + 1),
+            },
+        );
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "turn_epoch_mismatch");
+    }
+
+    #[test]
+    fn pane_info_exposes_live_turn_hints_before_first_completion() {
+        let (mut app, _public_pane_id) = app_with_test_workspace();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Working);
+        let epoch = terminal.turn_epoch;
+
+        let pane = app.pane_info(0, pane_id).unwrap();
+
+        assert_eq!(pane.turn, Some(0));
+        assert_eq!(pane.turn_epoch, Some(epoch));
+        assert!(pane.last_completed_turn.is_none());
+    }
+
+    fn set_pty_params(
+        public_pane_id: &str,
+        cols: u16,
+        rows: u16,
+        lock: bool,
+        viewer_id: Option<&str>,
+    ) -> PaneSetPtySizeParams {
+        PaneSetPtySizeParams {
+            pane_id: Some(public_pane_id.to_string()),
+            cols,
+            rows,
+            cell_width_px: None,
+            cell_height_px: None,
+            lock,
+            viewer_id: viewer_id.map(str::to_string),
+            ttl_ms: None,
+            require_stream: false,
+        }
+    }
+
+    fn stream_params(public_pane_id: &str, viewer_id: Option<&str>) -> PaneStreamParams {
+        PaneStreamParams {
+            pane_id: public_pane_id.to_string(),
+            include_history: true,
+            resume_from: None,
+            epoch: None,
+            max_frame_bytes: None,
+            scrollback_lines: None,
+            viewer_id: viewer_id.map(str::to_string),
+        }
+    }
+
+    fn pty_size(app: &App, pane_id: PaneId) -> (u16, u16) {
+        app.state
+            .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, pane_id)
+            .expect("runtime present")
+            .current_size()
+    }
+
+    #[test]
+    fn effective_pty_size_picks_max_cols_wholesale() {
+        let mut state = crate::app::state::AppState::test_new();
+        let terminal_id = crate::terminal::TerminalId::alloc();
+
+        // No leases → None.
+        assert_eq!(state.effective_pty_size(&terminal_id), None);
+
+        let far = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        state.upsert_pty_width_lease(
+            &terminal_id,
+            "narrow".into(),
+            crate::app::state::WidthLease {
+                cols: 80,
+                rows: 50,
+                cell_width_px: 7,
+                cell_height_px: 15,
+                expires_at: far,
+            },
+        );
+        state.upsert_pty_width_lease(
+            &terminal_id,
+            "wide".into(),
+            crate::app::state::WidthLease {
+                cols: 200,
+                rows: 30,
+                cell_width_px: 9,
+                cell_height_px: 18,
+                expires_at: far,
+            },
+        );
+
+        // The widest lease wins WHOLESALE: its own rows (30) and cell metrics
+        // (9x18), never a mix with the narrow lease's taller rows (50).
+        assert_eq!(
+            state.effective_pty_size(&terminal_id),
+            Some((30, 200, 9, 18))
+        );
+    }
+
+    #[test]
+    fn pty_width_lease_state_invariants_hold() {
+        // Empty state: no leases or pending shrinks — invariants pass.
+        crate::app::state::AppState::test_new().assert_invariants_for_test();
+
+        // A consistent non-empty state carrying a lease on a real terminal upholds
+        // the lease/pending-shrink invariants.
+        let mut state = crate::app::state::AppState::test_with_adversarial_identity_state();
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = state.terminal_id_for_pane(0, pane_id).unwrap();
+        let far = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        state.upsert_pty_width_lease(
+            &terminal_id,
+            "viewer".into(),
+            crate::app::state::WidthLease {
+                cols: 120,
+                rows: 40,
+                cell_width_px: 0,
+                cell_height_px: 0,
+                expires_at: far,
+            },
+        );
+        state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn pty_geometry_externally_owned_reflects_leases_and_direct_attach() {
+        let mut state = crate::app::state::AppState::test_new();
+        let terminal_id = crate::terminal::TerminalId::alloc();
+        assert!(!state.pty_geometry_externally_owned(&terminal_id));
+
+        // Direct-attach ownership alone.
+        state.direct_attach_resize_locks.insert(terminal_id.clone());
+        assert!(state.pty_geometry_externally_owned(&terminal_id));
+
+        // A width lease alone.
+        state.direct_attach_resize_locks.remove(&terminal_id);
+        let far = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        state.upsert_pty_width_lease(
+            &terminal_id,
+            "viewer".into(),
+            crate::app::state::WidthLease {
+                cols: 80,
+                rows: 24,
+                cell_width_px: 0,
+                cell_height_px: 0,
+                expires_at: far,
+            },
+        );
+        assert!(state.pty_geometry_externally_owned(&terminal_id));
+
+        // Both sources at once.
+        state.direct_attach_resize_locks.insert(terminal_id.clone());
+        assert!(state.pty_geometry_externally_owned(&terminal_id));
+
+        // Clearing both drops ownership; the two sources are independent.
+        state.direct_attach_resize_locks.remove(&terminal_id);
+        assert!(state.remove_pty_width_lease(&terminal_id, "viewer"));
+        assert!(!state.pty_geometry_externally_owned(&terminal_id));
+        state.assert_invariants_for_test();
+    }
+
+    #[tokio::test]
+    async fn pty_size_lease_widest_viewer_wins_no_narrow_shrink() {
+        let (mut app, public_pane_id, _rx) = app_with_send_key_runtime(64);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+
+        // Viewer A takes a WIDE lease on an 80x24 runtime — a grow, applied now.
+        let response = app.handle_pane_set_pty_size(
+            "a".into(),
+            set_pty_params(&public_pane_id, 100, 40, true, Some("A")),
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::PanePtySize {
+            cols, rows, locked, ..
+        } = success.result
+        else {
+            panic!("expected pane pty size response");
+        };
+        assert_eq!((cols, rows), (100, 40));
+        assert!(locked);
+        assert_eq!(pty_size(&app, pane_id), (40, 100));
+        assert!(app.state.pty_geometry_externally_owned(&terminal_id));
+
+        // Viewer B sets a NARROWER size while A holds wider: the arbiter keeps A's
+        // width, so the pane does NOT shrink and B sees the real (wide) winsize.
+        let response = app.handle_pane_set_pty_size(
+            "b".into(),
+            set_pty_params(&public_pane_id, 60, 30, true, Some("B")),
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::PanePtySize { cols, rows, .. } = success.result else {
+            panic!("expected pane pty size response");
+        };
+        assert_eq!((cols, rows), (100, 40));
+        assert_eq!(pty_size(&app, pane_id), (40, 100));
+        // Both viewers hold a lease.
+        assert_eq!(
+            app.state
+                .pty_width_leases
+                .get(&terminal_id)
+                .map(|m| m.len()),
+            Some(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn pty_size_lease_explicit_set_applies_grow_and_shrink_immediately() {
+        let (mut app, public_pane_id, _rx) = app_with_send_key_runtime(64);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+
+        // An explicit grow applies immediately.
+        app.handle_pane_set_pty_size(
+            "grow".into(),
+            set_pty_params(&public_pane_id, 150, 50, true, Some("A")),
+        );
+        assert_eq!(pty_size(&app, pane_id), (50, 150));
+
+        // The same (widest) viewer narrowing ITSELF via an explicit lock=true set
+        // is a deliberate synchronous resize and applies immediately too — a
+        // single viewer behaves as it does today. (The debounce is only for a
+        // wider viewer LEAVING; see `pty_size_lease_widest_drop_...`.)
+        let response = app.handle_pane_set_pty_size(
+            "shrink".into(),
+            set_pty_params(&public_pane_id, 90, 30, true, Some("A")),
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::PanePtySize { cols, rows, .. } = success.result else {
+            panic!("expected pane pty size response");
+        };
+        assert_eq!((cols, rows), (90, 30));
+        assert_eq!(pty_size(&app, pane_id), (30, 90));
+        // No pending shrink was armed — it applied straight away.
+        assert!(app.state.pty_pending_shrinks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pty_size_lease_widest_stream_close_shrinks_to_next_after_debounce() {
+        let (mut app, public_pane_id, _rx) = app_with_send_key_runtime(64);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+
+        app.handle_pane_set_pty_size(
+            "a".into(),
+            set_pty_params(&public_pane_id, 150, 50, true, Some("A")),
+        );
+        app.handle_pane_set_pty_size(
+            "b".into(),
+            set_pty_params(&public_pane_id, 90, 30, true, Some("B")),
+        );
+        // Wide A wins.
+        assert_eq!(pty_size(&app, pane_id), (50, 150));
+
+        // A's `pane.stream` closes (a lease DROP by the tick, not an explicit
+        // call): effective drops to B's width, but the shrink is DEBOUNCED to
+        // avoid thrashing the PTY down when a wider viewer disconnects.
+        app.handle_pane_stream_close("close-a".into(), stream_params(&public_pane_id, Some("A")));
+        assert_eq!(pty_size(&app, pane_id), (50, 150));
+        assert!(app.state.pty_geometry_externally_owned(&terminal_id));
+
+        // A sweep BEFORE the debounce deadline does not apply the shrink yet.
+        app.expire_pty_leases_and_apply_shrinks(std::time::Instant::now());
+        assert_eq!(pty_size(&app, pane_id), (50, 150));
+
+        // After the debounce the pane shrinks to the next-widest viewer (B).
+        app.expire_pty_leases_and_apply_shrinks(
+            std::time::Instant::now()
+                + crate::app::state::PTY_SHRINK_DEBOUNCE
+                + std::time::Duration::from_secs(1),
+        );
+        assert_eq!(pty_size(&app, pane_id), (30, 90));
+    }
+
+    #[tokio::test]
+    async fn pty_size_lease_explicit_release_is_immediate_and_honours_remaining() {
+        let (mut app, public_pane_id, _rx) = app_with_send_key_runtime(64);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+
+        app.handle_pane_set_pty_size(
+            "a".into(),
+            set_pty_params(&public_pane_id, 150, 50, true, Some("A")),
+        );
+        app.handle_pane_set_pty_size(
+            "b".into(),
+            set_pty_params(&public_pane_id, 90, 30, true, Some("B")),
+        );
+        assert_eq!(pty_size(&app, pane_id), (50, 150));
+
+        // The NARROW viewer B releases explicitly: A still holds wider, so the
+        // arbiter keeps A's width — B's release must not shrink the pane.
+        app.handle_pane_set_pty_size(
+            "b-release".into(),
+            set_pty_params(&public_pane_id, 90, 30, false, Some("B")),
+        );
+        assert_eq!(pty_size(&app, pane_id), (50, 150));
+
+        // The WIDE viewer A releases explicitly while a narrower B is gone: no
+        // lease remains, so the release applies its own requested size once as
+        // the parting handoff and relinquishes ownership immediately (no
+        // debounce, no persisted lock).
+        let response = app.handle_pane_set_pty_size(
+            "a-release".into(),
+            set_pty_params(&public_pane_id, 70, 20, false, Some("A")),
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::PanePtySize {
+            cols, rows, locked, ..
+        } = success.result
+        else {
+            panic!("expected pane pty size response");
+        };
+        assert_eq!((cols, rows, locked), (70, 20, false));
+        assert_eq!(pty_size(&app, pane_id), (20, 70));
+        assert!(!app.state.pty_geometry_externally_owned(&terminal_id));
+    }
+
+    #[tokio::test]
+    async fn pty_size_lease_last_release_reverts_to_layout_ownership() {
+        let (mut app, public_pane_id, _rx) = app_with_send_key_runtime(64);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+
+        app.handle_pane_set_pty_size(
+            "a".into(),
+            set_pty_params(&public_pane_id, 120, 45, true, Some("A")),
+        );
+        assert!(app.state.pty_geometry_externally_owned(&terminal_id));
+
+        // Releasing the only lease relinquishes ownership — no lease remains, so
+        // the arbiter returns None and the TUI reclaims the winsize via the gate.
+        app.handle_pane_set_pty_size(
+            "a-release".into(),
+            set_pty_params(&public_pane_id, 120, 45, false, Some("A")),
+        );
+        assert!(!app.state.pty_geometry_externally_owned(&terminal_id));
+        assert_eq!(app.state.effective_pty_size(&terminal_id), None);
+    }
+
+    #[tokio::test]
+    async fn pty_size_lease_dropped_when_viewer_stream_closes() {
+        let (mut app, public_pane_id, _rx) = app_with_send_key_runtime(64);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+
+        app.handle_pane_set_pty_size(
+            "a".into(),
+            set_pty_params(&public_pane_id, 120, 45, true, Some("A")),
+        );
+        assert!(app.state.pty_geometry_externally_owned(&terminal_id));
+
+        // A close carrying NO viewer_id (a legacy/synthesized close) must NOT drop
+        // the lease.
+        app.handle_pane_stream_close("close-none".into(), stream_params(&public_pane_id, None));
+        assert!(app.state.pty_geometry_externally_owned(&terminal_id));
+
+        // The viewer's own stream closing (its viewer_id) drops the lease — the
+        // PRIMARY liveness signal — and, with no lease left, ownership reverts.
+        app.handle_pane_stream_close("close-a".into(), stream_params(&public_pane_id, Some("A")));
+        assert!(!app.state.pty_geometry_externally_owned(&terminal_id));
+        assert_eq!(app.state.effective_pty_size(&terminal_id), None);
+    }
+
+    #[tokio::test]
+    async fn pty_size_lease_ttl_expiry_evicts_dead_viewer_on_tick() {
+        let (mut app, public_pane_id, _rx) = app_with_send_key_runtime(64);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+
+        // A short-TTL lease with no stream to tie liveness to (backstop only).
+        let mut params = set_pty_params(&public_pane_id, 120, 45, true, Some("A"));
+        params.ttl_ms = Some(1);
+        app.handle_pane_set_pty_size("a".into(), params);
+        assert!(app.state.pty_geometry_externally_owned(&terminal_id));
+
+        // The sweep with a `now` past the TTL evicts the dead viewer's lease.
+        let changed = app.expire_pty_leases_and_apply_shrinks(
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        );
+        assert!(changed);
+        assert!(!app.state.pty_geometry_externally_owned(&terminal_id));
+        assert_eq!(app.state.effective_pty_size(&terminal_id), None);
+    }
+
+    #[tokio::test]
+    async fn pty_size_lease_no_viewer_id_still_pins_for_legacy_clients() {
+        let (mut app, public_pane_id, _rx) = app_with_send_key_runtime(64);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+
+        // A legacy caller with no viewer_id still pins (via the sentinel key).
+        app.handle_pane_set_pty_size(
+            "legacy".into(),
+            set_pty_params(&public_pane_id, 120, 45, true, None),
+        );
+        assert_eq!(pty_size(&app, pane_id), (45, 120));
+        assert!(app.state.pty_geometry_externally_owned(&terminal_id));
+        assert_eq!(
+            app.state.effective_pty_size(&terminal_id),
+            Some((45, 120, 0, 0))
+        );
+
+        // Explicit release (still no viewer_id) drops the sentinel lease.
+        app.handle_pane_set_pty_size(
+            "legacy-release".into(),
+            set_pty_params(&public_pane_id, 120, 45, false, None),
+        );
+        assert!(!app.state.pty_geometry_externally_owned(&terminal_id));
+    }
+
+    #[tokio::test]
+    async fn pty_size_lease_missing_runtime_lock_true_leaves_leases_untouched() {
+        // A pane with terminal metadata but no runtime must fail without minting a
+        // lease.
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+        assert!(app
+            .state
+            .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, pane_id)
+            .is_none());
+
+        let response = app.handle_pane_set_pty_size(
+            "lock-no-runtime".into(),
+            set_pty_params(&public_pane_id, 100, 40, true, Some("A")),
+        );
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "pane_not_found");
+        assert!(!app.state.pty_geometry_externally_owned(&terminal_id));
+        assert!(app.state.pty_width_leases.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pty_size_lease_missing_runtime_lock_false_leaves_leases_untouched() {
+        // A failing lock=false request must not drop an existing lease.
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+        let far = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        app.state.upsert_pty_width_lease(
+            &terminal_id,
+            crate::app::state::DEFAULT_LEASE_VIEWER.into(),
+            crate::app::state::WidthLease {
+                cols: 100,
+                rows: 40,
+                cell_width_px: 0,
+                cell_height_px: 0,
+                expires_at: far,
+            },
+        );
+        assert!(app
+            .state
+            .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, pane_id)
+            .is_none());
+
+        let response = app.handle_pane_set_pty_size(
+            "release-no-runtime".into(),
+            set_pty_params(&public_pane_id, 120, 50, false, None),
+        );
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "pane_not_found");
+        // The pre-existing lease survives because the request failed.
+        assert!(app.state.pty_geometry_externally_owned(&terminal_id));
+    }
+
+    #[tokio::test]
+    async fn pty_size_lease_and_direct_attach_are_independent() {
+        let (mut app, public_pane_id, _rx) = app_with_send_key_runtime(64);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+
+        // API takes a width lease.
+        app.handle_pane_set_pty_size(
+            "api".into(),
+            set_pty_params(&public_pane_id, 100, 40, true, Some("A")),
+        );
+        assert!(app.state.pty_geometry_externally_owned(&terminal_id));
+        assert!(!app.state.direct_attach_resize_locks.contains(&terminal_id));
+
+        // A direct-attach client connects then disconnects: its separate set is
+        // toggled, but the API lease is untouched and survives the churn.
+        app.state
+            .direct_attach_resize_locks
+            .insert(terminal_id.clone());
+        app.state.direct_attach_resize_locks.remove(&terminal_id);
+        assert!(app.state.pty_geometry_externally_owned(&terminal_id));
+
+        // With a direct-attach client owning the size, releasing the API lease
+        // clears only the lease; the direct-attach lock keeps ownership.
+        app.state
+            .direct_attach_resize_locks
+            .insert(terminal_id.clone());
+        app.handle_pane_set_pty_size(
+            "api-release".into(),
+            set_pty_params(&public_pane_id, 100, 40, false, Some("A")),
+        );
+        assert!(!app.state.pty_width_leases.contains_key(&terminal_id));
+        assert!(app.state.direct_attach_resize_locks.contains(&terminal_id));
+        assert!(app.state.pty_geometry_externally_owned(&terminal_id));
     }
 
     fn metadata_params(pane_id: String) -> PaneReportMetadataParams {
@@ -2944,6 +4025,36 @@ mod tests {
         assert_eq!(success.result, ResponseResult::Ok {});
         assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from(vec![0x0a]));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn api_pane_send_input_raw_etx_marks_nearby_idle_as_aborted() {
+        let (mut app, pane_id, mut rx) = app_with_send_key_runtime(1);
+        let internal_pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, internal_pane_id).unwrap();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_detected_state(Some(Agent::Pi), AgentState::Working);
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                pane_id,
+                text: "\x03".into(),
+                keys: Vec::new(),
+            }),
+        });
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.result, ResponseResult::Ok {});
+        assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from_static(b"\x03"));
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        let record = terminal
+            .record_completed_turn(42, crate::terminal::state::TurnCompletionContext::default());
+        assert_eq!(record.outcome, crate::terminal::TurnOutcome::Aborted);
     }
 
     #[tokio::test]

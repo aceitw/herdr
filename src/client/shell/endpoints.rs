@@ -36,6 +36,11 @@ pub(crate) enum ClientEndpointFocusTarget {
     Workspace(String),
     Tab(String),
     Pane(String),
+    #[cfg(windows)]
+    Notification {
+        pane_id: String,
+        boot_id: String,
+    },
 }
 
 impl ClientShellState {
@@ -253,6 +258,15 @@ impl ClientShellState {
             .iter()
             .find(|endpoint| &endpoint.endpoint_id == endpoint_id)
             .map(|endpoint| endpoint.status)
+    }
+
+    pub(crate) fn endpoint_runtime_statuses(
+        &self,
+    ) -> Vec<(ClientEndpointId, ClientEndpointStatus)> {
+        self.endpoints
+            .iter()
+            .map(|endpoint| (endpoint.endpoint_id.clone(), endpoint.status))
+            .collect()
     }
 
     pub(crate) fn endpoint_has_snapshot(&self, endpoint_id: &ClientEndpointId) -> bool {

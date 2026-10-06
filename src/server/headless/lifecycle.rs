@@ -21,8 +21,34 @@ pub(super) fn wait_for_live_handoff_response_write(
 }
 
 impl HeadlessServer {
+    /// Starts the guest relay link once this process owns the panes.
+    #[cfg(unix)]
+    pub(super) fn start_guest_link(&mut self) {
+        if self.guest_link.is_none() {
+            self.guest_link = crate::guest::link::GuestLink::start_for_daemon();
+        }
+    }
+
+    /// Hands the panes to a replacement server. The replacement starts its
+    /// guest link only after the handoff commits, so this one stops first:
+    /// dropping it returns once its relay socket is closed, so the two never
+    /// hold the relay's host slot at once. A failed handoff has already reaped
+    /// the replacement, so the link restarts here.
     #[cfg(unix)]
     pub(super) fn perform_live_handoff(
+        &mut self,
+        params: crate::api::schema::ServerLiveHandoffParams,
+    ) -> io::Result<()> {
+        drop(self.guest_link.take());
+        let result = self.export_live_handoff(params);
+        if result.is_err() {
+            self.start_guest_link();
+        }
+        result
+    }
+
+    #[cfg(unix)]
+    fn export_live_handoff(
         &mut self,
         params: crate::api::schema::ServerLiveHandoffParams,
     ) -> io::Result<()> {
@@ -75,6 +101,7 @@ impl HeadlessServer {
             &self.app.terminal_runtimes,
             self.app.state.active,
             self.app.state.selected,
+            &self.app.state.archived_agents,
         );
 
         let mut handoff_entries = Vec::new();
@@ -244,10 +271,13 @@ impl HeadlessServer {
             .api_tx
             .clone()
             .ok_or_else(|| io::Error::other("cannot restore api socket without api sender"))?;
+        let loaded_config = crate::config::Config::load();
         let api_server = api::start_server_with_stop_control(
             api_tx,
             self.app.event_hub.clone(),
             self.should_quit.clone(),
+            &loaded_config.config,
+            self.app.federation.clone(),
         )?;
 
         let client_path = client_socket_path();
@@ -257,6 +287,8 @@ impl HeadlessServer {
         let client_socket_identity = socket_file_identity(&client_path)?;
         listener.set_nonblocking(ListenerNonblockingMode::Accept)?;
 
+        self.app
+            .set_federation_manager(api_server.federation_manager());
         self.api_server = Some(api_server);
         self.client_listener = listener;
         self.client_socket_path = client_path;

@@ -10,12 +10,6 @@ use interprocess::local_socket::traits::Stream as _;
 pub(crate) type LocalListener = interprocess::local_socket::Listener;
 pub(crate) type LocalStream = interprocess::local_socket::Stream;
 
-pub(crate) enum LocalStreamRead {
-    Data,
-    Pending,
-    Closed,
-}
-
 pub(crate) enum LocalStreamReadCount {
     Data(usize),
     Pending,
@@ -47,7 +41,7 @@ pub(crate) fn connect_local_stream(path: &Path) -> io::Result<LocalStream> {
 
         let name = path.to_string_lossy().to_string();
         let name = name.to_ns_name::<GenericNamespaced>()?;
-        LocalStream::connect(name)
+        LocalStream::connect(name).map_err(crate::platform::local_server_connection_error)
     }
 }
 
@@ -66,12 +60,14 @@ pub(crate) fn bind_local_listener(path: &Path) -> io::Result<LocalListener> {
     #[cfg(windows)]
     {
         use interprocess::local_socket::{prelude::*, GenericNamespaced, ListenerOptions};
+        use interprocess::os::windows::local_socket::ListenerOptionsExt as _;
 
         let name = path.to_string_lossy().to_string();
         let name = name.to_ns_name::<GenericNamespaced>()?;
         let listener = ListenerOptions::new()
             .name(name)
             .reclaim_name(false)
+            .security_descriptor(crate::platform::local_server_security_descriptor()?)
             .create_sync()?;
         fs::write(path, windows_socket_marker())?;
         Ok(listener)
@@ -158,20 +154,6 @@ pub(crate) fn bind_private_local_listener(path: &Path) -> io::Result<LocalListen
             .create_sync()?;
         fs::write(path, windows_socket_marker())?;
         Ok(listener)
-    }
-}
-
-pub(crate) fn poll_local_stream_read(
-    stream: &mut LocalStream,
-    buf: &mut [u8],
-) -> io::Result<LocalStreamRead> {
-    match poll_local_stream_read_count(stream, buf)? {
-        LocalStreamReadCount::Data(read) => {
-            let _ = read;
-            Ok(LocalStreamRead::Data)
-        }
-        LocalStreamReadCount::Pending => Ok(LocalStreamRead::Pending),
-        LocalStreamReadCount::Closed => Ok(LocalStreamRead::Closed),
     }
 }
 

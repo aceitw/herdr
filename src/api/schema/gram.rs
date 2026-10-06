@@ -27,6 +27,26 @@ pub struct GramSendParams {
     pub caller_pane_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
+    /// An optional file to attach, previously uploaded in chunks via
+    /// `gram.upload_chunk` under `file.upload_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<GramFileUpload>,
+}
+
+/// A staged file to attach to a `gram.send`/`gram.post`. Its bytes must already be
+/// uploaded in chunks via `gram.upload_chunk` under this `upload_id`; the handler
+/// assembles them onto the newly minted message and clears the staging file.
+/// `name` is the display name (sanitized to a safe basename server-side) and
+/// `mime` is an advisory content type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GramFileUpload {
+    pub upload_id: String,
+    pub name: String,
+    #[serde(default)]
+    pub mime: String,
+    /// Expected digest of the source bytes. Required by the cross-machine relay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
 }
 
 /// `gram.post` — the owner posts a message to agents (from the app).
@@ -40,6 +60,11 @@ pub struct GramPostParams {
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<String>,
+    /// An optional file to attach, previously uploaded in chunks via
+    /// `gram.upload_chunk` under `file.upload_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<GramFileUpload>,
+    /// Internal only: the guest gate's sender label. Never read from the wire.
     #[serde(skip)]
     #[schemars(skip)]
     pub from: Option<String>,
@@ -115,7 +140,8 @@ pub struct GramGrabParams {
 }
 
 /// `gram.mark_read` — the owner marks agent->owner messages read: `id`, `ids`
-/// or both. An unknown id marks nothing and answers `not_found`.
+/// or both. An unknown id marks nothing and answers `not_found`. A guest marks
+/// its own read state only, never the owner's.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct GramMarkReadParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -133,13 +159,14 @@ impl GramMarkReadParams {
 
 /// `gram.delete` — remove a message from the store for good.
 ///
-/// Deletion is deliberately destructive: the record is gone, which is what makes
-/// gram safe for a short-lived secret like a temporary API key — send it, use it,
-/// delete it. Authority follows the caller: the owner's app sends no
-/// `caller_pane_id` and may delete any message; an agent supplies its
-/// `caller_pane_id` and may delete only a message it is involved in (one it sent,
-/// one addressed to it, or one it grabbed), else the call is rejected. A
-/// `caller_pane_id` that names no live pane is an error.
+/// Deletion is deliberately destructive: the record (and any attached file bytes)
+/// are gone, which is what makes gram safe for a short-lived secret like a
+/// temporary API key — send it, use it, delete it. Authority follows the caller:
+/// the owner's app sends no `caller_pane_id` and may delete any message; an agent
+/// supplies its `caller_pane_id` and may delete only a message it is involved in
+/// (one it sent, one addressed to it, or one it grabbed), else the call is
+/// rejected. A `caller_pane_id` that names no live pane is an error, not a
+/// fall-through to owner authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct GramDeleteParams {
     pub id: String,
@@ -147,10 +174,88 @@ pub struct GramDeleteParams {
     pub caller_pane_id: Option<String>,
 }
 
-/// A file attached to a gram message, as returned to clients. Optional in this
-/// fork's text-core scope: no upload path exists yet, so every stored message
-/// has `file: None`, but the field and shape stay part of the wire contract so
-/// the HerdrUp app (which always expects it) decodes cleanly.
+/// `gram.upload_chunk` — append one chunk of a file being uploaded.
+///
+/// Files are sent in chunks because a single request is size-capped (the app's SSH
+/// path near 65 KiB, the daemon at 1 MiB). `upload_id` groups the chunks of one
+/// file; `offset` is the byte position this chunk starts at — the current staged
+/// size — so a dropped or reordered chunk is caught, and `offset: 0` (re)starts the
+/// upload. Attach the assembled file by passing the same `upload_id` in a
+/// `gram.send`/`gram.post` `file`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GramUploadChunkParams {
+    pub upload_id: String,
+    pub offset: u64,
+    pub data_base64: String,
+}
+
+/// `gram.upload.stream` — open a streaming upload channel for one file.
+///
+/// The per-chunk `gram.upload_chunk` method costs one API connection per chunk, and
+/// over the app's SSH transport one process spawn per chunk (a 100 MB file is ~2100).
+/// This opens ONE connection, acks it, then reads newline-delimited chunk frames on
+/// the same connection until EOF. Chunks still land through `gram_files::append_chunk`
+/// under `upload_id`, and the file is still attached by passing the same `upload_id`
+/// in a later `gram.send`/`gram.post` `file` — so nothing downstream changes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GramUploadStreamParams {
+    pub upload_id: String,
+}
+
+/// `gram.get_file` — legacy one-response download on the local socket. The
+/// bytes are inline base64 and can be as large as 100 MiB. For a remote relay,
+/// and for bounded new clients, use `gram.get_file_chunk` instead. Owner (no
+/// caller pane) may download any file; an agent may only download one it can see.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GramGetFileParams {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_pane_id: Option<String>,
+}
+/// Bounded file read. A response contains at most 512 KiB of decoded bytes.
+/// `offset == size` returns an empty chunk; a deleted file returns `not_found`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GramGetFileChunkParams {
+    pub id: String,
+    pub offset: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_pane_id: Option<String>,
+}
+
+/// Internal gateway envelope. The reverse SSH gateway overwrites `peer_alias`
+/// from its pinned saved-machine route; it must never trust the wire value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GramRelayParams {
+    pub peer_alias: String,
+    pub call: GramRelayCall,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "kind", content = "params", rename_all = "snake_case")]
+pub enum GramRelayCall {
+    Send(GramSendParams),
+    List(GramListParams),
+    UploadChunk(GramUploadChunkParams),
+    GetFileChunk(GramGetFileChunkParams),
+    Delete(GramDeleteParams),
+    /// A HerdrUp guest's post to an agent on the relaying machine.
+    Post(GramRelayPostParams),
+}
+
+/// A HerdrUp guest's post relayed by the machine that serves the guest: `to`
+/// must name one of that machine's agents, and the message is labeled
+/// `<guest> (via HerdrUp)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GramRelayPostParams {
+    pub text: String,
+    pub to: String,
+    /// The guest's name, `^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$`.
+    pub guest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<GramFileUpload>,
+}
+/// File attached to a gram message, as returned to clients. Metadata only — fetch
+/// the bytes with `gram.get_file`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct GramFileInfo {
     pub name: String,
@@ -179,9 +284,100 @@ pub struct GramMessageInfo {
     /// `gram.get_file`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<GramFileInfo>,
-    /// Install-stable identity of the daemon/store that wrote this message. In
-    /// this fork's scope there is exactly one store, so the value is stable
-    /// across restarts.
+    /// Install-stable identity of the daemon/store that wrote this message (see
+    /// [`crate::persist::gram::GramItem::origin_id`]). Stable across daemon
+    /// restarts; empty for messages written by an older build.
     #[serde(default)]
     pub origin_id: String,
+    /// Display label of the federated machine a relayed Gram came from, when
+    /// `from` is `<alias>/<name>` and that machine has a label: the same label
+    /// the machine's agents carry as `machine_label`. Resolved when read, so it
+    /// follows a rename and covers Grams stored before it. Absent for local
+    /// Grams, for an alias without a label, and from older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_label: Option<String>,
+}
+
+/// Where an effective Gram relay setting came from.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum GramRelaySource {
+    /// Disabled: nothing configured, or a conflict.
+    #[default]
+    None,
+    /// `[gram_relay]` in config.toml (also when an equal legacy variable is set).
+    Config,
+    /// The deprecated legacy environment variable alone.
+    Environment,
+}
+
+/// Whether the role's legacy environment variable is set in the daemon process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GramRelayEnvironment {
+    Present,
+    Absent,
+}
+
+impl GramRelayEnvironment {
+    pub(crate) fn from_present(present: bool) -> Self {
+        if present {
+            Self::Present
+        } else {
+            Self::Absent
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GramRelayErrorCode {
+    /// Config and the legacy environment variable differ; the role is disabled.
+    Conflict,
+    /// The last reload's `[gram_relay]` section was refused; the previous
+    /// effective setting is kept.
+    InvalidConfig,
+}
+
+/// One consented saved peer and its supervised reverse gateway.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GramRelayPeerStatus {
+    pub alias: String,
+    pub gateway: super::GramGatewayState,
+}
+
+/// Coordinator role: which saved peers may relay Gram.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GramRelayCoordinatorStatus {
+    /// `gram_relay.peers` from config; `null` when unset.
+    pub configured: Option<Vec<String>>,
+    /// Legacy `HERDR_GRAM_RELAY_PEERS`.
+    pub environment: GramRelayEnvironment,
+    /// Peers actually allowed; `null` when disabled.
+    pub effective: Option<Vec<String>>,
+    pub source: GramRelaySource,
+    pub error: Option<GramRelayErrorCode>,
+    pub message: Option<String>,
+    /// Gateway state of every effective peer.
+    pub peers: Vec<GramRelayPeerStatus>,
+}
+
+/// Remote role: where local Gram calls are forwarded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GramRelayRemoteStatus {
+    /// `gram_relay.coordinator_machine_id` from config; `null` when unset.
+    pub configured_coordinator_machine_id: Option<String>,
+    /// Reverse socket derived from the configured coordinator and this install.
+    pub configured_socket: Option<String>,
+    /// Legacy `HERDR_GRAM_REVERSE_SOCKET`.
+    pub environment: GramRelayEnvironment,
+    /// Socket Gram calls go to; `null` when disabled.
+    pub effective_socket: Option<String>,
+    pub source: GramRelaySource,
+    pub error: Option<GramRelayErrorCode>,
+    pub message: Option<String>,
+    /// Whether the effective socket accepts a connection now; `null` when disabled.
+    pub accepting: Option<bool>,
 }

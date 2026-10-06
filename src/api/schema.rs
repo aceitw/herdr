@@ -1,11 +1,15 @@
 use serde::{Deserialize, Serialize};
 
+pub mod accounts;
 pub mod agents;
 pub mod commands;
 pub mod common;
 pub mod events;
+pub mod fs;
 pub mod gram;
+pub mod guest;
 pub mod integrations;
+pub mod machines;
 pub mod panes;
 pub mod plugins;
 pub mod response;
@@ -15,12 +19,16 @@ pub mod tabs;
 pub mod workspaces;
 pub mod worktrees;
 
+pub use accounts::*;
 pub use agents::*;
 pub use commands::*;
 pub use common::*;
 pub use events::*;
+pub use fs::*;
 pub use gram::*;
+pub use guest::*;
 pub use integrations::*;
+pub use machines::*;
 pub use panes::*;
 pub use plugins::*;
 pub use response::*;
@@ -55,6 +63,12 @@ pub enum Method {
     ServerLiveHandoff(ServerLiveHandoffParams),
     #[serde(rename = "server.reload_config")]
     ServerReloadConfig(EmptyParams),
+    #[serde(rename = "machine.status")]
+    MachineStatus(EmptyParams),
+    #[serde(rename = "server.staged_update")]
+    ServerStagedUpdate(EmptyParams),
+    #[serde(rename = "server.apply_staged_update")]
+    ServerApplyStagedUpdate(EmptyParams),
     #[serde(rename = "server.ssh_agent.register")]
     ServerSshAgentRegister(ServerSshAgentRegisterParams),
     #[serde(rename = "server.agent_manifests")]
@@ -69,6 +83,57 @@ pub enum Method {
     ReleaseNotesDismiss(ReleaseNotesDismissParams),
     #[serde(rename = "command.invoke")]
     CommandInvoke(CommandInvokeParams),
+    #[serde(rename = "notifications.register_device")]
+    NotificationsRegisterDevice(NotificationsRegisterDeviceParams),
+    #[serde(rename = "notifications.unregister_device")]
+    NotificationsUnregisterDevice(NotificationsUnregisterDeviceParams),
+    #[serde(rename = "notifications.register_activity")]
+    NotificationsRegisterActivity(NotificationsRegisterActivityParams),
+    #[serde(rename = "notifications.unregister_activity")]
+    NotificationsUnregisterActivity(NotificationsRegisterActivityParams),
+    #[serde(rename = "notifications.status")]
+    NotificationsStatus(EmptyParams),
+    #[serde(rename = "gram.send")]
+    GramSend(GramSendParams),
+    #[serde(rename = "gram.post")]
+    GramPost(GramPostParams),
+    #[serde(rename = "gram.list")]
+    GramList(GramListParams),
+    #[serde(rename = "gram.grab")]
+    GramGrab(GramGrabParams),
+    #[serde(rename = "gram.mark_read")]
+    GramMarkRead(GramMarkReadParams),
+    #[serde(rename = "gram.delete")]
+    GramDelete(GramDeleteParams),
+    #[serde(rename = "gram.upload_chunk")]
+    GramUploadChunk(GramUploadChunkParams),
+    #[serde(rename = "gram.get_file")]
+    GramGetFile(GramGetFileParams),
+    #[serde(rename = "gram.get_file_chunk")]
+    GramGetFileChunk(GramGetFileChunkParams),
+    /// Internal only: the restricted reverse SSH gateway inserts the machine alias.
+    #[serde(rename = "gram.relay")]
+    GramRelay(GramRelayParams),
+    /// Effective Gram relay consent, its source and errors, and gateway state. Local only.
+    #[serde(rename = "gram.relay_status")]
+    GramRelayStatus(EmptyParams),
+    /// Owner only: invite one guest to one live agent. Never reachable by
+    /// federation peers or guests.
+    #[serde(rename = "guest.invite.create")]
+    GuestInviteCreate(GuestInviteCreateParams),
+    #[serde(rename = "guest.list")]
+    GuestList(GuestListParams),
+    #[serde(rename = "guest.revoke")]
+    GuestRevoke(GuestRevokeParams),
+    #[serde(rename = "guest.update")]
+    GuestUpdate(GuestUpdateParams),
+    #[serde(rename = "guest.audit")]
+    GuestAudit(GuestAuditParams),
+    /// Internal only: resolve an agent and its live-agent check for the guest gate.
+    #[cfg(unix)]
+    #[serde(skip)]
+    #[schemars(skip)]
+    GuestAgentProbe(GuestAgentProbeParams),
     #[serde(rename = "client.window_title.set")]
     ClientWindowTitleSet(ClientWindowTitleSetParams),
     #[serde(rename = "client.window_title.clear")]
@@ -80,7 +145,7 @@ pub enum Method {
     #[serde(rename = "workspace.create")]
     WorkspaceCreate(WorkspaceCreateParams),
     #[serde(rename = "workspace.list")]
-    WorkspaceList(EmptyParams),
+    WorkspaceList(WorkspaceListParams),
     #[serde(rename = "workspace.get")]
     WorkspaceGet(WorkspaceTarget),
     #[serde(rename = "workspace.focus")]
@@ -118,7 +183,7 @@ pub enum Method {
     #[serde(rename = "tab.close")]
     TabClose(TabTarget),
     #[serde(rename = "agent.list")]
-    AgentList(EmptyParams),
+    AgentList(AgentListParams),
     #[serde(rename = "agent.get")]
     AgentGet(AgentTarget),
     #[serde(rename = "agent.read")]
@@ -129,6 +194,12 @@ pub enum Method {
     AgentSendKeys(AgentSendKeysParams),
     #[serde(rename = "agent.rename")]
     AgentRename(AgentRenameParams),
+    #[serde(rename = "agent.archive")]
+    AgentArchive(AgentArchiveParams),
+    #[serde(rename = "agent.unarchive")]
+    AgentUnarchive(AgentUnarchiveParams),
+    #[serde(rename = "agent.forget")]
+    AgentForget(AgentForgetParams),
     #[serde(rename = "agent.view.set")]
     AgentViewSet(AgentViewSetParams),
     #[serde(rename = "agent.view.clear")]
@@ -141,6 +212,20 @@ pub enum Method {
     AgentPrompt(AgentPromptParams),
     #[serde(rename = "agent.wait")]
     AgentWait(AgentWaitParams),
+    #[serde(rename = "agent.restart")]
+    AgentRestart(AgentRestartParams),
+    #[serde(rename = "agent.transfer_session")]
+    AgentTransferSession(AgentTransferSessionParams),
+    #[serde(rename = "accounts.list")]
+    AccountsList(EmptyParams),
+    #[serde(rename = "accounts.create")]
+    AccountsCreate(AccountsCreateParams),
+    #[serde(rename = "accounts.remove")]
+    AccountsRemove(AccountsRemoveParams),
+    #[serde(rename = "agent.kinds")]
+    AgentKinds(EmptyParams),
+    #[serde(rename = "fs.list_dir")]
+    FsListDir(FsListDirParams),
     #[serde(rename = "pane.split")]
     PaneSplit(PaneSplitParams),
     #[serde(rename = "pane.swap")]
@@ -179,12 +264,16 @@ pub enum Method {
     PaneCopyMotion(PaneCopyMotionParams),
     #[serde(rename = "pane.copy_search")]
     PaneCopySearch(PaneCopySearchParams),
+    #[serde(rename = "pane.set_pty_size")]
+    PaneSetPtySize(PaneSetPtySizeParams),
     #[serde(rename = "pane.list")]
     PaneList(PaneListParams),
     #[serde(rename = "pane.current")]
     PaneCurrent(PaneCurrentParams),
     #[serde(rename = "pane.get")]
     PaneGet(PaneTarget),
+    #[serde(rename = "pane.turns")]
+    PaneTurns(PaneTurnsParams),
     #[serde(rename = "pane.focus")]
     PaneFocus(PaneTarget),
     #[serde(rename = "pane.input.set")]
@@ -203,6 +292,37 @@ pub enum Method {
     PaneSendInput(PaneSendInputParams),
     #[serde(rename = "pane.read")]
     PaneRead(PaneReadParams),
+    #[serde(rename = "pane.stream")]
+    #[schemars(skip)]
+    PaneStream(PaneStreamParams),
+    #[serde(skip)]
+    #[schemars(skip)]
+    PaneStreamOpen(PaneStreamParams),
+    #[serde(skip)]
+    #[schemars(skip)]
+    PaneStreamClose(PaneStreamParams),
+    /// Internal only: drop one viewer's width lease on every pane, as its
+    /// `pane.stream` closing would (the guest gate, on revoke). Unix-only, like
+    /// the guest gate that is its only sender.
+    #[cfg(unix)]
+    #[serde(skip)]
+    #[schemars(skip)]
+    PanePtyLeaseRelease(PanePtyLeaseReleaseParams),
+    #[serde(rename = "pane.input.stream")]
+    #[schemars(skip)]
+    PaneInputStream(PaneInputStreamParams),
+    #[serde(skip)]
+    #[schemars(skip)]
+    PaneInputStreamOpen(PaneInputStreamParams),
+    // Dotted third segment follows the STREAMING convention (`pane.input.stream`),
+    // not the `gram.upload_chunk` snake_case one: it is a streaming channel, and the
+    // wire name is what `api_method_name` and the federation audit key on.
+    #[serde(rename = "gram.upload.stream")]
+    #[schemars(skip)]
+    GramUploadStream(GramUploadStreamParams),
+    #[serde(skip)]
+    #[schemars(skip)]
+    GramUploadStreamOpen(GramUploadStreamParams),
     #[serde(rename = "pane.report_agent")]
     PaneReportAgent(PaneReportAgentParams),
     #[serde(rename = "pane.report_agent_session")]
@@ -245,18 +365,6 @@ pub enum Method {
     PluginActionInvoke(PluginActionInvokeParams),
     #[serde(rename = "plugin.log.list")]
     PluginLogList(PluginLogListParams),
-    #[serde(rename = "gram.send")]
-    GramSend(GramSendParams),
-    #[serde(rename = "gram.post")]
-    GramPost(GramPostParams),
-    #[serde(rename = "gram.list")]
-    GramList(GramListParams),
-    #[serde(rename = "gram.grab")]
-    GramGrab(GramGrabParams),
-    #[serde(rename = "gram.mark_read")]
-    GramMarkRead(GramMarkReadParams),
-    #[serde(rename = "gram.delete")]
-    GramDelete(GramDeleteParams),
     #[serde(rename = "plugin.pane.open")]
     PluginPaneOpen(PluginPaneOpenParams),
     #[serde(rename = "plugin.pane.focus")]

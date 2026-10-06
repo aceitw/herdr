@@ -79,6 +79,9 @@ pub enum AppEvent {
     /// A pane's child process exited.
     PaneDied {
         pane_id: PaneId,
+        /// Identifies the exact PTY runtime that exited. `None` is reserved for
+        /// synthetic/test events that intentionally target the current runtime.
+        runtime_epoch: Option<u64>,
         exit_reason: crate::platform::ChildExitReason,
     },
     /// A worktree-removal runtime could not be restored normally.
@@ -86,6 +89,9 @@ pub enum AppEvent {
     /// Process detection identified an agent before its screen state was confirmed.
     AgentProcessDetected {
         pane_id: PaneId,
+        /// Runtime that produced this detector observation. `None` is reserved
+        /// for synthetic/test events targeting the current runtime.
+        runtime_epoch: Option<u64>,
         agent: Agent,
         observed_at: Instant,
     },
@@ -94,12 +100,23 @@ pub enum AppEvent {
     /// Fallback detector state changed in a pane.
     StateChanged {
         pane_id: PaneId,
+        /// Runtime that produced this detector observation. `None` is reserved
+        /// for synthetic/test events targeting the current runtime.
+        runtime_epoch: Option<u64>,
         agent: Option<Agent>,
         state: AgentState,
         visible_blocker: bool,
         visible_working: bool,
         process_exited: bool,
         observed_at: Instant,
+    },
+    /// Orthogonal live input-prompt presence changed in a pane.
+    InputStateChanged {
+        pane_id: PaneId,
+        /// Runtime that produced this detector observation. `None` is reserved
+        /// for synthetic/test events targeting the current runtime.
+        runtime_epoch: Option<u64>,
+        kind: Option<crate::detect::InputPromptKind>,
     },
     /// Hook-authoritative agent state was reported for a pane.
     HookStateReported {
@@ -110,6 +127,10 @@ pub enum AppEvent {
         message: Option<String>,
         seq: Option<u64>,
         session_ref: Option<crate::agent_resume::AgentSessionRef>,
+        /// Active native tree leaf reported with this state observation.
+        session_cursor: Option<String>,
+        /// Harness process that owns `session_cursor`.
+        process_pid: Option<u32>,
     },
     /// Agent session identity was reported without state authority.
     AgentSessionReported {
@@ -118,7 +139,37 @@ pub enum AppEvent {
         agent_label: String,
         seq: Option<u64>,
         session_ref: Option<crate::agent_resume::AgentSessionRef>,
+        session_path: Option<String>,
+        session_cursor: Option<String>,
+        process_pid: Option<u32>,
         session_start_source: Option<String>,
+    },
+    /// Background transcript staging and destination-file verification finished.
+    AgentSessionTransferPrepared {
+        terminal_id: crate::terminal::TerminalId,
+        transfer_id: String,
+        result: Box<
+            Result<
+                crate::session_transfer::PreparedTransfer,
+                crate::session_transfer::TransferError,
+            >,
+        >,
+    },
+    /// Background source/destination fingerprint verification finished after
+    /// the user confirmed, while the source runtime was still alive.
+    AgentSessionTransferCutoverVerified {
+        terminal_id: crate::terminal::TerminalId,
+        transfer_id: String,
+        result: Result<(), crate::session_transfer::TransferError>,
+    },
+    /// Background native JSONL verification finished for an exact Codex
+    /// target or rollback process.
+    AgentSessionTransferRuntimeVerified {
+        terminal_id: crate::terminal::TerminalId,
+        transfer_id: String,
+        kind: crate::session_transfer::RuntimeVerificationKind,
+        process_pid: u32,
+        result: Result<(), crate::session_transfer::TransferError>,
     },
     /// A reporter supplied the command that resumes its own session.
     AgentResumeReported {
@@ -196,6 +247,13 @@ pub enum AppEvent {
         segment_index: usize,
         result: Result<Option<String>, String>,
     },
+    /// A background live account-usage fetch finished. `usage` is `None` on any
+    /// failure/timeout: the handler then leaves the cache untouched and clears
+    /// the in-flight marker so a later `accounts.list` can retry.
+    UsageRefreshed {
+        account_id: String,
+        usage: Option<(crate::api::schema::AccountUsage, bool)>,
+    },
     /// A plugin action or event command finished.
     PluginCommandFinished {
         log_id: String,
@@ -211,4 +269,27 @@ pub enum AppEvent {
     WorktreeRemoveFinished(Box<WorktreeRemoveResult>),
     /// Background worktree discovery completed for an API list/open request.
     WorktreeReadFinished(Box<WorktreeReadResult>),
+}
+
+impl AppEvent {
+    pub(crate) fn detector_runtime(&self) -> Option<(PaneId, Option<u64>)> {
+        match self {
+            Self::AgentProcessDetected {
+                pane_id,
+                runtime_epoch,
+                ..
+            }
+            | Self::StateChanged {
+                pane_id,
+                runtime_epoch,
+                ..
+            }
+            | Self::InputStateChanged {
+                pane_id,
+                runtime_epoch,
+                ..
+            } => Some((*pane_id, *runtime_epoch)),
+            _ => None,
+        }
+    }
 }

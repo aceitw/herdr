@@ -3,11 +3,14 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     ffi::{c_void, OsStr},
     mem::{size_of, MaybeUninit},
-    os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
+    os::windows::{
+        ffi::OsStrExt,
+        io::{AsRawHandle, FromRawHandle, OwnedHandle},
+    },
     path::PathBuf,
     ptr::{copy_nonoverlapping, null_mut},
     sync::{
-        atomic::{AtomicU64, Ordering as AtomicOrdering},
+        atomic::{AtomicU32, AtomicU64, Ordering as AtomicOrdering},
         Arc, LazyLock, Mutex, OnceLock,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -15,6 +18,94 @@ use std::{
 
 mod clipboard_image;
 mod config_backup;
+mod notifications;
+pub(crate) use notifications::{
+    foreground_desktop_notification_host, maybe_activate_desktop_notification,
+    show_actionable_desktop_notification, show_desktop_notification,
+};
+
+pub(crate) fn probe_local_server(path: &std::path::Path) -> std::io::Result<()> {
+    use interprocess::os::windows::named_pipe::{pipe_mode::Bytes, DuplexPipeStream};
+    use interprocess::ConnectWaitMode;
+
+    // The local-socket wrapper ignores wait_mode on Windows in interprocess
+    // 2.4.2. Its named-pipe API honors it without importing/reopening a handle.
+    let name = format!(r"\\.\pipe\{}", path.to_string_lossy());
+    DuplexPipeStream::<Bytes>::connect_by_path_with_wait_mode(
+        name.as_str(),
+        ConnectWaitMode::Timeout(Duration::from_millis(500)),
+    )
+    .map(|_| ())
+    .map_err(local_server_connection_error)
+}
+
+pub(crate) fn local_server_security_descriptor(
+) -> std::io::Result<interprocess::os::windows::security_descriptor::SecurityDescriptor> {
+    user_security_descriptor("GRGW")
+}
+
+fn user_security_descriptor(
+    access: &str,
+) -> std::io::Result<interprocess::os::windows::security_descriptor::SecurityDescriptor> {
+    use interprocess::os::windows::security_descriptor::SecurityDescriptor;
+    use widestring::{U16CStr, U16CString};
+    use windows_sys::Win32::Security::{
+        Authorization::ConvertSidToStringSidW, GetTokenInformation, TokenUser, TOKEN_QUERY,
+        TOKEN_USER,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token = null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let token = unsafe { OwnedHandle::from_raw_handle(token) };
+    let mut needed = 0;
+    unsafe { GetTokenInformation(token.as_raw_handle(), TokenUser, null_mut(), 0, &mut needed) };
+    if needed == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // usize storage keeps TOKEN_USER aligned and its trailing SID alive.
+    let mut buffer = vec![0usize; (needed as usize).div_ceil(size_of::<usize>())];
+    if unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenUser,
+            buffer.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: GetTokenInformation initialized the aligned TOKEN_USER and SID.
+    let user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
+    let mut sid = null_mut();
+    if unsafe { ConvertSidToStringSidW(user.User.Sid, &mut sid) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let sid_text = unsafe { U16CStr::from_ptr_str(sid) }.to_string_lossy();
+    unsafe { LocalFree(sid.cast()) };
+    // The elevated token's default owner can be Administrators. Authorize the
+    // account instead: its ordinary clients deliberately control elevated panes.
+    let sddl = U16CString::from_str(format!("D:P(A;;GA;;;SY)(A;;{access};;;{sid_text})"))
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
+    SecurityDescriptor::deserialize(&sddl)
+}
+
+pub(crate) fn local_server_connection_error(error: std::io::Error) -> std::io::Error {
+    if error.kind() != std::io::ErrorKind::PermissionDenied {
+        return error;
+    }
+    std::io::Error::new(
+        error.kind(),
+        format!(
+            "For an older elevated server, stop it in an admin shell and \
+             reopen Herdr (closes panes). {error}"
+        ),
+    )
+}
 
 pub(crate) fn windows_virtual_terminal_input_active() -> bool {
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
@@ -177,10 +268,7 @@ pub(crate) fn create_config_temporary(
             .create_new(true)
             .open(path);
     }
-    use interprocess::os::windows::security_descriptor::{
-        AsSecurityDescriptorExt as _, SecurityDescriptor,
-    };
-    use widestring::U16CString;
+    use interprocess::os::windows::security_descriptor::AsSecurityDescriptorExt as _;
     use windows_sys::Win32::{
         Foundation::GENERIC_WRITE,
         Storage::FileSystem::{
@@ -188,9 +276,7 @@ pub(crate) fn create_config_temporary(
             FILE_SHARE_WRITE,
         },
     };
-    let sddl =
-        U16CString::from_str("D:P(A;;GA;;;SY)(A;;GA;;;OW)").map_err(std::io::Error::other)?;
-    let descriptor = SecurityDescriptor::deserialize(&sddl)?;
+    let descriptor = user_security_descriptor("GA")?;
     let mut attributes = SECURITY_ATTRIBUTES {
         nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: null_mut(),
@@ -329,7 +415,8 @@ use windows_sys::{
         System::{
             Console::GetConsoleWindow,
             DataExchange::{
-                CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard,
+                CloseClipboard, CountClipboardFormats, EmptyClipboard, EnumClipboardFormats,
+                GetClipboardData, GetClipboardOwner, GetClipboardSequenceNumber, OpenClipboard,
                 RegisterClipboardFormatW, SetClipboardData,
             },
             Diagnostics::{
@@ -350,7 +437,7 @@ use windows_sys::{
                 GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, VirtualQueryEx, GMEM_MOVEABLE,
                 MEMORY_BASIC_INFORMATION,
             },
-            Ole::{CF_DIB, CF_DIBV5, CF_UNICODETEXT},
+            Ole::{CF_DIB, CF_DIBV5, CF_LOCALE, CF_OEMTEXT, CF_TEXT, CF_UNICODETEXT},
             Threading::{
                 GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, IsWow64Process2,
                 OpenProcess, OpenThread, QueryFullProcessImageNameW, ResumeThread,
@@ -367,13 +454,10 @@ use windows_sys::{
                     KEYBDINPUT, KEYEVENTF_KEYUP,
                 },
             },
-            Shell::{
-                CommandLineToArgvW, ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_TIP,
-                NIIF_INFO, NIIF_NOSOUND, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
-            },
+            Shell::{CommandLineToArgvW, ShellExecuteW},
             WindowsAndMessaging::{
-                CreateWindowExW, DestroyWindow, GetForegroundWindow, GetWindowThreadProcessId,
-                LoadIconW, SendMessageTimeoutW, IDI_APPLICATION, SMTO_ABORTIFHUNG, WM_IME_CONTROL,
+                GetForegroundWindow, GetWindowThreadProcessId, SendMessageTimeoutW,
+                SMTO_ABORTIFHUNG, WM_IME_CONTROL,
             },
         },
     },
@@ -945,6 +1029,75 @@ pub(crate) fn interactive_shell_command(argv: &[String], shell_name: &str) -> Op
         Some(script)
     } else {
         Some(cmd_encoded_powershell_command(&script))
+    }
+}
+
+pub(crate) fn managed_resume_shell_command(
+    argv: &[String],
+    shell_name: &str,
+    replace_shell: bool,
+) -> Option<String> {
+    let shell_name = shell_name.to_ascii_lowercase();
+    let powershell = shell_name.contains("powershell") || shell_name.contains("pwsh");
+    let cmd = shell_name
+        .rsplit(['/', '\\'])
+        .next()
+        .is_some_and(|name| matches!(name, "cmd" | "cmd.exe"));
+    let script = managed_resume_powershell_script(argv, replace_shell)?;
+    if powershell {
+        Some(script)
+    } else {
+        let command = cmd_encoded_powershell_command(&script);
+        let command = if cmd {
+            command
+        } else {
+            // Git Bash permits aliases and functions named `powershell.exe`.
+            // Select the application through Bash's real builtins.
+            format!(r"\builtin command {command}")
+        };
+        if replace_shell {
+            // The encoded PowerShell exits with the harness status. Exit the outer
+            // shell too so a failed transfer launch becomes an immediate PaneDied.
+            if cmd {
+                Some(format!("{command} & exit /b"))
+            } else {
+                // Git Bash and other supported POSIX shells use `;`, not cmd's
+                // backgrounding `&`, and must not receive cmd's `/b` argument.
+                Some(format!(r"{command}; \command exit $?"))
+            }
+        } else {
+            Some(command)
+        }
+    }
+}
+
+fn managed_resume_powershell_script(argv: &[String], replace_shell: bool) -> Option<String> {
+    let (program, args) = argv.split_first()?;
+    let mut start = format!(
+        "$p=Microsoft.PowerShell.Management\\Start-Process -FilePath {}",
+        super::quote_powershell_arg(program),
+    );
+    if !args.is_empty() {
+        let command_line = args
+            .iter()
+            .map(|arg| super::quote_windows_command_line_arg(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
+        start.push_str(" -ArgumentList ");
+        start.push_str(&super::quote_powershell_arg(&command_line));
+    }
+    start.push_str(" -NoNewWindow -Wait -PassThru -ErrorAction Stop");
+
+    let launch_error = format!(
+        "[Console]::Error.WriteLine(('Herdr could not launch executable ' + {} + ': ' + $_.Exception.Message))",
+        super::quote_powershell_arg(program),
+    );
+    if replace_shell {
+        Some(format!(
+            "try {{ {start} }} catch {{ {launch_error}; exit 127 }}; exit $p.ExitCode"
+        ))
+    } else {
+        Some(format!("try {{ {start} }} catch {{ {launch_error} }}"))
     }
 }
 
@@ -2355,6 +2508,8 @@ pub fn process_exists(pid: u32) -> bool {
     ok && exit_code == STILL_ACTIVE
 }
 
+static LAST_CLIPBOARD_WRITE_SEQUENCE: AtomicU32 = AtomicU32::new(0);
+
 pub fn write_clipboard(bytes: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(bytes) else {
         return false;
@@ -2397,11 +2552,91 @@ pub fn write_clipboard(bytes: &[u8]) -> bool {
             return false;
         }
 
+        // Closing may generate additional text formats and advance the sequence.
+        drop(_clipboard);
+        // Read the sequence first: a later writer must not become our last write.
+        let sequence = GetClipboardSequenceNumber();
+        let sequence = if GetClipboardOwner() == owner {
+            sequence
+        } else {
+            0
+        };
+        LAST_CLIPBOARD_WRITE_SEQUENCE.store(sequence, AtomicOrdering::Relaxed);
         true
     }
 }
 
 pub fn read_clipboard_text() -> Option<String> {
+    None
+}
+
+/// Whether the system clipboard currently holds exactly this text.
+///
+/// Returns `None` when the clipboard changed since our last write, cannot be read,
+/// or has non-text formats.
+/// Kept separate from [`read_clipboard_text`] so unsupported modal paste on
+/// Windows is unchanged.
+pub fn clipboard_text_matches(bytes: &[u8]) -> Option<bool> {
+    let current = read_clipboard_unicode_text()?;
+    Some(clipboard_text_equals(&current, bytes))
+}
+
+fn clipboard_text_equals(current: &str, bytes: &[u8]) -> bool {
+    let Ok(payload) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    normalized_clipboard_newlines(payload) == normalized_clipboard_newlines(current)
+}
+
+fn normalized_clipboard_newlines(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.contains("\r\n") {
+        std::borrow::Cow::Owned(text.replace("\r\n", "\n"))
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
+fn plain_text_clipboard_format(format: u32) -> bool {
+    format == CF_UNICODETEXT as u32
+        || format == CF_TEXT as u32
+        || format == CF_OEMTEXT as u32
+        || format == CF_LOCALE as u32
+}
+
+fn read_clipboard_unicode_text() -> Option<String> {
+    const MAX_CLIPBOARD_TEXT_BYTES: usize = 1024 * 1024;
+
+    for attempt in 0..10 {
+        if unsafe { OpenClipboard(null_mut()) } != 0 {
+            let _clipboard = ClipboardGuard;
+            let sequence = unsafe { GetClipboardSequenceNumber() };
+            if sequence == 0
+                || sequence != LAST_CLIPBOARD_WRITE_SEQUENCE.load(AtomicOrdering::Relaxed)
+            {
+                return None;
+            }
+            let format_count = unsafe { CountClipboardFormats() };
+            if format_count <= 0 {
+                return None;
+            }
+            let mut format = 0;
+            for _ in 0..format_count {
+                format = unsafe { EnumClipboardFormats(format) };
+                if format == 0 || !plain_text_clipboard_format(format) {
+                    return None;
+                }
+            }
+            let bytes = clipboard_global_bytes(CF_UNICODETEXT as u32, MAX_CLIPBOARD_TEXT_BYTES)?;
+            let units = bytes
+                .chunks_exact(2)
+                .map(|pair| u16::from_ne_bytes([pair[0], pair[1]]))
+                .take_while(|unit| *unit != 0);
+            return String::from_utf16(&units.collect::<Vec<_>>()).ok();
+        }
+        if attempt < 9 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
     None
 }
 
@@ -2426,6 +2661,52 @@ pub fn open_url(url: &str) -> std::io::Result<Option<std::process::Child>> {
             result as isize
         )))
     }
+}
+
+pub(crate) fn open_path(path: &std::path::Path) -> std::io::Result<Option<std::process::Child>> {
+    let operation = wide_null("open");
+    let path = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            operation.as_ptr(),
+            path.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+        )
+    };
+    if result as isize > 32 {
+        Ok(None)
+    } else {
+        Err(std::io::Error::other(format!(
+            "failed to open file with ShellExecuteW: code {}",
+            result as isize
+        )))
+    }
+}
+
+pub(crate) fn tailscale_cli_candidates() -> Vec<super::TailscaleCliCandidate> {
+    vec![super::TailscaleCliCandidate::new("tailscale")]
+}
+
+pub(crate) fn private_lan_ipv4() -> std::io::Result<Option<std::net::Ipv4Addr>> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "LAN pairing is not available on Windows in this build. Connect Tailscale and run `herdr pair` without `--lan`.",
+    ))
+}
+
+pub(crate) fn lan_pairing_help() -> &'static str {
+    "Pair over a private local network instead of Tailscale (unavailable on Windows)"
+}
+
+pub(crate) fn ssh_pairing_setup_hint() -> &'static str {
+    "Start the Windows OpenSSH Server service, then run `herdr pair` again."
 }
 
 pub fn read_clipboard_image() -> Option<ClipboardImage> {
@@ -2496,112 +2777,6 @@ fn clipboard_global_bytes(format: u32, max_bytes: usize) -> Option<Vec<u8>> {
         GlobalUnlock(handle);
     }
     Some(bytes)
-}
-
-pub fn show_desktop_notification(title: &str, body: Option<&str>) -> std::io::Result<bool> {
-    let title = title.to_owned();
-    let body = body.unwrap_or(&title).to_owned();
-    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
-    std::thread::Builder::new()
-        .name("herdr-windows-notification".into())
-        .spawn(move || show_desktop_notification_on_thread(&title, &body, ready_tx))?;
-    ready_rx
-        .recv_timeout(Duration::from_secs(2))
-        .map_err(|err| match err {
-            std::sync::mpsc::RecvTimeoutError::Timeout => std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "Windows notification setup timed out",
-            ),
-            std::sync::mpsc::RecvTimeoutError::Disconnected => std::io::Error::other(
-                "Windows notification thread exited before reporting readiness",
-            ),
-        })?
-}
-
-fn show_desktop_notification_on_thread(
-    title: &str,
-    body: &str,
-    ready_tx: std::sync::mpsc::SyncSender<std::io::Result<bool>>,
-) {
-    let class_name = wide_null("STATIC");
-    let window_name = wide_null("Herdr notifications");
-    let hwnd = unsafe {
-        CreateWindowExW(
-            0,
-            class_name.as_ptr(),
-            window_name.as_ptr(),
-            0,
-            0,
-            0,
-            0,
-            0,
-            null_mut(),
-            null_mut(),
-            null_mut(),
-            std::ptr::null(),
-        )
-    };
-    if hwnd.is_null() {
-        let _ = ready_tx.send(Err(std::io::Error::last_os_error()));
-        return;
-    }
-
-    let mut notification = unsafe { std::mem::zeroed::<NOTIFYICONDATAW>() };
-    notification.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
-    notification.hWnd = hwnd;
-    notification.uID = 1;
-    notification.hIcon = unsafe { LoadIconW(null_mut(), IDI_APPLICATION) };
-    notification.uFlags = NIF_TIP;
-    if !notification.hIcon.is_null() {
-        notification.uFlags |= NIF_ICON;
-    }
-    copy_wide_truncated(&mut notification.szTip, "Herdr");
-
-    if unsafe { Shell_NotifyIconW(NIM_ADD, &notification) } == 0 {
-        let _ = ready_tx.send(Err(std::io::Error::other(
-            "failed to add Herdr notification-area icon",
-        )));
-        unsafe {
-            DestroyWindow(hwnd);
-        }
-        return;
-    }
-
-    notification.uFlags = NIF_INFO;
-    notification.dwInfoFlags = NIIF_INFO | NIIF_NOSOUND;
-    copy_wide_truncated(&mut notification.szInfoTitle, title);
-    copy_wide_truncated(&mut notification.szInfo, body);
-    if unsafe { Shell_NotifyIconW(NIM_MODIFY, &notification) } == 0 {
-        unsafe {
-            Shell_NotifyIconW(NIM_DELETE, &notification);
-            DestroyWindow(hwnd);
-        }
-        let _ = ready_tx.send(Err(std::io::Error::other(
-            "failed to show Herdr desktop notification",
-        )));
-        return;
-    }
-
-    let _ = ready_tx.send(Ok(true));
-    std::thread::sleep(Duration::from_secs(10));
-    unsafe {
-        Shell_NotifyIconW(NIM_DELETE, &notification);
-        DestroyWindow(hwnd);
-    }
-}
-
-fn copy_wide_truncated<const N: usize>(destination: &mut [u16; N], value: &str) {
-    destination.fill(0);
-    let mut offset = 0;
-    for ch in value.chars() {
-        let mut units = [0; 2];
-        let encoded = ch.encode_utf16(&mut units);
-        if offset + encoded.len() >= N {
-            break;
-        }
-        destination[offset..offset + encoded.len()].copy_from_slice(encoded);
-        offset += encoded.len();
-    }
 }
 
 fn wide_null(value: &str) -> Vec<u16> {
@@ -3038,6 +3213,177 @@ mod tests {
     };
 
     #[test]
+    fn local_resources_authorize_account_without_admin_rights() {
+        use interprocess::local_socket::traits::Listener as _;
+        use std::io::{Read, Write};
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::Security::{
+            CreateRestrictedToken, GetTokenInformation, ImpersonateLoggedOnUser, RevertToSelf,
+            TokenUser, DISABLE_MAX_PRIVILEGE, LUA_TOKEN, SID_AND_ATTRIBUTES, TOKEN_DUPLICATE,
+            TOKEN_QUERY, TOKEN_USER,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+        let path =
+            std::env::temp_dir().join(format!("herdr-user-pipe-{}.sock", std::process::id()));
+        let listener = crate::ipc::bind_local_listener(&path).unwrap();
+        let mut raw_token = std::ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                OpenProcessToken(
+                    GetCurrentProcess(),
+                    TOKEN_DUPLICATE | TOKEN_QUERY,
+                    &mut raw_token,
+                )
+            },
+            0
+        );
+        let token = unsafe { OwnedHandle::from_raw_handle(raw_token) };
+        let mut restricted = std::ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                CreateRestrictedToken(
+                    token.as_raw_handle(),
+                    DISABLE_MAX_PRIVILEGE | LUA_TOKEN,
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    &mut restricted,
+                )
+            },
+            0
+        );
+        let restricted = unsafe { OwnedHandle::from_raw_handle(restricted) };
+        let private_path = path.with_extension("private");
+        super::create_config_temporary(&private_path, true)
+            .unwrap()
+            .write_all(b"recovery")
+            .unwrap();
+        assert_ne!(
+            unsafe { ImpersonateLoggedOnUser(restricted.as_raw_handle()) },
+            0
+        );
+        let connection = crate::ipc::connect_local_stream(&path);
+        let private_read = fs::read(&private_path);
+        let private_write = fs::write(&private_path, b"updated");
+        let reverted = unsafe { RevertToSelf() };
+        assert_ne!(reverted, 0);
+        assert_eq!(private_read.unwrap(), b"recovery");
+        private_write.unwrap();
+        let mut client = connection.expect("the account SID must work without admin membership");
+        let mut server = listener.accept().unwrap();
+        client.write_all(b"account").unwrap();
+        let mut received = [0; 7];
+        server.read_exact(&mut received).unwrap();
+        assert_eq!(&received, b"account");
+
+        // Removing the account SID must not leave access through Everyone or
+        // another ordinary group. This exercises the real DACL access check.
+        let mut size = 0;
+        unsafe {
+            GetTokenInformation(
+                token.as_raw_handle(),
+                TokenUser,
+                std::ptr::null_mut(),
+                0,
+                &mut size,
+            )
+        };
+        let mut user = vec![0usize; (size as usize).div_ceil(std::mem::size_of::<usize>())];
+        assert_ne!(
+            unsafe {
+                GetTokenInformation(
+                    token.as_raw_handle(),
+                    TokenUser,
+                    user.as_mut_ptr().cast(),
+                    size,
+                    &mut size,
+                )
+            },
+            0
+        );
+        let user = unsafe { &*user.as_ptr().cast::<TOKEN_USER>() };
+        let disabled = SID_AND_ATTRIBUTES {
+            Sid: user.User.Sid,
+            Attributes: 0,
+        };
+        let mut without_account = std::ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                CreateRestrictedToken(
+                    token.as_raw_handle(),
+                    DISABLE_MAX_PRIVILEGE | LUA_TOKEN,
+                    1,
+                    &disabled,
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    &mut without_account,
+                )
+            },
+            0
+        );
+        let without_account = unsafe { OwnedHandle::from_raw_handle(without_account) };
+        assert_ne!(
+            unsafe { ImpersonateLoggedOnUser(without_account.as_raw_handle()) },
+            0
+        );
+        let denied = crate::ipc::connect_local_stream(&path);
+        let private_denied = fs::read(&private_path);
+        let reverted = unsafe { RevertToSelf() };
+        assert_ne!(reverted, 0);
+        assert_eq!(
+            denied.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            private_denied.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_ne!(
+            unsafe { ImpersonateLoggedOnUser(restricted.as_raw_handle()) },
+            0
+        );
+        let removed = fs::remove_file(private_path);
+        let reverted = unsafe { RevertToSelf() };
+        assert_ne!(reverted, 0);
+        removed.expect("the account must be able to remove its private recovery files");
+        drop(client);
+        drop(server);
+        drop(listener);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn clipboard_text_equals_normalizes_line_endings() {
+        assert!(super::clipboard_text_equals("hello", b"hello"));
+        assert!(super::clipboard_text_equals("a\r\nb", b"a\nb"));
+        assert!(super::clipboard_text_equals("a\nb", b"a\r\nb"));
+        assert!(!super::clipboard_text_equals("hello ", b"hello"));
+        assert!(!super::clipboard_text_equals("hello", b"world"));
+        assert!(!super::clipboard_text_equals("hello", &[0xff]));
+        assert!(!super::clipboard_text_equals("a\rb", b"a\nb"));
+    }
+
+    #[test]
+    fn clipboard_format_check_rejects_rich_content() {
+        for format in [
+            super::CF_UNICODETEXT,
+            super::CF_TEXT,
+            super::CF_OEMTEXT,
+            super::CF_LOCALE,
+        ] {
+            assert!(super::plain_text_clipboard_format(format as u32));
+        }
+        assert!(!super::plain_text_clipboard_format(super::CF_DIB as u32));
+        assert!(!super::plain_text_clipboard_format(0xC000));
+    }
+
+    #[test]
     fn windows_standard_plugin_runtime_paths_drop_only_disk_and_unc_verbatim_prefixes() {
         assert_eq!(
             super::standard_windows_path(std::path::Path::new(r"\\?\C:\plugins\example")),
@@ -3215,15 +3561,6 @@ mod tests {
     }
 
     #[test]
-    fn windows_notification_text_is_null_terminated_and_unicode_safe() {
-        let mut destination = [u16::MAX; 6];
-        super::copy_wide_truncated(&mut destination, "abc😀def");
-
-        assert_eq!(String::from_utf16(&destination[..5]).unwrap(), "abc😀");
-        assert_eq!(destination[5], 0);
-    }
-
-    #[test]
     fn powershell_agent_command_omits_argument_list_when_no_arguments_are_passed() {
         let argv = vec!["opencode".into()];
 
@@ -3260,6 +3597,73 @@ mod tests {
             String::from_utf16(&utf16).unwrap(),
             "if((Get-Command pi -ErrorAction SilentlyContinue).CommandType -eq 'ExternalScript'){& pi '' 'two words' '100%' 'wow!' 'a''b' '--model'}else{Start-Process -FilePath pi -ArgumentList '\"\" \"two words\" 100% wow! a''b --model' -NoNewWindow -Wait}"
         );
+    }
+
+    #[test]
+    fn managed_resume_uses_application_only_powershell_launch_and_transfer_exit() {
+        let argv = vec![
+            "codex".into(),
+            "resume".into(),
+            "session with ' quote".into(),
+        ];
+
+        let ordinary = super::managed_resume_shell_command(&argv, "powershell.exe", false)
+            .expect("ordinary managed resume command");
+        assert!(ordinary.contains("Microsoft.PowerShell.Management\\Start-Process"));
+        assert!(ordinary.contains("-FilePath codex"));
+        assert!(ordinary.contains("-ErrorAction Stop"));
+        assert!(ordinary.contains("Herdr could not launch executable"));
+        assert!(!ordinary.ends_with("exit $p.ExitCode"));
+
+        let transfer = super::managed_resume_shell_command(&argv, "powershell.exe", true)
+            .expect("transfer managed resume command");
+        assert!(transfer.ends_with("; exit $p.ExitCode"));
+        assert!(transfer.contains("catch { [Console]::Error.WriteLine"));
+        assert!(transfer.contains("exit 127"));
+    }
+
+    #[test]
+    fn managed_cmd_resume_exits_outer_shell_after_encoded_transfer_command() {
+        use base64::Engine as _;
+
+        let argv = vec!["claude".into(), "--resume".into(), "session id".into()];
+        let command = super::managed_resume_shell_command(&argv, "cmd.exe", true)
+            .expect("cmd transfer managed resume command");
+        let encoded_command = command
+            .strip_suffix(" & exit /b")
+            .expect("cmd transfer must exit its outer shell");
+        let encoded = encoded_command
+            .split_whitespace()
+            .last()
+            .expect("encoded PowerShell payload");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("decode PowerShell payload");
+        let utf16 = bytes
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect::<Vec<_>>();
+        let script = String::from_utf16(&utf16).expect("PowerShell payload is UTF-16");
+        assert!(script.contains("Microsoft.PowerShell.Management\\Start-Process"));
+        assert!(script.contains("-FilePath claude"));
+        assert!(script.ends_with("; exit $p.ExitCode"));
+    }
+
+    #[test]
+    fn managed_git_bash_resume_waits_then_exits_with_the_target_status() {
+        let argv = vec!["codex".into(), "resume".into(), "session id".into()];
+        let command =
+            super::managed_resume_shell_command(&argv, r"C:\Program Files\Git\bin\bash.exe", true)
+                .expect("Git Bash transfer managed resume command");
+
+        // `-NoLogo -NoProfile`, matching cmd_encoded_powershell_command. The old
+        // expectation omitted -NoLogo and had never run: this is a fork test, and
+        // the fork's windows_check.ps1 ran a filtered list, so it first executed
+        // when this merge adopted upstream's full-suite script.
+        assert!(command
+            .starts_with("\\builtin command powershell.exe -NoLogo -NoProfile -EncodedCommand "));
+        assert!(command.ends_with(r"; \command exit $?"));
+        assert!(!command.contains(" & exit /b"));
     }
 
     #[test]
@@ -4054,7 +4458,7 @@ mod tests {
         cache.remember_for_test(10, &snapshot, &job);
         cache.entries.get_mut(&10).unwrap().verified_at = Instant::now()
             .checked_sub(super::FOREGROUND_SELECTION_RECHECK + Duration::from_secs(1))
-            .unwrap();
+            .expect("host uptime exceeds the recheck interval this test backdates");
         assert_eq!(cache.get(10, &snapshot), None);
     }
 
@@ -4171,7 +4575,7 @@ mod tests {
         cache.remember_for_test(10, &first_snapshot, &first_job);
         cache.entries.get_mut(&10).unwrap().last_used = Instant::now()
             .checked_sub(super::FOREGROUND_SELECTION_CACHE_RETENTION + Duration::from_secs(1))
-            .unwrap();
+            .expect("host uptime exceeds the cache retention this test backdates");
 
         let second_snapshot = super::ProcessSnapshot::new(vec![
             test_entry(11, 1, "powershell.exe", &["powershell.exe"]),

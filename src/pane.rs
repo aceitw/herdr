@@ -29,9 +29,14 @@ mod cursor;
 mod input;
 mod kitty_keyboard;
 mod osc;
+mod output_ring;
 mod state;
 mod terminal;
 mod xtgettcap;
+
+pub(crate) use output_ring::{
+    clamp_max_frame_bytes, OutputDrain, OutputRing, OutputWait, OUTPUT_RING_CAPACITY_BYTES,
+};
 
 use self::agent_detection::{
     codex_prompt_ready, decide_detection_screen_read, decide_screen_detection_publish,
@@ -44,8 +49,9 @@ use self::agent_detection::{
 pub use self::terminal::InputState;
 use self::terminal::{GhosttyPaneTerminal, PaneTerminal};
 pub(crate) use self::terminal::{
-    TerminalCompressionStep, TerminalDirtyPatch, TerminalDirtyPatchOutcome, TerminalReadSnapshot,
-    TerminalSearchDirection, TerminalSearchWindow, TerminalTextPoint, TerminalWordMotion,
+    TerminalComposerFrame, TerminalCompressionStep, TerminalDirtyPatch, TerminalDirtyPatchOutcome,
+    TerminalReadSnapshot, TerminalSearchDirection, TerminalSearchWindow, TerminalTextPoint,
+    TerminalWordMotion,
 };
 pub use self::{
     state::PaneState,
@@ -120,6 +126,11 @@ fn apply_pane_terminal_env(cmd: &mut CommandBuilder) {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PaneLaunchEnv {
     extra: Vec<(String, String)>,
+    /// Auth variables to remove because a specific account was selected. Carried
+    /// separately from `extra` because a selected account can legitimately set NO
+    /// override (a primary account on the default config-home, issue #94) while
+    /// still needing a conflicting global token cleared.
+    clear_vars: Vec<String>,
     identity: PaneLaunchIdentity,
 }
 
@@ -139,6 +150,17 @@ impl PaneLaunchEnv {
     pub(crate) fn from_extra(extra: Vec<(String, String)>) -> Self {
         Self {
             extra,
+            clear_vars: Vec::new(),
+            identity: PaneLaunchIdentity::Inherit,
+        }
+    }
+
+    /// Build from a resolved account selection, keeping the "set these" and
+    /// "clear those" halves distinct all the way to the child.
+    pub(crate) fn from_account(account_env: crate::config::AccountLaunchEnv) -> Self {
+        Self {
+            extra: account_env.vars,
+            clear_vars: account_env.clear_vars,
             identity: PaneLaunchIdentity::Inherit,
         }
     }
@@ -180,6 +202,27 @@ fn apply_pane_launch_env(cmd: &mut CommandBuilder, launch_env: &PaneLaunchEnv) {
     }
     for (key, value) in &launch_env.extra {
         cmd.env(key, value);
+        // When this launch applies a config-home override, clear conflicting auth
+        // tokens so the selected account's own credentials are authoritative — a
+        // global CLAUDE_CODE_OAUTH_TOKEN otherwise overrides CLAUDE_CONFIG_DIR
+        // (gitmoot workflow-note row 86147). This covers launches that set a
+        // config-home var WITHOUT going through the account registry, e.g. a
+        // config.toml `extra_env`.
+        if let Some(kind) = crate::config::kind_for_config_env_var(key) {
+            for var in crate::config::auth_env_vars_to_clear(kind) {
+                cmd.env_remove(var);
+            }
+        }
+    }
+    // The account-selected clear-list, which the loop above CANNOT derive: a primary
+    // account on the harness default config-home sets no override (issue #94), so
+    // `extra` is empty and the loop never runs — while a global token still outranks
+    // the selection. Skips anything this launch explicitly set, so an override always
+    // beats a clear.
+    for var in &launch_env.clear_vars {
+        if !launch_env.extra.iter().any(|(key, _)| key == var) {
+            cmd.env_remove(var);
+        }
     }
     cmd.env(crate::HERDR_ENV_VAR, crate::HERDR_ENV_VALUE);
     crate::integration::apply_pane_base_env(cmd);
@@ -238,6 +281,7 @@ fn active_pending_release(
 async fn publish_state_changed_event(
     state_events: mpsc::Sender<AppEvent>,
     pane_id: PaneId,
+    runtime_epoch: u64,
     agent: Option<Agent>,
     state: AgentState,
     visible_blocker: bool,
@@ -251,6 +295,7 @@ async fn publish_state_changed_event(
     if let Err(e) = state_events
         .send(AppEvent::StateChanged {
             pane_id,
+            runtime_epoch: Some(runtime_epoch),
             agent,
             state,
             visible_blocker,
@@ -268,22 +313,45 @@ async fn publish_state_changed_event(
     }
 }
 
+async fn publish_input_state_changed_event(
+    state_events: mpsc::Sender<AppEvent>,
+    pane_id: PaneId,
+    runtime_epoch: u64,
+    kind: Option<crate::detect::InputPromptKind>,
+) {
+    if let Err(err) = state_events
+        .send(AppEvent::InputStateChanged {
+            pane_id,
+            runtime_epoch: Some(runtime_epoch),
+            kind,
+        })
+        .await
+    {
+        warn!(
+            pane = pane_id.raw(),
+            err = %err,
+            "failed to deliver InputStateChanged event"
+        );
+    }
+}
 async fn publish_agent_process_detected_event(
     state_events: mpsc::Sender<AppEvent>,
     pane_id: PaneId,
+    runtime_epoch: u64,
     agent: Agent,
     observed_at: std::time::Instant,
 ) {
     if let Err(e) = state_events
         .send(AppEvent::AgentProcessDetected {
             pane_id,
+            runtime_epoch: Some(runtime_epoch),
             agent,
             observed_at,
         })
         .await
     {
         warn!(
-            pane = pane_id.raw(),
+            pane = ?pane_id,
             err = %e,
             "failed to deliver AgentProcessDetected event"
         );
@@ -317,6 +385,7 @@ async fn publish_codex_prompt_observation(
 
 #[derive(Debug, Clone, Copy)]
 struct AgentDetectionPublishUpdate {
+    runtime_epoch: u64,
     state: AgentState,
     visible_idle: bool,
     visible_blocker: bool,
@@ -352,6 +421,7 @@ async fn apply_agent_detection_publish_update(
     publish_state_changed_event(
         state_events,
         pane_id,
+        update.runtime_epoch,
         agent,
         update.state,
         update.visible_blocker,
@@ -791,6 +861,7 @@ fn probe_foreground_process(pid: u32, foreground_pgid: Option<u32>) -> ProcessPr
 #[cfg(unix)]
 fn spawn_basic_detection_task(
     pane_id: PaneId,
+    runtime_epoch: u64,
     child_pid: Arc<AtomicU32>,
     terminal: Arc<PaneTerminal>,
     detection_content_seq: Arc<AtomicU64>,
@@ -824,6 +895,8 @@ fn spawn_basic_detection_task(
         let mut release_was_active = false;
         let mut last_detection_text = String::new();
         let mut last_screen_scan_detection_content_seq = None;
+        let mut last_input_screen_scan_detection_content_seq = None;
+        let mut last_input_prompt_kind = None;
         let mut agent_startup_grace_until = None;
         let mut pending_idle = PendingIdleConfirmation::default();
         let mut last_codex_prompt_ready = false;
@@ -838,6 +911,14 @@ fn spawn_basic_detection_task(
             tokio::select! {
                 _ = tokio::time::sleep(sleep_duration) => {}
                 _ = detect_reset.notified() => {
+                    if last_input_prompt_kind.take().is_some() {
+                        publish_input_state_changed_event(
+                            state_events.clone(),
+                            pane_id,
+                            runtime_epoch,
+                            None,
+                        ).await;
+                    }
                     publish_codex_prompt_observation(
                         &state_events, pane_id, Some(Agent::Codex), "", None, false,
                         &mut last_codex_prompt_ready,
@@ -858,6 +939,7 @@ fn spawn_basic_detection_task(
                     release_was_active = false;
                     last_detection_text.clear();
                     last_screen_scan_detection_content_seq = None;
+                    last_input_screen_scan_detection_content_seq = None;
                     agent_startup_grace_until = None;
                     pending_idle.clear();
                 }
@@ -974,6 +1056,7 @@ fn spawn_basic_detection_task(
                             publish_agent_process_detected_event(
                                 state_events.clone(),
                                 pane_id,
+                                runtime_epoch,
                                 agent,
                                 now,
                             )
@@ -988,6 +1071,47 @@ fn spawn_basic_detection_task(
             let process_exited = pending_foreground_shell_clear
                 && agent.is_some()
                 && !foreground_shell_exit_reported;
+
+            let input_content_seq = agent.map(|_| detection_content_seq.load(Ordering::Relaxed));
+            if process_exited || agent.is_none() {
+                last_input_screen_scan_detection_content_seq = input_content_seq;
+                if last_input_prompt_kind.take().is_some() {
+                    publish_input_state_changed_event(
+                        state_events.clone(),
+                        pane_id,
+                        runtime_epoch,
+                        None,
+                    )
+                    .await;
+                }
+            } else if input_content_seq != last_input_screen_scan_detection_content_seq
+                || agent_changed
+            {
+                let content = terminal.detection_text();
+                let osc_title = terminal.agent_osc_title();
+                let osc_progress = terminal.agent_osc_progress();
+                let kind = agent.and_then(|agent| {
+                    crate::detect::manifest::detect_input_with_osc(
+                        agent,
+                        crate::detect::manifest::DetectionInput {
+                            screen: &content,
+                            osc_title: &osc_title,
+                            osc_progress: &osc_progress,
+                        },
+                    )
+                });
+                last_input_screen_scan_detection_content_seq = input_content_seq;
+                if kind != last_input_prompt_kind {
+                    last_input_prompt_kind = kind;
+                    publish_input_state_changed_event(
+                        state_events.clone(),
+                        pane_id,
+                        runtime_epoch,
+                        kind,
+                    )
+                    .await;
+                }
+            }
 
             if lifecycle_authority_active && !process_exited {
                 pending_idle.clear();
@@ -1091,6 +1215,7 @@ fn spawn_basic_detection_task(
                         pane_id,
                         agent,
                         AgentDetectionPublishUpdate {
+                            runtime_epoch,
                             state: new_state,
                             visible_idle,
                             visible_blocker,
@@ -1372,9 +1497,21 @@ pub struct PaneRuntime {
     detect_reset_notify: Arc<Notify>,
     pending_release: Arc<Mutex<Option<PendingAgentRelease>>>,
     preserve_processes_on_drop: bool,
+    /// Monotonic generation id for this runtime. Put on the `pane.stream` wire so
+    /// a reconnecting client can tell whether the runtime it last saw is still
+    /// the same one (a changed epoch forces a resync).
+    epoch: u64,
     // Task handles for deterministic shutdown
     compression: TerminalCompressionTask,
     detect_handle: Option<tokio::task::AbortHandle>,
+}
+
+/// Source of per-runtime `pane.stream` epochs. A fresh epoch per runtime
+/// construction means any handoff/respawn presents as a new generation.
+static NEXT_PANE_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+fn next_pane_epoch() -> u64 {
+    NEXT_PANE_EPOCH.fetch_add(1, Ordering::Relaxed)
 }
 
 enum PaneRuntimeIo {
@@ -1510,21 +1647,23 @@ impl PaneRuntimeIo {
         }
     }
 
-    fn queue_user_input_submission(
+    fn queue_user_input_submission_guarded(
         &self,
         text: Bytes,
         enter: Bytes,
         delay: std::time::Duration,
         deadline: Option<std::time::Instant>,
+        guard: Option<crate::pty::SubmissionGuard>,
     ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
         match self {
             PaneRuntimeIo::Actor(actor) => {
                 #[cfg(windows)]
-                return actor.queue_user_input_submission(text, enter, delay, deadline);
+                return actor
+                    .queue_user_input_submission_guarded(text, enter, delay, deadline, guard);
                 #[cfg(unix)]
                 {
                     let _ = deadline;
-                    actor.queue_user_input_submission(text, enter, delay)
+                    actor.queue_user_input_submission_guarded(text, enter, delay, guard)
                 }
             }
             #[cfg(test)]
@@ -1533,13 +1672,45 @@ impl PaneRuntimeIo {
                 let sender = sender.clone();
                 let (reply_tx, reply_rx) = std::sync::mpsc::channel();
                 std::thread::spawn(move || {
-                    let result = sender
-                        .try_send(text)
-                        .map_err(std::io::Error::other)
-                        .and_then(|()| {
-                            std::thread::sleep(delay);
-                            sender.try_send(enter).map_err(std::io::Error::other)
-                        });
+                    let result = if text.is_empty() {
+                        Ok(())
+                    } else {
+                        sender.try_send(text).map_err(|err| {
+                            crate::pty::actor::submission_text_unwritten(&std::io::Error::other(
+                                err,
+                            ))
+                        })
+                    }
+                    .and_then(|()| {
+                        std::thread::sleep(delay);
+                        if let Some(guard) = guard.as_ref() {
+                            if !(guard.occupant_unchanged)() {
+                                if let Some(watch) = guard.watch.as_ref() {
+                                    watch
+                                        .abandoned
+                                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                                }
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::Interrupted,
+                                    "pane occupant changed before prompt submission",
+                                ));
+                            }
+                        }
+                        if let Err(err) = sender.try_send(enter) {
+                            if let Some(watch) = guard.as_ref().and_then(|g| g.watch.as_ref()) {
+                                watch
+                                    .abandoned
+                                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                            }
+                            return Err(std::io::Error::other(err));
+                        }
+                        if let Some(watch) = guard.as_ref().and_then(|g| g.watch.as_ref()) {
+                            watch
+                                .submitted
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        Ok(())
+                    });
                     let _ = reply_tx.send(result);
                 });
                 Ok(reply_rx)
@@ -1557,6 +1728,9 @@ pub enum WheelRouting {
 
 impl Drop for PaneRuntime {
     fn drop(&mut self) {
+        // Tell any attached `pane.stream` viewers the runtime is gone so they
+        // emit `exited` and close, rather than blocking until an idle timeout.
+        self.terminal.mark_output_ring_closed();
         // Abort detection task immediately and terminate the owned session.
         // The PTY actor shuts down before the process/session policy runs.
         if let Some(handle) = &self.detect_handle {
@@ -1852,6 +2026,10 @@ impl<'a> PaneShellConfig<'a> {
             mode,
         }
     }
+}
+
+pub(crate) fn resolved_pane_shell(shell_config: PaneShellConfig<'_>) -> String {
+    pane_shell(shell_config.default_shell)
 }
 
 /// Target platform for shell launch policy. Parameterized (instead of raw
@@ -2419,6 +2597,7 @@ impl PaneRuntime {
         let content_seq = Arc::new(AtomicU64::new(0));
         let content_write_lock = Arc::new(Mutex::new(()));
         let detection_content_seq = Arc::new(AtomicU64::new(0));
+        let epoch = next_pane_epoch();
 
         let io = {
             let terminal = terminal.clone();
@@ -2488,6 +2667,7 @@ impl PaneRuntime {
                 // unknowable. Checkpoint conservatively; normal autosave settles clean exits.
                 let _ = rt.block_on(exit_events.send(AppEvent::PaneDied {
                     pane_id,
+                    runtime_epoch: Some(epoch),
                     exit_reason: crate::platform::ChildExitReason::Handoff,
                 }));
                 debug!(pane = pane_id.raw(), "handoff PTY actor exiting");
@@ -2505,6 +2685,7 @@ impl PaneRuntime {
         let self_reported_agent_active = Arc::new(AtomicBool::new(false));
         let (detect_handle, detect_reset_notify, pending_release) = spawn_basic_detection_task(
             pane_id,
+            epoch,
             child_pid.clone(),
             terminal.clone(),
             detection_content_seq.clone(),
@@ -2533,6 +2714,7 @@ impl PaneRuntime {
             pending_release,
             preserve_processes_on_drop: true,
             compression,
+            epoch,
             detect_handle: Some(detect_handle),
         })
     }
@@ -2588,6 +2770,7 @@ impl PaneRuntime {
         let content_seq = Arc::new(AtomicU64::new(0));
         let detection_content_seq = Arc::new(AtomicU64::new(0));
         let full_lifecycle_authority_active = Arc::new(AtomicBool::new(false));
+        let epoch = next_pane_epoch();
         let self_reported_agent_active = Arc::new(AtomicBool::new(false));
         {
             let child_pid = child_pid.clone();
@@ -2617,6 +2800,7 @@ impl PaneRuntime {
                 if let Err(e) = rt.block_on(events.send(AppEvent::PaneDied {
                     pane_id,
                     exit_reason,
+                    runtime_epoch: Some(epoch),
                 })) {
                     error!(pane = pane_id.raw(), err = %e, "failed to send PaneDied event");
                 }
@@ -2741,6 +2925,8 @@ impl PaneRuntime {
                 let mut last_visible_signal_refresh = None;
                 let mut last_detection_text = String::new();
                 let mut last_screen_scan_detection_content_seq = None;
+                let mut last_input_screen_scan_detection_content_seq = None;
+                let mut last_input_prompt_kind = None;
                 let mut agent_startup_grace_until = None;
                 let mut pending_idle = PendingIdleConfirmation::default();
                 let mut last_codex_prompt_ready = false;
@@ -2765,6 +2951,14 @@ impl PaneRuntime {
                     tokio::select! {
                         _ = tokio::time::sleep(tick) => {}
                         _ = detect_reset.notified() => {
+                            if last_input_prompt_kind.take().is_some() {
+                                publish_input_state_changed_event(
+                                    state_events.clone(),
+                                    pane_id,
+                                    epoch,
+                                    None,
+                                ).await;
+                            }
                             publish_codex_prompt_observation(
                                 &state_events, pane_id, Some(Agent::Codex), "", None, false,
                                 &mut last_codex_prompt_ready,
@@ -2785,6 +2979,7 @@ impl PaneRuntime {
                             last_visible_signal_refresh = None;
                             last_detection_text.clear();
                             last_screen_scan_detection_content_seq = None;
+                            last_input_screen_scan_detection_content_seq = None;
                             agent_startup_grace_until = None;
                             pending_idle.clear();
                         }
@@ -2942,6 +3137,7 @@ impl PaneRuntime {
                                         publish_agent_process_detected_event(
                                             state_events.clone(),
                                             pane_id,
+                                            epoch,
                                             agent,
                                             now,
                                         )
@@ -2985,6 +3181,48 @@ impl PaneRuntime {
                     let process_exited = pending_foreground_shell_clear
                         && agent.is_some()
                         && !foreground_shell_exit_reported;
+
+                    let input_content_seq =
+                        agent.map(|_| detection_content_seq.load(Ordering::Relaxed));
+                    if process_exited || agent.is_none() {
+                        last_input_screen_scan_detection_content_seq = input_content_seq;
+                        if last_input_prompt_kind.take().is_some() {
+                            publish_input_state_changed_event(
+                                state_events.clone(),
+                                pane_id,
+                                epoch,
+                                None,
+                            )
+                            .await;
+                        }
+                    } else if input_content_seq != last_input_screen_scan_detection_content_seq
+                        || agent_changed
+                    {
+                        let content = terminal.detection_text();
+                        let osc_title = terminal.agent_osc_title();
+                        let osc_progress = terminal.agent_osc_progress();
+                        let kind = agent.and_then(|agent| {
+                            crate::detect::manifest::detect_input_with_osc(
+                                agent,
+                                crate::detect::manifest::DetectionInput {
+                                    screen: &content,
+                                    osc_title: &osc_title,
+                                    osc_progress: &osc_progress,
+                                },
+                            )
+                        });
+                        last_input_screen_scan_detection_content_seq = input_content_seq;
+                        if kind != last_input_prompt_kind {
+                            last_input_prompt_kind = kind;
+                            publish_input_state_changed_event(
+                                state_events.clone(),
+                                pane_id,
+                                epoch,
+                                kind,
+                            )
+                            .await;
+                        }
+                    }
 
                     if lifecycle_authority_active && !process_exited {
                         pending_idle.clear();
@@ -3088,6 +3326,7 @@ impl PaneRuntime {
                                 pane_id,
                                 agent,
                                 AgentDetectionPublishUpdate {
+                                    runtime_epoch: epoch,
                                     state: new_state,
                                     visible_idle,
                                     visible_blocker,
@@ -3136,6 +3375,7 @@ impl PaneRuntime {
             pending_release,
             preserve_processes_on_drop: false,
             compression,
+            epoch,
             detect_handle,
         })
     }
@@ -3180,6 +3420,31 @@ impl PaneRuntime {
 
     pub(crate) fn content_seq(&self) -> u64 {
         self.content_seq.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Attach a `pane.stream` viewer, lazily creating this pane's bounded output
+    /// ring on the first subscribe. Returns the shared `Arc<OutputRing>` so the
+    /// connection thread can drain it without routing bytes through the app loop.
+    pub(crate) fn attach_output_stream(&self, capacity: usize) -> Arc<OutputRing> {
+        let (rows, cols) = self.current_size();
+        let candidate = OutputRing::new(
+            self.epoch,
+            capacity,
+            cols,
+            rows,
+            Arc::downgrade(&self.terminal),
+        );
+        self.terminal.attach_output_ring(candidate)
+    }
+
+    /// Detach a `pane.stream` viewer. Returns the remaining subscriber count; the
+    /// ring is torn down (restoring the zero-cost read path) when it reaches zero.
+    pub(crate) fn detach_output_stream(&self) -> usize {
+        self.terminal.detach_output_ring()
     }
 
     /// Resize if the dimensions actually changed.
@@ -3339,6 +3604,14 @@ impl PaneRuntime {
         self.terminal.alternate_screen_active()
     }
 
+    pub fn active_screen(&self) -> Option<crate::ghostty::ActiveScreen> {
+        self.terminal.active_screen()
+    }
+
+    pub fn normalize_alternate_screen_on_exit(&self) -> bool {
+        self.terminal.normalize_alternate_screen_on_exit()
+    }
+
     pub fn cursor_state(&self, area: Rect, show_cursor: bool) -> Option<TerminalCursorState> {
         if !show_cursor {
             return None;
@@ -3373,6 +3646,18 @@ impl PaneRuntime {
 
     pub fn detection_text(&self) -> String {
         self.terminal.detection_text()
+    }
+
+    pub(crate) fn composer_frame(&self) -> (TerminalComposerFrame, u64) {
+        let before = self.detection_content_seq.load(Ordering::Acquire);
+        let mut frame = self.terminal.composer_frame();
+        let after = self.detection_content_seq.load(Ordering::Acquire);
+        frame.frame_stable &= before == after;
+        (frame, after)
+    }
+
+    pub(crate) fn detection_content_seq(&self) -> u64 {
+        self.detection_content_seq.load(Ordering::Acquire)
     }
 
     pub fn terminal_title(&self) -> Option<String> {
@@ -3520,15 +3805,16 @@ impl PaneRuntime {
         self.io.try_send_bytes(bytes)
     }
 
-    pub fn queue_user_input_submission(
+    pub fn queue_user_input_submission_guarded(
         &self,
         text: Bytes,
         enter: Bytes,
         delay: std::time::Duration,
         deadline: Option<std::time::Instant>,
+        guard: Option<crate::pty::SubmissionGuard>,
     ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
         self.io
-            .queue_user_input_submission(text, enter, delay, deadline)
+            .queue_user_input_submission_guarded(text, enter, delay, deadline, guard)
     }
 
     pub fn try_send_paste(&self, text: String) -> Result<(), mpsc::error::TrySendError<Bytes>> {
@@ -3860,6 +4146,7 @@ impl PaneRuntime {
                 pending_release: Arc::new(Mutex::new(None)),
                 preserve_processes_on_drop: true,
                 compression,
+                epoch: next_pane_epoch(),
                 detect_handle: Some(tokio::spawn(async {}).abort_handle()),
             },
             rx,
@@ -3977,6 +4264,143 @@ mod tests {
         };
         assert_eq!(patch.rows.len(), 5);
         assert!(patch.rows.iter().all(|(_, cells)| cells.len() == 24));
+    }
+
+    /// THE INCIDENT'S ACCEPTANCE CRITERION, AT THE LAST LINK IN THE CHAIN.
+    ///
+    /// A staged update killed 30 panes; on restore all 11 Claude agents relaunched under
+    /// the DEFAULT profile instead of the selected secondary account, and began appending
+    /// to the PRIMARY transcript. The user experienced that as ONE TO TWO HOURS OF AGENT
+    /// HISTORY DISAPPEARING — the bytes were intact in the other account's file the whole
+    /// time.
+    ///
+    /// Which transcript a resumed agent writes to is decided by exactly two things in the
+    /// child environment: the config-home it is pointed at, and whether a machine-global
+    /// auth token is present to override that. Everything upstream — persisting the
+    /// account id, rebuilding the launch env — is only worth anything if it survives to
+    /// HERE.
+    ///
+    /// I claimed in a commit message that the token clearing "comes for free" from this
+    /// function and did not check it. Asserting it is the difference between a mechanism
+    /// that looks right and one that is known to work. The checks that falsely passed
+    /// during the incident — pane counts, restored session ids, a process existing — are
+    /// deliberately not what this test looks at.
+    #[test]
+    fn a_selected_account_reaches_the_child_and_defeats_a_global_token() {
+        let mut cmd = CommandBuilder::new("shell");
+        // The hazard: a machine-global token that overrides CLAUDE_CONFIG_DIR and silently
+        // re-homes the agent onto whichever account minted it.
+        cmd.env("CLAUDE_CODE_OAUTH_TOKEN", "global-token-for-primary");
+
+        let launch_env = PaneLaunchEnv {
+            extra: vec![(
+                "CLAUDE_CONFIG_DIR".to_string(),
+                "/root/.claude-9".to_string(),
+            )],
+            ..PaneLaunchEnv::default()
+        };
+        apply_pane_launch_env(&mut cmd, &launch_env);
+
+        // The selected account reaches the child ...
+        assert_eq!(
+            cmd.get_env("CLAUDE_CONFIG_DIR")
+                .and_then(std::ffi::OsStr::to_str),
+            Some("/root/.claude-9"),
+            "the resumed agent must be pointed at the SELECTED account's config-home"
+        );
+        // ... and nothing is left that can override it. This is the assertion whose
+        // absence let the routing claim go unverified.
+        assert!(
+            cmd.get_env("CLAUDE_CODE_OAUTH_TOKEN").is_none(),
+            "a global OAuth token outranks CLAUDE_CONFIG_DIR; leaving it set sends the \
+             agent's writes to the WRONG account's transcript, which is what the user \
+             experiences as lost history"
+        );
+    }
+
+    /// The negative half: with NO account selected, this function CHANGES NOTHING about
+    /// account routing. A launch that never chose an account must behave exactly as before,
+    /// or the guard above would quietly break every default-account pane.
+    ///
+    /// Asserted as "unchanged from an explicit baseline", NOT as "absent". The first version
+    /// asserted `CLAUDE_CONFIG_DIR` was absent — which depends on the ambient environment of
+    /// whatever machine runs it. It passed in isolation and failed in the full run on this
+    /// box, because this seat itself runs under a secondary account and `CommandBuilder`
+    /// inherits the process environment. A test whose result depends on where it runs is not
+    /// evidence.
+    #[test]
+    fn no_selected_account_does_not_change_account_routing() {
+        let mut cmd = CommandBuilder::new("shell");
+        cmd.env("CLAUDE_CONFIG_DIR", "/ambient-home");
+        cmd.env("CLAUDE_CODE_OAUTH_TOKEN", "ambient-token");
+
+        apply_pane_launch_env(&mut cmd, &PaneLaunchEnv::default());
+
+        assert_eq!(
+            cmd.get_env("CLAUDE_CONFIG_DIR")
+                .and_then(std::ffi::OsStr::to_str),
+            Some("/ambient-home"),
+            "an empty launch env must not redirect a pane's config-home"
+        );
+        assert_eq!(
+            cmd.get_env("CLAUDE_CODE_OAUTH_TOKEN")
+                .and_then(std::ffi::OsStr::to_str),
+            Some("ambient-token"),
+            "the token is cleared only when an account override is actually applied"
+        );
+    }
+
+    /// THE HOLE THIS CLOSES: a selected account that sets NO config-home override must
+    /// still defeat a machine-global token.
+    ///
+    /// A primary account whose config_dir IS the harness default deliberately injects no
+    /// `CLAUDE_CONFIG_DIR` — doing so strands `~/.claude.json` (issue #94). The token
+    /// clearing used to be derived from the override vars, so an empty override set meant
+    /// nothing was cleared, and a global `CLAUDE_CODE_OAUTH_TOKEN` authenticated the agent
+    /// as whichever account minted it. That is the incident's exact mechanism, aimed at
+    /// the very account the incident dumped everything into.
+    ///
+    /// Judged by the symptom: what decides the transcript is what the CHILD can see.
+    #[test]
+    fn a_default_config_home_account_still_defeats_a_global_token() {
+        let mut cmd = CommandBuilder::new("shell");
+        cmd.env(
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "global-token-for-another-account",
+        );
+        // Baseline proving the assertion below is about the clear, not about absence:
+        // the ambient config-home must survive untouched.
+        cmd.env("CLAUDE_CONFIG_DIR", "/home/tester/.claude");
+
+        // A primary claude account on the default config-home: nothing to SET, something
+        // to CLEAR. Built as the account registry resolves it, not hand-assembled.
+        let account = crate::config::AccountConfig {
+            id: "primary".into(),
+            kind: "claude".into(),
+            label: "Primary".into(),
+            config_dir: "/home/tester/.claude".into(),
+        };
+        let account_env = crate::config::AccountLaunchEnv {
+            vars: Vec::new(),
+            clear_vars: crate::config::auth_env_vars_to_clear(&account.kind)
+                .iter()
+                .map(|var| (*var).to_string())
+                .collect(),
+        };
+        apply_pane_launch_env(&mut cmd, &PaneLaunchEnv::from_account(account_env));
+
+        assert!(
+            cmd.get_env("CLAUDE_CODE_OAUTH_TOKEN").is_none(),
+            "a global OAuth token outranks config-home routing; leaving it set on an \
+             explicitly selected account sends that agent's writes to the WRONG account's \
+             transcript, which is what the user experiences as lost history"
+        );
+        assert_eq!(
+            cmd.get_env("CLAUDE_CONFIG_DIR")
+                .and_then(std::ffi::OsStr::to_str),
+            Some("/home/tester/.claude"),
+            "a default-config-home account must not gain an injected override (issue #94)"
+        );
     }
 
     #[test]
@@ -4835,6 +5259,31 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn pane_died_normalize_leaves_alternate_screen_and_recovers_history() {
+        let runtime = PaneRuntime::test_with_scrollback_bytes(
+            40,
+            5,
+            4096,
+            b"primary-line-1\r\nprimary-line-2\r\n\x1b[?1049halt-content",
+        );
+
+        let before = runtime.input_state().unwrap();
+        assert!(before.alternate_screen);
+        assert!(runtime.handoff_history_ansi().is_none());
+
+        assert!(runtime.normalize_alternate_screen_on_exit());
+
+        let after = runtime.input_state().unwrap();
+        assert!(!after.alternate_screen);
+        let history = runtime.handoff_history_ansi().unwrap();
+        assert!(history.contains("primary-line-1"));
+
+        let primary = PaneRuntime::test_with_scrollback_bytes(40, 5, 4096, b"primary-only\r\n");
+        assert!(!primary.normalize_alternate_screen_on_exit());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn ended_handoff_keeps_persistence_cwd_when_pid_is_reused() {
         let (runtime, _rx) = PaneRuntime::test_with_channel(80, 24);
         assert!(runtime.child_wait_completed.is_none());
@@ -5029,6 +5478,7 @@ mod tests {
             pending_release: Arc::new(Mutex::new(None)),
             preserve_processes_on_drop: true,
             compression,
+            epoch: next_pane_epoch(),
             detect_handle: Some(tokio::spawn(async {}).abort_handle()),
         };
 
@@ -5069,6 +5519,7 @@ mod tests {
             pending_release: Arc::new(Mutex::new(None)),
             preserve_processes_on_drop: true,
             compression,
+            epoch: next_pane_epoch(),
             detect_handle: Some(tokio::spawn(async {}).abort_handle()),
         };
 
@@ -5882,6 +6333,7 @@ mod tests {
         let publish = publish_state_changed_event(
             tx.clone(),
             pane_id,
+            7,
             Some(Agent::Pi),
             AgentState::Idle,
             false,
@@ -5920,6 +6372,7 @@ mod tests {
             second,
             AppEvent::StateChanged {
                 pane_id: delivered_pane,
+                runtime_epoch: Some(7),
                 agent: Some(Agent::Pi),
                 state: AgentState::Idle,
                 visible_blocker: false,

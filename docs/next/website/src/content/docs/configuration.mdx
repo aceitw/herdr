@@ -121,6 +121,135 @@ manage_ssh_config = true
 
 When enabled, `herdr --remote` writes a private temporary SSH config that includes your user and system SSH configs first, then adds fallback `ServerAliveInterval` and `ServerAliveCountMax` values. Your own keepalive settings win. Linux and macOS clients also use a private per-attach OpenSSH control socket to reuse the first authenticated connection; Windows OpenSSH does not. Set `manage_ssh_config = false` to run remote attach through plain `ssh` without Herdr's generated config or control socket.
 
+## Federation
+
+Federation lets one Herdr daemon reach another daemon's runtime. It is off by default. The inbound TCP listener only binds when you both enable it and give it at least one peer token to authenticate against; otherwise it refuses to start rather than expose an unauthenticated port.
+
+```toml
+[federation]
+coordinator = true
+listen = true
+listen_addr = "127.0.0.1:7020"
+
+[[federation.peers]]
+alias = "laptop"
+token_file = "/etc/herdr/peers/laptop.token"
+capability = "observe"
+
+[[federation.peers]]
+alias = "ops"
+token_file = "/etc/herdr/peers/ops.token"
+capability = "interact"
+
+[[federation.peers]]
+alias = "build"
+endpoint = "tcp://build.internal:7020"
+token_file = "/etc/herdr/peers/build.token"
+expected_node_id = "machine_0123456789abcdef0123456789abcdef"
+```
+
+Each `[[federation.peers]]` table declares one peer:
+
+- `alias` — a stable local routing identity for the peer, used in qualified IDs, logs, and diagnostics.
+- `display_label` — optional mutable display text. Changing it does not change routing identity or reconnect the peer.
+- `token_file` — path to the shared secret used by inbound and outbound TCP federation. Its trimmed contents are never logged. An unreadable or empty file grants no inbound access and sends no outbound credential.
+- `endpoint` — optional `tcp://host:port` destination for outbound connections. Omit it for an inbound-only peer. SSH targets belong in the saved-machine catalog and `federation.saved_machines`, not this table.
+- `expected_node_id` — an optional install-identity pin checked both when a TCP peer connects inbound and when any outbound peer's `agent.list` response is polled. Missing or changed identities are rejected while the pin is set.
+- `capability` — the tier a token grants over TCP federation. One of `observe`, `interact`, or `admin`. Default: `observe`.
+
+Saved-machine federation trust is separate from both the endpoint catalog and explicit TCP peers:
+
+```toml
+[federation.saved_machines."0123456789abcdef0123456789abcdef"]
+expected_machine_id = "machine_0123456789abcdef0123456789abcdef"
+```
+
+The table key is the saved machine's immutable profile ID. Saved profiles are reconciled only when `federation.coordinator = true`; the default remote role never federates its own catalog back, so enabling this on one machine does not create a cycle. The endpoint catalog remains authoritative for each trusted profile's label, SSH target, remote session, and enabled state. Add, enable, disable, remove, target/session changes, and trust-policy changes are applied without restarting the daemon. A label-only rename changes display data without reconnecting or changing qualified routing identity. Removing and re-adding a machine creates a new profile ID and does not inherit the old trust policy. `expected_machine_id` is required, and unknown credential fields are rejected. OpenSSH continues to own authentication and SSH federation remains a full-control trust boundary; this policy never stores or derives tokens, passwords, or private keys.
+
+Every named session (`herdr --session <name>`) reads this same config, so federation runs only in the default session's server unless a session is listed in `federation.named_sessions`. In any other named session, `coordinator`, explicit peers with an `endpoint`, and `listen` are ignored: it polls no saved machines or outbound peers and leaves `listen_addr` to the default session. Its `herdr machine status` reports saved machines as coordinator-disabled. A named session can still be the target a coordinator on another machine reaches through a saved profile's session.
+
+```toml
+[federation]
+coordinator = true
+named_sessions = ["agents"]
+```
+
+List a session only when it should federate alongside the default session; two sessions that both coordinate each poll every saved machine, and two with `listen = true` contend for the same `listen_addr`. `"default"` is accepted and redundant. Names follow the `--session` naming rules.
+
+Capability tiers are ordered, each including the one below it:
+
+- `observe` — read-only: list, read, and inspect panes, agents, events, and layout.
+- `interact` — everything in `observe`, plus driving agents and panes (`agent.prompt`, `agent.send_keys`, `pane.send_text`, `pane.send_keys`).
+- `admin` — everything in `interact`, plus focus, rename, and input/authority mutations (`agent.focus`, `agent.rename`, `pane.rename`, `pane.input.set`, `pane.send_input`, `agent.view.set`, `agent.view.clear`).
+
+
+Each outbound transport has a monotonically increasing peer generation and learns the remote daemon's opaque boot ID from `agent.list`. Ordinary replies and every `pane.stream` frame are checked against the generation and boot observed when the request started. A target/session reload, disconnect replacement, or remote restart therefore ends the old route and returns `stale_peer_generation` instead of forwarding stale data. The home never retries automatically: `peer_unreachable` means the connection was not established, while `delivery_unknown` means a write or response failed after connection and the peer may have acted. `forbidden` and other peer errors pass through unchanged.
+Federation exposes only a deliberate, read-and-drive subset of the API. Anything not in a tier — server lifecycle, plugin, integration, gram, notification, window-title, and agent/pane/workspace/tab/worktree/layout mutation — is denied to every federated peer regardless of tier. Inbound connections are also capped so a peer cannot exhaust the daemon's threads or file descriptors.
+
+`agent.list` returns local agents plus the coordinator's cached remote agents by default. Federation pollers set its `local_only` parameter so a peer returns only agents it owns; this prevents cyclic peer topologies from re-exporting already qualified agents. Pollers also discard returned agents that already carry federation machine identity, which keeps mixed-version peers bounded when an older daemon ignores the new parameter.
+
+The coordinator also caches each reachable peer's `workspace.list` (requested with `local_only: true`, with re-exported entries discarded the same way). It is fetched on the first successful agent poll, then every 30 seconds, and once early when a polled agent names a workspace the cache does not have; the 5-second agent poll adds no other request. The cache is kept while a peer is degraded or unreachable, so its workspaces stay listed with the peer's reachability.
+
+The coordinator also keeps one `events.subscribe` stream open to each identity-validated peer that advertises `events_v2`, so remote status changes, completed turns, and pane, workspace and tab lifecycle events reach its local subscribers in about a second instead of on the next poll (see [Remote events on a coordinator](/docs/socket-api/#remote-events-on-a-coordinator)). The stream uses the same route as the poll: a saved machine's existing `remote-api-bridge`, or the TCP endpoint and token, where the `observe` tier suffices. A failed stream reconnects with the poll's backoff, a changed peer boot ID restarts it, and each reconnect resynchronizes from `agent.list`. The 5-second poll keeps running as the backstop, but a poll answer older than a relayed event never overwrites that event's status. Peers without the capability are only polled.
+
+Use `herdr machine status` (or `herdr machine status --json`) on the coordinator to inspect saved-profile, endpoint/TUI, and federation health separately. An untrusted profile prints `herdr machine federate <profile-id>` as its next action (`next_action` in JSON). Federation reachability, validated remote machine ID, last successful poll, bounded error class, negotiated version/capabilities, and stale data are reported independently. Errors do not expose SSH commands, tokens, or remote stderr.
+
+When Gram relay consent covers a saved machine, its status also carries `gram_relay` (the text form prints a `gram relay:` line). `state` is `off`, `starting`, `up`, or `retrying`; `retrying` adds `attempt`, `next_in_secs`, and a bounded `last_error`. The coordinator retries a failed or exited reverse gateway on its own, from 2 seconds doubling to a 60-second cap, without restarting the machine's federation bridge. Example: `"gram_relay": {"state": "retrying", "attempt": 3, "next_in_secs": 8, "last_error": "remote Gram reverse socket preflight failed: exit status: 255"}`.
+
+After `herdr machine add --label <label> <user@host>`, run `herdr machine federate <label-or-id>` to opt in only that saved machine. The command connects through OpenSSH, captures the remote install identity on first use, pins it in `federation.saved_machines`, enables coordinator mode, and reloads the live daemon. Verify reachability with `herdr machine status`; `herdr machine unfederate <label-or-id>` removes only that policy and keeps the saved SSH profile. A later identity mismatch fails closed rather than replacing the pin. Check the SSH host key before the first connection: the command does not make an unknown host trustworthy.
+
+### Migrating SSH federation peers
+
+For a legacy `[[federation.peers]]` SSH entry, run `herdr machine federate <alias>`; it migrates the entry into a saved profile and pinned policy without carrying credentials into config. If several legacy SSH peers remain, opt in to migrating them all explicitly with `herdr machine federate <alias> --migrate-all-legacy`; a single-peer migration refuses to leave an invalid half-migrated config. TCP and inbound-only peers remain unchanged. Do not recreate an existing saved profile: removing and re-adding it mints a new ID and drops its old trust policy.
+
+The coordinator now uses only the saved-machine `remote-api-bridge`; the one-request `api-bridge` command and direct SSH request transport no longer exist. Direct `herdr --machine <label-or-id> …` commands use the same saved profile and remain available independently of federation policy. Upgrade from a release that provides both bridge commands before enabling coordinator mode. Rolling the coordinator back across this cutover requires rolling remote binaries back too, or federation through those remotes will fail because the newer binary no longer serves `api-bridge`. Back up the config first; an older binary may also reject the newer `coordinator`, `display_label`, or `saved_machines` keys until they are removed.
+
+OpenSSH credentials are not migrated into Herdr. Existing agents, host-key policy, SSH config, and private-key handling stay with OpenSSH; federation config stores only the immutable profile ID and expected machine ID.
+
+### Selected-agent reverse access (trusted machines)
+
+Reverse access is off until the coordinator enables `[federation] coordinator = true`, has a pinned saved SSH machine under `[federation.saved_machines.<profile-id>]`, and grants one live agent. For example, run `herdr machine grant <profile-id> <profile-id>/<terminal-id> --observe --interact` on the coordinator. `--observe-peer <alias>` and `--interact-peer <alias>` separately permit other peers; absent those flags, only coordinator agents are exposed. `herdr machine revoke <profile-id> <profile-id>/<terminal-id>` removes the grant and reloads the coordinator. A grant binds the source pane ID, displayed agent name, and harness session ref; restart with a different session, rename, archive, transfer, or machine-pin mismatch fails closed. Revocation stops the reverse SSH forward; an already-submitted prompt can still have an unknown delivery outcome.
+
+On the **remote** machine, explicitly set `reverse_coordinator_machine_id = "<coordinator-install-id>"` under `[federation]` (the grant command prints the ID). The granted agent calls `herdr agent federated-list` and `herdr agent federated-prompt <coordinator-terminal-id> "message"`; `HERDR_PANE_ID` identifies its live local pane by default. `--caller-pane` can instead name that public pane ID or its local terminal ID. The CLI resolves either to the current live terminal before asking the coordinator. The list contains coordinator agents and only explicitly permitted peer agents, with the coordinator's observed reachability.
+
+This is **not per-process security**. Herdr's local Unix API trusts a caller-supplied pane identity. Any malicious process running as the same user on the trusted remote machine can claim the granted pane ID and use its grant. Only opt in machines whose same-user processes you trust; selecting an agent is convenience routing, not an OS-enforced sandbox.
+
+:::caution[Security]
+A TCP federation token grants exactly its peer's capability tier and nothing more. Treat each token file as a secret scoped to that tier: hand a peer an `observe` token when it only needs to watch, and reserve `admin` for peers you fully trust. This is different from the SSH path, which runs a discovered remote Herdr executable's `remote-api-bridge` against the named session's local socket and therefore grants full, unfiltered control-plane access. OpenSSH owns authentication, host-key checks, and interactive-auth failure. The local unix socket itself is never token-checked or tier-filtered.
+:::
+
+### Gram files across trusted machines
+
+Gram remains in the coordinator's canonical store. A saved, identity-pinned SSH peer can use a separate, default-off reverse Unix socket for remote `gram send --file`, list, file download, and delete. The owner posts to a remote agent by its machine-qualified name (`herdr gram post "message" --to <profile-id>/<agent>`). This does **not** add `gram.*` to the ordinary TCP federation allowlist or forward the coordinator's unrestricted local API. On the remote, a HerdrUp guest's post to its shared agent, with its attachment, also goes to the coordinator, where that agent reads its Gram; the coordinator accepts a relayed post only from a guest to one of that machine's own agents, and addresses it to that agent's machine-qualified name, as an owner's post to it would be. The remote keeps a copy of the shared agent's Grams and the guest's own posts for guests with Gram sharing on, so they can list them, open their files and be notified. The owner's Gram and notifications stay on the coordinator, and the copies are dropped when no sharing guest can see them. A Gram deleted through the relay drops its copy at once; one deleted on the coordinator drops it the next time the guest lists its Gram (checked at most every 30 seconds, while the shared agent runs). The same check brings back the guest's Grams this remote relayed while sharing was off, so turning sharing on shows the shared agent's Grams and the guest's posts since the guest accepted; Grams it did not relay itself are never taken on the coordinator's word.
+
+Relay consent is durable Herdr configuration and is off by default. Both sides need the updated binary; the coordinator's saved SSH profile must already pin the remote install ID (`herdr machine federate`). OpenSSH must permit reverse stream-local forwarding. No private SSH key is copied to the remote machine.
+
+**Coordinator** (`config.toml`): allow one saved machine by its profile ID from `herdr machine list`.
+
+```toml
+[gram_relay]
+peers = ["8195b6326f748f4da1945364a4e205b9"]
+```
+
+**Remote machine** (`config.toml`): trust the coordinator's install ID, read from the coordinator's `machine.json` in its Herdr config directory. The reverse socket path is derived from this ID and the remote's own install ID (`herdr gram relay-path <coordinator-install-id>` prints it).
+
+```toml
+[gram_relay]
+coordinator_machine_id = "machine_f872cca4c7743d39c1fad1fa5a74a087"
+```
+
+Apply either side with `herdr server reload-config`; no daemon restart is needed and panes and other federation routes stay intact. The coordinator starts the reverse gateway for a newly allowed peer and retries it with backoff until it is up. Check each side with `herdr gram relay-status` (`--json` for scripts): it shows the configured value, whether the legacy environment variable is present, the effective value, its `source` (`config`, `environment`, or `none`), any `error`, each allowed peer's gateway state on the coordinator, and on the remote the socket path and whether it accepts connections. An invalid `[gram_relay]` section (for example a malformed install ID) is refused on reload: the previous effective setting stays in force and status reports `invalid_config`. At startup a config file that does not parse falls back to defaults, which grant nothing.
+
+To roll back, set the key to its explicit empty value and run `herdr server reload-config`: `peers = []` on the coordinator, `coordinator_machine_id = ""` on the remote. On the coordinator the peer's gateway is torn down, its reverse socket closes, and any further relayed request from that peer is rejected; on the remote, Gram returns to the local store. An explicit empty value always grants nothing, even while a legacy environment variable is still set (status then reports `conflict`). Deleting the key also works, but only on a daemon without the legacy variable, because an absent key defers to the variable.
+
+The `HERDR_GRAM_RELAY_PEERS` and `HERDR_GRAM_REVERSE_SOCKET` environment variables are deprecated. A variable counts as set even when it is empty; an empty value grants nothing. A daemon whose config does not set the key honours the variable (`source` is `environment`, with a deprecation warning in the log and in status). When the config key is present and equal to the variable, config wins (`source` is `config`). When they differ (including an empty list or empty ID on one side), that side of the relay is disabled with `error: conflict` until you make them match or start the daemon without the variable. Herdr never widens access by merging them.
+
+The reverse socket is private to the remote account and reconnects with the saved SSH session. While disconnected, remote Gram operations fail instead of silently writing to a second local store. Coordinator-only methods such as `gram post` and `gram grab` also fail explicitly on the remote; run those on the coordinator. Files are staged with the existing size limits, then committed to the coordinator only after their length and SHA-256 match; downloads verify both before atomically replacing the destination. The default credential-shaped download warning scans every chunk; `--reveal` is an explicit override. A deleted source attachment cannot be downloaded, and an interrupted upload leaves only bounded staging that is swept after its expiry.
+
+:::caution[Trusted-machine boundary]
+Another process running as the same user on an enabled remote machine can claim a recipient pane ID and read that pane's Gram files. These controls keep other machines and ordinary wrong-recipient calls out; they are **not** per-process isolation. Enable only machines whose user account you trust.
+:::
+
 ## Keybindings
 
 For a guided introduction to the prefix and a vetted prefix-free setup, see [Keyboard](/docs/keyboard/).
@@ -495,6 +624,8 @@ position = "bottom-right"
 Choose `herdr` for an in-app toast, `terminal` for an outer-terminal notification that also works over SSH, `system` for the local OS notification service, or `off` to disable popups. Herdr suppresses popups for the active tab. Search `ui.toast` in the [Config reference](/docs/config-reference/) for positions, delay behavior, and clipboard feedback settings.
 
 On macOS, `system` tries `terminal-notifier` first and falls back to `/usr/bin/osascript` when it is unavailable or fails. The fallback appears as Script Editor in Notification Center and cannot activate the hosting terminal. Install `terminal-notifier` with `brew install terminal-notifier`. For a supported, detected terminal, it can activate the terminal app when you click the notification. Alternatively, choose `terminal` to let a supported outer terminal own the notification.
+
+On Windows, `system` notifications remain in Notification Center. Clicking one selects its originating pane in the running Herdr client and brings its terminal window forward when Windows exposes that window. A click cannot reopen a closed client or select a pane from a restarted server. Windows Terminal can bring the owning window forward, but cannot reliably select a different outer terminal tab.
 
 ## Sound
 

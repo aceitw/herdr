@@ -5,10 +5,15 @@ use tracing::warn;
 use super::{model::LoadedConfig, Config, CONFIG_PATH_ENV_VAR};
 
 const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
+    "accounts",
     "advanced",
     "experimental",
+    "federation",
+    "gram_relay",
+    "guest",
     "keys",
     "onboarding",
+    "push",
     "remote",
     "server",
     "session",
@@ -119,7 +124,7 @@ fn normalize_utf8_bom(content: &str) -> String {
     normalized
 }
 
-pub(super) fn read_optional_config(path: &Path) -> std::io::Result<Option<String>> {
+pub(crate) fn read_optional_config(path: &Path) -> std::io::Result<Option<String>> {
     match std::fs::read_to_string(path) {
         Ok(content) => Ok(Some(normalize_utf8_bom(&content))),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -375,6 +380,46 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
         &mut invalid_sections,
         |section| config.remote = section,
     );
+    load_live_section(
+        table,
+        "push",
+        "push config",
+        &mut diagnostics,
+        &mut invalid_sections,
+        |section| config.push = section,
+    );
+    load_live_section(
+        table,
+        "federation",
+        "federation config",
+        &mut diagnostics,
+        &mut invalid_sections,
+        |section| config.federation = section,
+    );
+    load_live_section(
+        table,
+        "gram_relay",
+        "gram relay config",
+        &mut diagnostics,
+        &mut invalid_sections,
+        |section| config.gram_relay = section,
+    );
+    load_live_section(
+        table,
+        "guest",
+        "guest config",
+        &mut diagnostics,
+        &mut invalid_sections,
+        |section| config.guest = section,
+    );
+    load_live_section(
+        table,
+        "accounts",
+        "accounts config",
+        &mut diagnostics,
+        &mut invalid_sections,
+        |section| config.accounts = section,
+    );
 
     diagnostics.extend(config.theme.diagnostics());
 
@@ -594,6 +639,81 @@ pub(crate) fn upsert_top_level_bool(content: &str, key: &str, value: bool) -> St
     }
 }
 
+/// Append a new `[[accounts]]` array-of-tables entry to a config.toml body. APPEND-ONLY
+/// — everything above is preserved byte-for-byte (comments included); only a well-formed
+/// block is added at the end, separated by a blank line. String values are TOML-escaped.
+/// Used by `accounts.create`.
+pub fn append_accounts_block(
+    content: &str,
+    id: &str,
+    kind: &str,
+    label: &str,
+    config_dir: &str,
+) -> String {
+    let mut out = content.to_string();
+    if !out.is_empty() {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    out.push_str("[[accounts]]\n");
+    out.push_str(&format!("id = {}\n", toml_basic_string(id)));
+    out.push_str(&format!("kind = {}\n", toml_basic_string(kind)));
+    out.push_str(&format!("label = {}\n", toml_basic_string(label)));
+    out.push_str(&format!("config_dir = {}\n", toml_basic_string(config_dir)));
+    out
+}
+
+/// Quote a value as a TOML basic string, escaping backslashes and double-quotes.
+fn toml_basic_string(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Remove the `[[accounts]]` array-of-tables entry whose `id == account_id` from a
+/// config.toml body, preserving everything else (comments, other accounts, formatting).
+/// A no-op that returns the input unchanged when no entry matches. The block spans from
+/// its `[[accounts]]` header through to (but not including) the next top-level `[`/`[[`
+/// header or EOF — so its trailing blank line goes with it and blanks don't accumulate.
+/// Used by `accounts.remove`.
+pub fn remove_accounts_block(content: &str, account_id: &str) -> String {
+    let lines: Vec<&str> = content.split('\n').collect();
+    let mut out: Vec<&str> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].trim() == "[[accounts]]" {
+            let start = i;
+            let mut j = i + 1;
+            let mut block_id: Option<&str> = None;
+            while j < lines.len() && !lines[j].trim_start().starts_with('[') {
+                if block_id.is_none() {
+                    block_id = accounts_block_id_from_line(lines[j]);
+                }
+                j += 1;
+            }
+            if block_id == Some(account_id) {
+                i = j; // drop [start, j)
+                continue;
+            }
+            out.extend_from_slice(&lines[start..j]);
+            i = j;
+        } else {
+            out.push(lines[i]);
+            i += 1;
+        }
+    }
+    out.join("\n")
+}
+
+/// Parse the `id` value from a `id = "..."` line inside an `[[accounts]]` block.
+fn accounts_block_id_from_line(line: &str) -> Option<&str> {
+    let rest = line.trim_start().strip_prefix("id")?.trim_start();
+    let rest = rest.strip_prefix('=')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(&rest[..end])
+}
+
 /// Write a key = value pair in a TOML section (creates section if missing).
 pub fn upsert_section_value(content: &str, section: &str, key: &str, value: &str) -> String {
     upsert_section_raw(content, section, key, value)
@@ -750,6 +870,72 @@ fn upsert_section_raw(content: &str, section: &str, key: &str, value: &str) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn append_accounts_block_is_append_only_escapes_and_reparses() {
+        let base = "[server]\nheadless_cols = 120\n";
+        let out =
+            append_accounts_block(base, "claude-2", "claude", "My \"Max\"", "/root/.claude-2");
+        assert!(out.starts_with(base), "existing content preserved verbatim");
+        assert!(out.contains("[[accounts]]\n"));
+        assert!(out.contains("id = \"claude-2\"\n"));
+        assert!(out.contains("kind = \"claude\"\n"));
+        assert!(out.contains("config_dir = \"/root/.claude-2\"\n"));
+        assert!(
+            out.contains("label = \"My \\\"Max\\\"\"\n"),
+            "quotes escaped: {out}"
+        );
+        // The result must still be valid TOML with the new account in the array.
+        let parsed: toml::Value = toml::from_str(&out).expect("valid TOML");
+        let accounts = parsed
+            .get("accounts")
+            .and_then(|value| value.as_array())
+            .expect("accounts array");
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(
+            accounts[0].get("id").and_then(|value| value.as_str()),
+            Some("claude-2")
+        );
+    }
+
+    #[test]
+    fn remove_accounts_block_drops_the_matching_entry_and_keeps_the_rest() {
+        let base = "# top comment\n[server]\nheadless_cols = 120\n\n";
+        let with_two = append_accounts_block(
+            &append_accounts_block(base, "keep", "claude", "Keep", "/root/.claude"),
+            "gone",
+            "claude",
+            "Gone",
+            "/root/.claude-2",
+        );
+        let out = remove_accounts_block(&with_two, "gone");
+        assert!(out.contains("# top comment"), "comments preserved");
+        assert!(out.contains("headless_cols = 120"));
+        // still valid TOML with only the kept account.
+        let parsed: toml::Value = toml::from_str(&out).expect("valid TOML");
+        let accounts = parsed
+            .get("accounts")
+            .and_then(|v| v.as_array())
+            .expect("accounts");
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].get("id").and_then(|v| v.as_str()), Some("keep"));
+    }
+
+    #[test]
+    fn remove_accounts_block_is_a_noop_for_an_unknown_id() {
+        let content = append_accounts_block("[server]\n", "a", "claude", "A", "/root/.a");
+        assert_eq!(remove_accounts_block(&content, "nope"), content);
+    }
+
+    #[test]
+    fn append_accounts_block_onto_empty_config() {
+        let out = append_accounts_block("", "a", "claude", "A", "/root/.a");
+        assert!(
+            out.starts_with("[[accounts]]\n"),
+            "no leading blank line on empty input: {out:?}"
+        );
+        assert!(toml::from_str::<toml::Value>(&out).is_ok());
+    }
 
     #[test]
     fn upsert_top_level_bool_replaces_existing_value() {

@@ -84,6 +84,15 @@ Wait for an agent:
 herdr agent wait w1:p1 --until done
 ```
 
+Stage and review a Claude Code/Codex session transfer, then confirm it:
+
+```bash
+herdr agent transfer-session jarvis --to codex --account codex-work
+herdr agent transfer-session jarvis --to codex --account codex-work --confirm <transfer-id>
+```
+
+Use `--yes` for a one-command stage, verify, and confirm flow.
+
 Read pane output:
 
 ```bash
@@ -97,7 +106,9 @@ Raw socket method names use dot notation:
 | Area | Methods |
 | --- | --- |
 | Server | `ping`, `server.stop`, `server.reload_config`, `server.agent_manifests`, `server.reload_agent_manifests` |
-| Notification | `notification.show` |
+| Notification | `notification.show`, `notifications.register_device`, `notifications.unregister_device`, `notifications.status` |
+| Gram | `gram.send`, `gram.post`, `gram.list`, `gram.grab`, `gram.mark_read`, `gram.delete`, `gram.upload_chunk`, `gram.get_file`, `gram.relay_status` |
+| Guest | `guest.invite.create`, `guest.list`, `guest.update`, `guest.revoke`, `guest.audit` (owner only; denied to federation peers and guests) |
 | Client | `client.window_title.set`, `client.window_title.clear` |
 | Session | `session.snapshot` |
 | Workspace | `workspace.create`, `workspace.list`, `workspace.get`, `workspace.focus`, `workspace.rename`, `workspace.move`, `workspace.move_block`, `workspace.report_metadata`, `workspace.close` |
@@ -106,12 +117,28 @@ Raw socket method names use dot notation:
 | Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
 | Popup | `popup.close` |
 | Layout | `layout.export`, `layout.apply`, `layout.set_split_ratio` |
-| Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.wait`, `agent.rename`, `agent.focus`, `agent.start`, `agent.view.set`, `agent.view.clear` |
+| Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.wait`, `agent.rename`, `agent.focus`, `agent.start`, `agent.transfer_session`, `agent.view.set`, `agent.view.clear` |
 | Events | `events.subscribe`, `events.wait` |
 | Integrations | `integration.install`, `integration.uninstall` |
 | Plugins | `plugin.link`, `plugin.list`, `plugin.unlink`, `plugin.enable`, `plugin.disable`, `plugin.action.list`, `plugin.action.invoke`, `plugin.log.list`, `plugin.pane.open`, `plugin.pane.focus`, `plugin.pane.close` |
 
-`agent.wait` is server-owned and event-driven. It pins the resolved pane occupant so a replacement cannot satisfy the wait. `agent.prompt` accepts an optional `wait` object with `until` and `timeout_ms`; this submits the prompt and starts the wait in one request, avoiding a race between separate calls. If the resolved agent is already `blocked`, `agent.prompt` returns `agent_blocked` without sending input or starting the wait.
+`gram.mark_read` takes `id`, `ids` or both, and marks nothing when one of them is unknown. `notifications.unregister_device` takes `{"device_token"}`. `guest.invite.create` accepts `share_gram` (default `false`), and `guest.update {"guest_id", "share_gram"}` turns it on or off for an accepted guest, effective for its next request. `guest.list` shows `share_gram` for each guest and invite. When a host shares the Gram, the guest's `gram.list` (`limit`, `before_id`), `gram.get_file`, `gram.get_file_chunk` and `gram.mark_read` see only the Grams the shared agent sent the owner through `gram.send` from its own terminal (the `caller_pane_id` the server resolves) since the guest accepted, plus the guest's own posts. A `from` label alone never qualifies. Without sharing they answer `guest_forbidden`. Guest read marks are kept apart from the owner's. A guest's `notifications.register_device` and `notifications.unregister_device` manage that guest's own phones. The guest hello reply advertises `"features": {"gram", "push"}`.
+
+On a federation coordinator, `workspace.list` returns local workspaces first, then each outbound peer's own workspaces in that peer's sidebar order. A remote workspace keeps the peer's `number`, `label`, and `focused` value, while `workspace_id` and `active_tab_id` gain the `<alias>/` prefix. `machine_id` (routing alias), `machine_label`, `machine_profile_id`, and `reachability` identify the owner; an unreachable or degraded peer keeps its last-known workspaces with `agent_status: "unknown"` and the real value in `last_known_status`. Set `local_only: true` to omit remote workspaces. `workspace.get`, `tab.get`, and `tab.list` with an `<alias>/…` workspace or tab id are forwarded to that peer, and the reply ids are qualified the same way. An id whose prefix is not a configured alias is resolved locally and returns `workspace_not_found` or `tab_not_found`.
+
+`gram.*` is the owner↔agent message channel. `gram.grab` claims a shared queue item and is first-wins atomic at the storage layer, so no two agents can ever claim the same item — regardless of identity. Sender and claimant identity is the caller's agent name (or pane id if it has no name), resolved from `caller_pane_id`; it is durable across a restart or live-handoff but carries name-semantics: renaming, clearing, or reusing a name changes which items an agent sees as its own in `gram.list`. `gram.list` returns the owner view when `caller_pane_id` is omitted and that pane's agent view otherwise. `gram.list` pages with the optional `limit` (the newest N, clamped to 500) and `before_id` (a cursor: strictly older than that id, which must itself be in the same filtered list, else `invalid_params`); the reply adds `has_more` and an `unread_count` computed over the whole filtered list rather than the page. Conditional fetch is head-only: `if_unchanged_digest` is ignored when `before_id` is present, and the digest always covers the full filtered list. `gram.list` pages with the optional `limit` (the newest N, clamped to 500) and `before_id` (a cursor: strictly older than that id, which must itself be in the same filtered list, else `invalid_params`); the reply adds `has_more` and an `unread_count` computed over the whole filtered list rather than the page. Conditional fetch is head-only: `if_unchanged_digest` is ignored when `before_id` is present, and the digest always covers the full filtered list. Attribution is advisory, not authenticated.
+
+A Gram an agent on a federated machine sends through the Gram relay has `from` set to `<alias>/<name>`. When that machine has a display label, its message objects in `gram.list` (owner and agent views) and in `gram.send` replies also carry `machine_label`, the same label its agents carry in `agent.list`, so a client can show `<machine_label>/<name>`. The label is resolved when the message is read, so it follows a rename and covers older Grams. Local Grams and Grams from an alias with no label omit it. The owner's push for such a Gram names the machine the way remote agent alerts do: "llm-opt on Jerry's Mac Studio".
+
+A message may carry one file. Because a single request is size-capped (near 65 KiB over the app's SSH path, 1 MiB on the local socket), a file is uploaded in chunks with `gram.upload_chunk` (`{upload_id, offset, data_base64}`; `offset` is the byte position this chunk starts at, and `offset: 0` restarts the upload) and then attached by passing that `upload_id` in a `gram.send`/`gram.post` `file` object. `gram.get_file` returns the bytes inline as base64 in one reply (the response path is not size-capped). `gram.delete` removes a message and its file bytes for good. The owner (no `caller_pane_id`) may delete any message; an agent that supplies its caller pane may delete or download only a message it can see (the same audience as `gram.list`). That audience check is **cooperative filtering within the flat local trust domain, not an authenticated boundary** — every local process can already read the store directly, and "owner" is just the absence of a caller pane. Its value for a short-lived secret (a temporary API key) is that deletion genuinely purges the bytes, keeping the secret out of the persistent store once you delete it.
+
+`agent.wait` is server-owned and event-driven. It pins the resolved pane occupant so a replacement cannot satisfy the wait. `agent.prompt` accepts an optional `wait` object with `until` and `timeout_ms`; this combines a prompt write with submission observation and, only after verified submission, a status wait. If the resolved agent is already `blocked`, it returns `agent_blocked` before writing. Successful prompts include `delivery: "written_to_pty"` after a complete text+Enter PTY write, or `delivery: "submitted"` after an attributable lifecycle advance from a settled agent or an observed same-attempt composer clear. A successful `written_to_pty` with `wait` means submission was not verified; the request does not continue waiting for status, and callers must inspect the pane before resending. A persistent same-attempt draft returns `agent_prompt_unsubmitted`; a visible modal returns `agent_input_pending` before any write. Bracketed paste relies on writer provenance rather than rendered token text.
+
+If submission was confirmed but a requested status is not observed by the deadline, the error is `agent_status_unobserved_after_submit`; the prompt was submitted, so clients must not resend it. A direct transition to a requested settled status is accepted without requiring a sampled `working` frame.
+
+`agent.transfer_session` supports bidirectional native-session transfer among Claude Code, Codex, and OMP on the local server. The first request supplies `target`, `to`, and optional target `account`; it parses the source once, creates a native destination session, rereads the actual destination JSONL, and leaves the source running with phase `ready`. Review `message_count`, `omissions`, and the echoed `target_account` in the returned agent's `session_transfer`, then repeat the request with the same target fields plus `transfer_id` and `confirm: true`. Herdr rechecks both transcript fingerprints before replacing the runtime. Claude must report the exact staged session through its official integration. Codex 0.150.1 defers that report until the first prompt, so a Codex target may instead complete when Herdr verifies the native destination JSONL and an exact `codex resume <session-id>` process, recording the selected PID. OMP sources and targets require the current official integration, which reports the canonical session path, selected tree leaf, and exact process PID; Herdr verifies that leaf's visible branch and the reported foreground OMP process. The bounded observation window can reveal an interactive blocker but is not the proof gate: verified content proceeds when the window expires, while a content mismatch rolls back even if the process looks ready. Comparison requires the same visible roles, order, and text, while allowing provider metadata, JSON field ordering, non-visible record ordering, and CRLF JSONL line endings. A later official report must still match the accepted target identity. Any blocker, exit, timeout, content mismatch, or identity mismatch restores the original harness, session, account, name, label, and working directory. The method is intentionally unavailable over federation because it has selected-account filesystem authority.
+
+`pane.get` returns an additive `composer` object with `state` (`empty`, `draft_present`, or `unknown`), optional `attempt_id`, and provenance, region, cursor, style, and frame-stability evidence. Suggestion text drawn by a hosted CLI is not a draft because it lacks writer provenance and is strictly right of the cursor. Region-not-found, mid-repaint, conflicting evidence, and old responses without the object resolve to `unknown`, not `empty`. Style is only a tripwire that can downgrade confidence.
 
 `workspace.move_block` atomically moves the ordered `workspace_ids` before `before_workspace_id`; omit the anchor to move the block to the end. The ids must be unique and the anchor cannot be part of the block. The response contains the authoritative ordered workspace list.
 
@@ -722,6 +749,8 @@ If no native session reference is stored, the field is omitted.
 
 `PaneInfo` and `AgentInfo` expose optional `terminal_title` and `terminal_title_stripped` fields. `terminal_title` is the latest OSC 0/2 title after safety normalization. `terminal_title_stripped` removes one recognized leading activity or spinner glyph and following whitespace. These server-owned values are ephemeral across a cold restart and are independent of the metadata `title` and semantic agent state.
 
+Those records also expose modal input independently of lifecycle state. `input_pending: true` is paired with `input_prompt_kind` (`confirm`, `select`, `free_text`, or `unknown`); both fields are omitted when no modal is present. `pane.agent_status_changed` carries the same tuple and emits on input-only changes even when `agent_status` is unchanged. Unfiltered subscriptions provide this orthogonal transition stream, and `pane.get` / `agent.get` recover current state after reconnecting.
+
 Use `pane.report_metadata` when a user hook wants to customize presentation without taking over lifecycle state from a Herdr integration.
 
 ```json
@@ -787,18 +816,22 @@ Subscribe to events when you need a long-lived stream:
 The first response acknowledges the subscription. Later lines are pushed events.
 All entries must be valid: if any referenced pane does not exist, Herdr rejects
 the entire request with an error and closes the connection. Refresh the pane list
-and retry rather than assuming the other entries were subscribed.
+and retry rather than assuming the other entries were subscribed. Requests with
+`events_v2` skip such entries instead (see below).
 Lifecycle subscriptions start when the request is accepted and do not replay
 events retained before that point.
 
 Lifecycle and agent-status events are drained in bounded batches, in order within
-each subscription. Event history is not durable. If a subscriber falls behind
-the retained history, including while its subscriptions are being initialized,
-the server sends an error response with the original request `id` and
-`error.code: "events_lost"`, then closes that subscription connection instead of
-silently continuing with missing events. Other clients remain connected.
-The history is shared across event types, so an overrun is reported even when
-the evicted events might not have matched this subscription's filters.
+each subscription, so bursts are delivered in full. Event history is not
+durable. If a subscriber without `events_v2` falls behind the retained history,
+including while its subscriptions are being initialized, the server sends an
+error response with the original request `id` and `error.code: "events_lost"`,
+then closes that subscription connection instead of silently continuing with
+missing events. Other clients remain connected. The history is shared across
+event types, so an overrun is reported even when the evicted events might not
+have matched this subscription's filters. Subscribers that request
+`events_v2` receive a `lagged` control line instead and the stream stays open
+(see below).
 
 On `events_lost`, treat the cached state as stale. Open a new subscription,
 wait for `subscription_started`, and keep reading while requesting
@@ -837,6 +870,83 @@ an authoritative read; a delayed payload may predate their latest snapshot.
 Worktree event subscriptions include `worktree.created`, `worktree.opened`, and `worktree.removed`. Worktree events describe Git checkout lifecycle. `worktree.created` includes the opened `workspace` and created `worktree`. `worktree.opened` includes the target `workspace`, opened `worktree`, and `already_open`. `worktree.removed` includes the `workspace_id`, removed `worktree`, and `forced`.
 
 Use `events.subscribe` for lifecycle events. Dedicated wait helpers are documented separately when a one-shot wait is supported.
+
+### Sequence numbers, all-pane status and events v2
+
+Every event line carries `seq`, the server's event sequence number. It never
+decreases along a stream and restarts when the server restarts. Lines for hub
+events carry that event's number; lines Herdr derives from pane state (an
+initial status, a snapshot status change, `pane.output_matched`,
+`pane.scroll_changed`) carry the sequence the stream had read through, so
+several lines can share a number. Each poll delivers every matching event, in
+server order, across all entries of the request.
+
+`pane.agent_status_changed` and `pane.turn_completed` accept an omitted
+`pane_id`, which watches every pane, including panes created after the
+subscription started. `agent_status` still filters. An all-pane status
+subscription reports status changes that have no server event of their own,
+such as `done` becoming `idle` when a pane is seen, within about a second; a
+pane that appears later reports its later transitions but not its first state.
+
+Servers that advertise `capabilities.events_v2` in `ping` also accept
+`"events_v2": true` next to `subscriptions`. Older servers ignore the field. It
+changes three things for that request only:
+
+- Entries whose pane does not exist are skipped instead of failing the whole
+  request. The acknowledgement lists them as
+  `"rejected": [{ "index": 1, "error": { "code": "pane_not_found", "message": "…" } }]`.
+- If the stream fell so far behind that the server discarded events it had not
+  delivered, Herdr writes
+  `{ "control": "lagged", "seq": 904, "first_missed_seq": 1, "last_missed_seq": 904 }`
+  and keeps the stream open instead of failing it with `events_lost`.
+  Resynchronize from `session.snapshot` or `agent.list`.
+- A stream with nothing to deliver for 15 seconds writes
+  `{ "control": "heartbeat", "seq": 904 }`.
+
+Without `events_v2`, streams never contain `control` lines, a missing pane still
+fails the request, and a stream that falls behind the retained history ends with
+`events_lost` as described above.
+
+### Remote events on a coordinator
+
+A federation coordinator relays each outbound peer's events into its own
+stream, so a local subscriber receives remote changes the same way it receives
+local ones, usually within a second. Every id in a relayed event gains the
+peer's `<alias>/` prefix: pane, terminal, workspace and tab ids, including those
+inside pane, workspace, tab, worktree and layout snapshots. Workspace and tab
+snapshots carry the coordinator's `machine_id`, `machine_label` and
+`machine_profile_id`. Relayed events get the coordinator's `seq` numbers, not
+the peer's.
+
+All-pane `pane.agent_status_changed` and `pane.turn_completed` entries include
+remote panes automatically. An entry can also name one remote pane, for example
+`"pane_id": "build/w1:p2"`. Its initial state comes from the coordinator's
+cached `agent.list` entry for that pane. An unknown alias or pane fails with
+`pane_not_found`, or is listed in `rejected` with `events_v2`.
+
+Relaying needs a peer that advertises `capabilities.events_v2` and, when the
+peer's machine ID is pinned, a validated identity. Other peers keep the
+5-second `agent.list` poll only: their changes show up in `agent.list` but
+produce no events. After a reconnect, or a `lagged` line from the peer, the
+coordinator compares a fresh `agent.list` with what it already relayed and
+emits each missed status change once. After a peer restart it emits the
+current status of every pane on that peer.
+
+Set `"local_only": true` to leave out the events a server relays from its own
+peers. A coordinator sets it on its relay stream, so a peer that is itself a
+coordinator never re-exports a third machine's events. Older servers ignore
+the field; they have no relayed events to leave out.
+
+Devices registered with `notifications.register_device` also get push
+notifications for remote agents, per their needs-you, finished and exited
+preferences. The title names the machine, for example `llm-opt on Jerry's Mac
+Studio needs attention`, and the alert carries the `<alias>/`-qualified pane
+id, so `muted_panes` mutes a remote pane by that id. Each transition is pushed
+once: a repeated relayed event, a resync, or a poll that repeats a known
+status sends nothing. Peers without `events_v2` notify from the 5-second poll.
+An agent pane that a reachable peer stops listing counts as exited, so an exit
+lost while a peer was offline still alerts once. The Live Activity counts the
+agents on reachable peers with the local ones.
 
 ## Reading panes
 

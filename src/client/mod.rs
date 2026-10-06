@@ -411,6 +411,74 @@ fn graphics_owner_is_active(
 /// - stdin reader thread → sends raw input bytes to main loop
 /// - resize poller thread → sends resize events to main loop
 /// - server reader thread → reads ServerMessages and sends to main loop
+fn report_endpoint_runtime_status(
+    stream: &mut impl ClientMessageSink,
+    endpoint_id: &endpoint::ClientEndpointId,
+    status: endpoint::ClientEndpointStatus,
+) -> std::io::Result<()> {
+    let endpoint::ClientEndpointId::Ssh(profile_id) = endpoint_id else {
+        return Ok(());
+    };
+    use crate::protocol::endpoint::{EndpointRuntimeStatus, EndpointRuntimeStatusReport};
+    let status = match status {
+        endpoint::ClientEndpointStatus::Connecting => EndpointRuntimeStatus::Connecting,
+        endpoint::ClientEndpointStatus::Online => EndpointRuntimeStatus::Online,
+        endpoint::ClientEndpointStatus::Reconnecting => EndpointRuntimeStatus::Reconnecting,
+        endpoint::ClientEndpointStatus::Attention => EndpointRuntimeStatus::Attention,
+        endpoint::ClientEndpointStatus::Disabled => EndpointRuntimeStatus::Disabled,
+    };
+    let report = EndpointRuntimeStatusReport {
+        profile_id: profile_id.to_string(),
+        status,
+    };
+    stream.send_local_client_message(&crate::protocol::ClientMessage::EndpointControl {
+        kind: crate::protocol::endpoint::ENDPOINT_RUNTIME_STATUS_KIND.into(),
+        data: serde_json::to_string(&report).map_err(std::io::Error::other)?,
+    })
+}
+
+#[cfg(test)]
+mod endpoint_runtime_status_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct Sink(Option<ClientMessage>);
+
+    impl ClientMessageSink for Sink {
+        fn send_client_message(&mut self, message: &ClientMessage) -> std::io::Result<()> {
+            self.0 = Some(message.clone());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn ssh_endpoint_status_is_reported_to_the_local_daemon() {
+        let profile = endpoint::SavedSshEndpoint::new("Build", "dev@build", "agent-work").unwrap();
+        let mut sink = Sink::default();
+        report_endpoint_runtime_status(
+            &mut sink,
+            &endpoint::ClientEndpointId::Ssh(profile.id.clone()),
+            endpoint::ClientEndpointStatus::Online,
+        )
+        .unwrap();
+
+        let Some(ClientMessage::EndpointControl { kind, data }) = sink.0 else {
+            panic!("expected endpoint runtime status control message");
+        };
+        assert_eq!(
+            kind,
+            crate::protocol::endpoint::ENDPOINT_RUNTIME_STATUS_KIND
+        );
+        let report: crate::protocol::endpoint::EndpointRuntimeStatusReport =
+            serde_json::from_str(&data).unwrap();
+        assert_eq!(report.profile_id, profile.id.to_string());
+        assert_eq!(
+            report.status,
+            crate::protocol::endpoint::EndpointRuntimeStatus::Online
+        );
+    }
+}
+
 /// - main loop: coordinates input, output, and server communication
 async fn run_client_loop(
     initial: Option<(LocalStream, handshake::HandshakeResult)>,
@@ -1178,6 +1246,31 @@ async fn run_client_loop(
                 }
                 // Direct terminal attach is Unix-only; every Windows client uses ClientShell.
             }
+            #[cfg(windows)]
+            ClientLoopEvent::NotificationActivated(target) => {
+                if let Some(shell) = state.shell.as_mut() {
+                    let outcome = shell.activate_system_notification(target);
+                    if !outcome.actions.is_empty() {
+                        crate::platform::foreground_desktop_notification_host();
+                    }
+                    let frame = outcome
+                        .repaint
+                        .then(|| shell.compose(state.reported_size.0, state.reported_size.1))
+                        .flatten();
+                    if finish_client_shell_input(
+                        &mut state,
+                        outcome,
+                        frame,
+                        &mut write_stream,
+                        &mut pending_activation,
+                        &mut endpoint_commands,
+                        &mut prefix_input_source,
+                        &mut scheduled_activation,
+                    )? {
+                        return Ok(());
+                    }
+                }
+            }
             ClientLoopEvent::TerminalUnavailable(err) => {
                 info!(err = %err, "client terminal unavailable; detaching");
                 let _ = write_to_server(&mut write_stream, &ClientMessage::Detach);
@@ -1258,6 +1351,11 @@ async fn run_client_loop(
                     if !supervisors.record_status(&endpoint_id, generation, status, now) {
                         continue;
                     }
+                    if let Err(error) =
+                        report_endpoint_runtime_status(&mut write_stream, &endpoint_id, status)
+                    {
+                        debug!(%error, endpoint = %endpoint_id.storage_key(), "endpoint status report deferred until Local reconnects");
+                    }
                     if status == endpoint::ClientEndpointStatus::Attention {
                         warn!(endpoint = %endpoint_id.storage_key(), generation, error = %message, "endpoint needs attention");
                     }
@@ -1313,6 +1411,23 @@ async fn run_client_loop(
                         negotiation,
                         false,
                     );
+                    let statuses = if endpoint_id.is_local() {
+                        state
+                            .shell
+                            .as_ref()
+                            .map_or_else(Vec::new, |shell| shell.endpoint_runtime_statuses())
+                    } else {
+                        vec![(endpoint_id.clone(), endpoint::ClientEndpointStatus::Online)]
+                    };
+                    for (status_endpoint_id, status) in statuses {
+                        if let Err(error) = report_endpoint_runtime_status(
+                            &mut write_stream,
+                            &status_endpoint_id,
+                            status,
+                        ) {
+                            debug!(%error, endpoint = %status_endpoint_id.storage_key(), "endpoint status report deferred until Local reconnects");
+                        }
+                    }
                     if let Some(frame) = frame {
                         state.present_frame(frame);
                     }
@@ -1744,7 +1859,12 @@ async fn run_client_loop(
                                     .flatten();
                                 (effects, frame)
                             };
-                            handle_shell_notification_effects(effects, &state.sound_config);
+                            handle_shell_notification_effects(
+                                effects,
+                                &state.sound_config,
+                                #[cfg(windows)]
+                                &event_tx,
+                            );
                             if let Some(frame) = frame {
                                 state.present_frame(frame);
                             }
@@ -2199,6 +2319,13 @@ async fn run_client_loop(
                             &host_sgr_pixels_active,
                         );
                     }
+                    if let Err(error) = report_endpoint_runtime_status(
+                        &mut write_stream,
+                        &failure.endpoint_id,
+                        endpoint::ClientEndpointStatus::Reconnecting,
+                    ) {
+                        debug!(%error, endpoint = %failure.endpoint_id.storage_key(), "endpoint status report deferred until Local reconnects");
+                    }
                 }
                 // A revoked transport changes the safe rollback destination. Handle those
                 // failures before applying a timeout to the remaining activation phase.
@@ -2257,7 +2384,12 @@ async fn run_client_loop(
                             .flatten();
                         (effects, outcome, frame)
                     };
-                    handle_shell_notification_effects(effects, &state.sound_config);
+                    handle_shell_notification_effects(
+                        effects,
+                        &state.sound_config,
+                        #[cfg(windows)]
+                        &event_tx,
+                    );
                     if finish_client_shell_input(
                         &mut state,
                         outcome,

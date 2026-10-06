@@ -1,9 +1,11 @@
 use std::time::{Duration, Instant};
 
 use crate::api::schema::{
-    AgentPromptParams, AgentPromptWaitOptions, AgentReadParams, AgentRenameParams,
-    AgentSendKeysParams, AgentStartParams, AgentTarget, AgentWaitParams, EmptyParams, ErrorBody,
-    ErrorResponse, Method, PaneProcessInfoParams, PaneTarget, ReadFormat, ReadSource, Request,
+    AgentArchiveParams, AgentForgetParams, AgentListParams, AgentPromptParams,
+    AgentPromptWaitOptions, AgentReadParams, AgentRenameParams, AgentRestartParams,
+    AgentSendKeysParams, AgentSessionTransferHarness, AgentStartParams, AgentTarget,
+    AgentTransferSessionParams, AgentUnarchiveParams, AgentWaitParams, ErrorBody, ErrorResponse,
+    Method, PaneProcessInfoParams, PaneTarget, ReadFormat, ReadSource, Request,
 };
 
 const AGENT_START_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -17,15 +19,22 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
 
     match subcommand {
         "list" => agent_list(&args[1..]),
+        "federated-list" => federated_agent_command(&args[1..], false),
+        "federated-prompt" => federated_agent_command(&args[1..], true),
         "get" => agent_get(&args[1..]),
         "read" => agent_read(&args[1..]),
         "send-keys" => agent_send_keys(&args[1..]),
         "prompt" => agent_prompt(&args[1..]),
         "rename" => agent_rename(&args[1..]),
+        "archive" => agent_archive(&args[1..]),
+        "unarchive" => agent_unarchive(&args[1..]),
+        "forget" => agent_forget(&args[1..]),
         "focus" => agent_focus(&args[1..]),
         "wait" => agent_wait(&args[1..]),
         "attach" => agent_attach(&args[1..]),
         "start" => agent_start(&args[1..]),
+        "restart" => agent_restart(&args[1..]),
+        "transfer-session" => agent_transfer_session(&args[1..]),
         "explain" => agent_explain(&args[1..]),
         "help" | "--help" | "-h" => {
             print_agent_help();
@@ -288,7 +297,7 @@ fn matched_rule_region_preview<'a>(
 
 fn agent_start(args: &[String]) -> std::io::Result<i32> {
     let Some(name) = args.first() else {
-        eprintln!("usage: herdr agent start <name> --kind KIND --pane ID [--timeout MS] [-- <agent-args...>]");
+        eprintln!("usage: herdr agent start <name> --kind KIND --pane ID [--timeout MS] [--account ID] [-- <agent-args...>]");
         return Ok(2);
     };
     let separator = args
@@ -298,6 +307,7 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
     let mut kind = None;
     let mut pane_id = None;
     let mut timeout_ms = None;
+    let mut account = None;
     let mut index = 1;
     while index < separator {
         match args[index].as_str() {
@@ -326,6 +336,14 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
                     Ok(timeout_ms) => Some(timeout_ms),
                     Err(exit_code) => return Ok(exit_code),
                 };
+                index += 2;
+            }
+            "--account" => {
+                let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
+                    eprintln!("missing value for --account");
+                    return Ok(2);
+                };
+                account = Some(value.clone());
                 index += 2;
             }
             other => {
@@ -377,6 +395,7 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
                 pane_id: pane_id.clone(),
                 args: agent_args.clone(),
                 timeout_ms,
+                account: account.clone(),
             }),
         })?;
         if response.get("error").is_none() {
@@ -435,16 +454,111 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
     }
 }
 
+/// Validate `agent list` flags. `--json` is accepted as a no-op — bare
+/// `agent list` already emits JSON via `print_response`, so the flag only makes
+/// the documented contract copy-safe. Any other argument is rejected. Returns
+/// the exit code to surface on rejection.
+fn parse_agent_list_args(args: &[String]) -> Result<(), i32> {
+    for arg in args {
+        match arg.as_str() {
+            "--json" => {}
+            other => {
+                eprintln!("unknown option: {other}");
+                return Err(2);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn agent_list(args: &[String]) -> std::io::Result<i32> {
-    if !args.is_empty() {
-        eprintln!("usage: herdr agent list");
-        return Ok(2);
+    if let Err(code) = parse_agent_list_args(args) {
+        return Ok(code);
     }
 
     super::print_response(&super::send_request(&Request {
         id: "cli:agent:list".into(),
-        method: Method::AgentList(EmptyParams::default()),
+        method: Method::AgentList(AgentListParams::default()),
     })?)
+}
+
+/// Explicit trusted-machine reverse request. The pane id is supplied by the
+/// caller, not OS-attested; a malicious same-user process can spoof it.
+fn federated_agent_command(args: &[String], prompt: bool) -> std::io::Result<i32> {
+    let coordinator = crate::config::Config::load()
+        .config
+        .federation
+        .reverse_coordinator_machine_id;
+    let Some(coordinator) = coordinator else {
+        eprintln!("reverse federation disabled: set federation.reverse_coordinator_machine_id to the trusted coordinator's pinned install id");
+        return Ok(1);
+    };
+    let mut caller = std::env::var("HERDR_PANE_ID").ok();
+    let mut positional = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == "--caller-pane" {
+            let Some(value) = args.get(index + 1) else {
+                eprintln!("--caller-pane requires a live local agent pane or terminal id");
+                return Ok(2);
+            };
+            caller = Some(value.clone());
+            index += 2;
+        } else {
+            positional.push(args[index].as_str());
+            index += 1;
+        }
+    }
+    let Some(caller) = caller.filter(|caller| !caller.is_empty()) else {
+        eprintln!("HERDR_PANE_ID (or --caller-pane) is required; same-user processes can spoof opted-in pane identities");
+        return Ok(2);
+    };
+    let method = match (prompt, positional.as_slice()) {
+        (false, []) => crate::api::reverse_agents::ReverseMethod::AgentList,
+        (true, [target, text]) => crate::api::reverse_agents::ReverseMethod::AgentPrompt {
+            target: (*target).to_owned(),
+            text: (*text).to_owned(),
+        },
+        _ => {
+            eprintln!("usage: herdr agent federated-list [--caller-pane ID]\n       herdr agent federated-prompt <terminal-id-from-federated-list> <text> [--caller-pane ID]");
+            return Ok(2);
+        }
+    };
+    let roster = match crate::api::client::ApiClient::local().request(Request {
+        id: "cli:agent:federated:caller".into(),
+        method: Method::AgentList(AgentListParams { local_only: true }),
+    }) {
+        Ok(roster) => roster,
+        Err(error) => {
+            eprintln!("cannot verify live local caller: {error}");
+            return Ok(1);
+        }
+    };
+    let crate::api::schema::ResponseResult::AgentList { agents, .. } = roster.result else {
+        eprintln!("local agent roster unavailable");
+        return Ok(1);
+    };
+    let mut matches = agents.into_iter().filter(|agent| {
+        (agent.pane_id == caller || agent.terminal_id == caller)
+            && agent.machine_id.is_none()
+            && agent.archived.is_none()
+    });
+    let Some(agent) = matches.next() else {
+        eprintln!("caller is not a live local agent pane or terminal");
+        return Ok(1);
+    };
+    if matches.next().is_some() {
+        eprintln!("caller identity is ambiguous");
+        return Ok(1);
+    }
+    let caller = agent.terminal_id;
+    match crate::api::reverse_agents::request_remote(&coordinator, caller, method) {
+        Ok(response) => super::print_response(&response),
+        Err(error) => {
+            eprintln!("reverse federation failed: {error}");
+            Ok(1)
+        }
+    }
 }
 
 fn agent_get(args: &[String]) -> std::io::Result<i32> {
@@ -481,6 +595,331 @@ fn agent_focus(args: &[String]) -> std::io::Result<i32> {
             target: target.clone(),
         }),
     })?)
+}
+
+fn agent_restart(args: &[String]) -> std::io::Result<i32> {
+    const USAGE: &str = "usage: herdr agent restart <target> [--account <id>]";
+    let Some(target) = args.first() else {
+        eprintln!("{USAGE}");
+        return Ok(2);
+    };
+    let mut account = None;
+    let mut rest = args[1..].iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--account" => {
+                let Some(value) = rest.next() else {
+                    eprintln!("{USAGE}");
+                    return Ok(2);
+                };
+                account = Some(value.clone());
+            }
+            _ => {
+                eprintln!("{USAGE}");
+                return Ok(2);
+            }
+        }
+    }
+
+    super::print_response(&super::send_request(&Request {
+        id: "cli:agent:restart".into(),
+        method: Method::AgentRestart(AgentRestartParams {
+            target: target.clone(),
+            account,
+        }),
+    })?)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct AgentTransferCliArgs {
+    target: String,
+    to: AgentSessionTransferHarness,
+    account: Option<String>,
+    confirm: Option<String>,
+    yes: bool,
+}
+
+fn parse_agent_transfer_args(args: &[String]) -> Result<AgentTransferCliArgs, i32> {
+    const USAGE: &str = "usage: herdr agent transfer-session <target> --to claude|codex|omp [--account <id>] [--yes | --confirm <transfer-id>]";
+    let Some(target) = args.first() else {
+        eprintln!("{USAGE}");
+        return Err(2);
+    };
+    let mut to = None;
+    let mut account = None;
+    let mut confirm = None;
+    let mut yes = false;
+    let mut rest = args[1..].iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--to" => {
+                let Some(value) = rest.next() else {
+                    eprintln!("{USAGE}");
+                    return Err(2);
+                };
+                to = match value.as_str() {
+                    "claude" => Some(AgentSessionTransferHarness::Claude),
+                    "codex" => Some(AgentSessionTransferHarness::Codex),
+                    "omp" => Some(AgentSessionTransferHarness::Omp),
+                    _ => {
+                        eprintln!("{USAGE}");
+                        return Err(2);
+                    }
+                };
+            }
+            "--account" => {
+                let Some(value) = rest.next() else {
+                    eprintln!("{USAGE}");
+                    return Err(2);
+                };
+                account = Some(value.clone());
+            }
+            "--confirm" => {
+                let Some(value) = rest.next() else {
+                    eprintln!("{USAGE}");
+                    return Err(2);
+                };
+                confirm = Some(value.clone());
+            }
+            "--yes" => yes = true,
+            "help" | "--help" | "-h" => {
+                eprintln!("{USAGE}");
+                return Err(0);
+            }
+            _ => {
+                eprintln!("{USAGE}");
+                return Err(2);
+            }
+        }
+    }
+    let Some(to) = to else {
+        eprintln!("{USAGE}");
+        return Err(2);
+    };
+    if confirm.is_some() && yes {
+        eprintln!("{USAGE}");
+        return Err(2);
+    }
+    Ok(AgentTransferCliArgs {
+        target: target.clone(),
+        to,
+        account,
+        confirm,
+        yes,
+    })
+}
+
+fn agent_transfer_session(args: &[String]) -> std::io::Result<i32> {
+    let parsed = match parse_agent_transfer_args(args) {
+        Ok(parsed) => parsed,
+        Err(code) => return Ok(code),
+    };
+    if let Some(transfer_id) = parsed.confirm {
+        let response = super::send_request(&Request {
+            id: "cli:agent:transfer-session:confirm".into(),
+            method: Method::AgentTransferSession(AgentTransferSessionParams {
+                target: parsed.target.clone(),
+                to: parsed.to,
+                account: parsed.account,
+                transfer_id: Some(transfer_id),
+                confirm: true,
+            }),
+        })?;
+        return wait_for_session_transfer_outcome(&parsed.target, response);
+    }
+
+    let mut response = super::send_request(&Request {
+        id: "cli:agent:transfer-session:prepare".into(),
+        method: Method::AgentTransferSession(AgentTransferSessionParams {
+            target: parsed.target.clone(),
+            to: parsed.to,
+            account: parsed.account.clone(),
+            transfer_id: None,
+            confirm: false,
+        }),
+    })?;
+    if response.get("error").is_some() {
+        return super::print_response(&response);
+    }
+    let poll_target = session_transfer_poll_target(&response, &parsed.target);
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let transfer = response
+            .pointer("/result/agent/session_transfer")
+            .and_then(serde_json::Value::as_object);
+        let phase = transfer
+            .and_then(|transfer| transfer.get("phase"))
+            .and_then(serde_json::Value::as_str);
+        match phase {
+            Some("ready") => {
+                let message_count = transfer
+                    .and_then(|transfer| transfer.get("message_count"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                let transfer_id = transfer
+                    .and_then(|transfer| transfer.get("id"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                // History left behind, if the transcript was larger than the
+                // transfer window. Reported separately from the record-class
+                // omissions because it is the only one that costs the user
+                // something they might not accept.
+                let dropped = windowed_records_of(transfer);
+                match staged_transfer_decision(parsed.yes, dropped) {
+                    StagedDecision::ReportAndWait { lossy } => {
+                        eprintln!(
+                            "staged {message_count} visible messages; source is still running. Re-run with --confirm <transfer-id> to cut over"
+                        );
+                        if lossy {
+                            eprintln!(
+                                "LOSSY: the transcript exceeded the transfer window, so the {dropped} OLDEST records are NOT being transferred. Only the most recent history moves."
+                            );
+                        }
+                        return super::print_response(&response);
+                    }
+                    StagedDecision::RefuseLossyYes => {
+                        eprintln!(
+                            "refusing --yes: this transfer would drop the {dropped} oldest records (the transcript exceeds the transfer window). Re-run without --yes to see what is lost, then --confirm <transfer-id> to accept it."
+                        );
+                        return super::print_response(&response).map(|_| 1);
+                    }
+                    StagedDecision::Confirm => {}
+                }
+                let Some(transfer_id) = transfer_id else {
+                    eprintln!("session transfer became ready without a transfer id");
+                    return Ok(1);
+                };
+                let response = super::send_request(&Request {
+                    id: "cli:agent:transfer-session:confirm".into(),
+                    method: Method::AgentTransferSession(AgentTransferSessionParams {
+                        target: parsed.target.clone(),
+                        to: parsed.to,
+                        account: parsed.account,
+                        transfer_id: Some(transfer_id),
+                        confirm: true,
+                    }),
+                })?;
+                return wait_for_session_transfer_outcome(&poll_target, response);
+            }
+            Some("failed" | "rolled_back") => {
+                println!("{response}");
+                return Ok(1);
+            }
+            Some("completed") => return super::print_response(&response),
+            _ => {}
+        }
+        if Instant::now() >= deadline {
+            eprintln!("timed out waiting for the staged session transfer");
+            println!("{response}");
+            return Ok(1);
+        }
+        std::thread::sleep(AGENT_START_POLL_INTERVAL);
+        response = super::send_request(&Request {
+            id: "cli:agent:transfer-session:poll".into(),
+            method: Method::AgentGet(AgentTarget {
+                target: poll_target.clone(),
+            }),
+        })?;
+        if response.get("error").is_some() && !session_transfer_poll_may_retry(&response) {
+            return super::print_response(&response);
+        }
+    }
+}
+
+fn session_transfer_poll_target(response: &serde_json::Value, fallback: &str) -> String {
+    response
+        .pointer("/result/agent/pane_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(fallback)
+        .to_string()
+}
+
+/// What to do with a staged transfer, given `--yes` and how much history it drops.
+///
+/// EXTRACTED SO THE REFUSAL IS TESTABLE. The previous test exercised only the field
+/// lookup, so deleting the lossy `--yes` refusal, inverting it, or dropping the warning
+/// all left it green — review round 3, and the fourth test in this PR that could not
+/// reach what it claimed to protect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StagedDecision {
+    /// Print the staging summary and stop, so a person decides. `lossy` adds the
+    /// warning naming what is being left behind.
+    ReportAndWait { lossy: bool },
+    /// `--yes` was passed but the transfer would discard history. Refuse: the flag
+    /// exists to skip a confirmation nobody needed to read, and this is one they do.
+    RefuseLossyYes,
+    /// `--yes` on a lossless transfer — confirm immediately, as asked.
+    Confirm,
+}
+
+fn staged_transfer_decision(yes: bool, dropped_records: u64) -> StagedDecision {
+    match (yes, dropped_records > 0) {
+        (false, lossy) => StagedDecision::ReportAndWait { lossy },
+        (true, true) => StagedDecision::RefuseLossyYes,
+        (true, false) => StagedDecision::Confirm,
+    }
+}
+
+/// How many records a staged transfer is leaving behind.
+///
+/// Extracted so the FIELD PATH is testable. A typo anywhere in it makes this
+/// silently return 0, which reads as "nothing was dropped" — so `--yes` would wave
+/// a lossy transfer through and staging would print no warning, with nothing
+/// anywhere reporting a fault. The failure is invisible in exactly the direction
+/// that costs the user history.
+fn windowed_records_of(transfer: Option<&serde_json::Map<String, serde_json::Value>>) -> u64 {
+    transfer
+        .and_then(|transfer| transfer.get("omissions"))
+        .and_then(|omissions| omissions.get("windowed_records"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+}
+
+fn wait_for_session_transfer_outcome(
+    target: &str,
+    mut response: serde_json::Value,
+) -> std::io::Result<i32> {
+    if response.get("error").is_some() {
+        return super::print_response(&response);
+    }
+    let target = session_transfer_poll_target(&response, target);
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let phase = response
+            .pointer("/result/agent/session_transfer/phase")
+            .and_then(serde_json::Value::as_str);
+        match phase {
+            Some("completed") => return super::print_response(&response),
+            Some("failed" | "rolled_back") => {
+                println!("{response}");
+                return Ok(1);
+            }
+            _ => {}
+        }
+        if Instant::now() >= deadline {
+            eprintln!("timed out waiting for the target harness to verify its session");
+            println!("{response}");
+            return Ok(1);
+        }
+        std::thread::sleep(AGENT_START_POLL_INTERVAL);
+        response = super::send_request(&Request {
+            id: "cli:agent:transfer-session:cutover-poll".into(),
+            method: Method::AgentGet(AgentTarget {
+                target: target.clone(),
+            }),
+        })?;
+        if response.get("error").is_some() && !session_transfer_poll_may_retry(&response) {
+            return super::print_response(&response);
+        }
+    }
+}
+
+fn session_transfer_poll_may_retry(response: &serde_json::Value) -> bool {
+    response
+        .pointer("/error/code")
+        .and_then(serde_json::Value::as_str)
+        == Some("agent_not_found")
 }
 
 fn agent_attach(args: &[String]) -> std::io::Result<i32> {
@@ -774,6 +1213,127 @@ fn agent_rename(args: &[String]) -> std::io::Result<i32> {
     })?)
 }
 
+fn agent_archive(args: &[String]) -> std::io::Result<i32> {
+    const USAGE: &str = "usage: herdr agent archive <target> [--reason TEXT] [--by WHO] [--parked-work FILE] [--force] [--json]";
+    let Some(target) = args.first().filter(|arg| !arg.starts_with('-')) else {
+        eprintln!("{USAGE}");
+        return Ok(2);
+    };
+    let mut reason = None;
+    let mut by = None;
+    let mut parked_work = Vec::new();
+    let mut force = false;
+    let mut rest = args[1..].iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--reason" => {
+                let Some(value) = rest.next() else {
+                    eprintln!("{USAGE}");
+                    return Ok(2);
+                };
+                reason = Some(value.clone());
+            }
+            "--by" => {
+                let Some(value) = rest.next() else {
+                    eprintln!("{USAGE}");
+                    return Ok(2);
+                };
+                by = Some(value.clone());
+            }
+            "--parked-work" => {
+                let Some(path) = rest.next() else {
+                    eprintln!("{USAGE}");
+                    return Ok(2);
+                };
+                let content = std::fs::read_to_string(path)?;
+                match serde_json::from_str::<serde_json::Value>(&content) {
+                    Ok(serde_json::Value::Array(items)) => parked_work = items,
+                    Ok(_) => {
+                        eprintln!("--parked-work file must contain a JSON array");
+                        return Ok(2);
+                    }
+                    Err(err) => {
+                        eprintln!("--parked-work file is not valid JSON: {err}");
+                        return Ok(2);
+                    }
+                }
+            }
+            "--force" => force = true,
+            // Output is already JSON via print_response; accepted for symmetry.
+            "--json" => {}
+            other => {
+                eprintln!("unknown option: {other}");
+                return Ok(2);
+            }
+        }
+    }
+
+    super::print_response(&super::send_request(&Request {
+        id: "cli:agent:archive".into(),
+        method: Method::AgentArchive(AgentArchiveParams {
+            target: target.clone(),
+            reason,
+            by,
+            parked_work,
+            force,
+        }),
+    })?)
+}
+
+fn agent_unarchive(args: &[String]) -> std::io::Result<i32> {
+    const USAGE: &str = "usage: herdr agent unarchive <target> [--fresh] [--json]";
+    let Some(target) = args.first().filter(|arg| !arg.starts_with('-')) else {
+        eprintln!("{USAGE}");
+        return Ok(2);
+    };
+    let mut fresh = false;
+    for arg in &args[1..] {
+        match arg.as_str() {
+            // Start a clean agent instead of resuming the archived session.
+            "--fresh" => fresh = true,
+            // Output is already JSON via print_response; accepted for symmetry.
+            "--json" => {}
+            other => {
+                eprintln!("unknown option: {other}");
+                return Ok(2);
+            }
+        }
+    }
+
+    super::print_response(&super::send_request(&Request {
+        id: "cli:agent:unarchive".into(),
+        method: Method::AgentUnarchive(AgentUnarchiveParams {
+            target: target.clone(),
+            fresh,
+        }),
+    })?)
+}
+
+fn agent_forget(args: &[String]) -> std::io::Result<i32> {
+    const USAGE: &str = "usage: herdr agent forget <target> [--json]";
+    let Some(target) = args.first().filter(|arg| !arg.starts_with('-')) else {
+        eprintln!("{USAGE}");
+        return Ok(2);
+    };
+    for arg in &args[1..] {
+        match arg.as_str() {
+            // Output is already JSON via print_response; accepted for symmetry.
+            "--json" => {}
+            other => {
+                eprintln!("unknown option: {other}");
+                return Ok(2);
+            }
+        }
+    }
+
+    super::print_response(&super::send_request(&Request {
+        id: "cli:agent:forget".into(),
+        method: Method::AgentForget(AgentForgetParams {
+            target: target.clone(),
+        }),
+    })?)
+}
+
 fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
     let Some(target) = args.first() else {
         eprintln!(
@@ -932,17 +1492,29 @@ fn agent_read(args: &[String]) -> std::io::Result<i32> {
 fn print_agent_help() {
     eprintln!("herdr agent commands:");
     eprintln!("  herdr agent list");
+    eprintln!("  herdr agent federated-list [--caller-pane ID] (trusted-machine grant; HERDR_PANE_ID by default)");
+    eprintln!(
+        "  herdr agent federated-prompt <terminal-id-from-federated-list> <text> [--caller-pane ID]"
+    );
+    eprintln!(
+        "  Reverse grants do not isolate same-user processes: they can spoof an opted-in pane ID."
+    );
     eprintln!("  herdr agent get <target>");
     eprintln!("  herdr agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]");
     eprintln!("  herdr agent send-keys <target> <key> [key ...]");
     eprintln!("  herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS]");
     eprintln!("  herdr agent rename <target> <name>|--clear");
+    eprintln!("  herdr agent archive <target> [--reason TEXT] [--by WHO] [--parked-work FILE] [--force] [--json]");
+    eprintln!("  herdr agent unarchive <target> [--fresh] [--json]");
+    eprintln!("  herdr agent forget <target> [--json]");
     eprintln!("  herdr agent focus <target>");
     eprintln!("  herdr agent wait <target> [--until STATUS]... [--timeout MS]");
     eprintln!("  herdr agent attach <target> [--takeover]");
     eprintln!(
         "  herdr agent start <name> --kind KIND --pane ID [--timeout MS] [-- <agent-args...>]"
     );
+    eprintln!("  herdr agent restart <target>");
+    eprintln!("  herdr agent transfer-session <target> --to claude|codex|omp [--account ID] [--yes | --confirm ID]");
     eprintln!("  herdr agent explain <target> [--json|--format text|json] [--verbose]");
     eprintln!(
         "  herdr agent explain --file PATH --agent LABEL [--json|--format text|json] [--verbose]"
@@ -956,4 +1528,161 @@ fn parse_timeout(value: &str) -> Result<u64, i32> {
         eprintln!("{err}");
         2
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// AXIS — ROUND-3 FINDING 4: BOTH arms of the lossy `--yes` refusal.
+    ///
+    /// The previous test called only `windowed_records_of`, so deleting the refusal,
+    /// inverting it, or dropping the warning all left it green. This asserts the
+    /// decision itself, including the lossless arm — without which "refuses" could
+    /// quietly mean "--yes is broken for everyone".
+    #[test]
+    fn a_lossy_yes_is_refused_and_a_lossless_one_confirms() {
+        // --yes on a transfer that discards history: refuse, do not confirm.
+        assert_eq!(
+            staged_transfer_decision(true, 874),
+            StagedDecision::RefuseLossyYes
+        );
+        // --yes on a lossless transfer: confirm, as asked. THE MIRROR.
+        assert_eq!(staged_transfer_decision(true, 0), StagedDecision::Confirm);
+        // Without --yes: always report and wait, with the warning only when lossy.
+        assert_eq!(
+            staged_transfer_decision(false, 874),
+            StagedDecision::ReportAndWait { lossy: true }
+        );
+        assert_eq!(
+            staged_transfer_decision(false, 0),
+            StagedDecision::ReportAndWait { lossy: false }
+        );
+    }
+
+    /// AXIS: the field path reaches the real value, and a shape that lacks it
+    /// reads as zero rather than as a wrong number.
+    ///
+    /// This guards the silent direction: a mistyped path returns 0, which means
+    /// "nothing dropped" — staging would print no warning and `--yes` would wave a
+    /// lossy transfer through, with no error anywhere. The fixture mirrors the
+    /// live `agent.list` shape, taken from a real staged transfer.
+    #[test]
+    fn windowed_records_are_read_from_the_staged_transfer() {
+        let staged: serde_json::Value = serde_json::from_str(
+            r#"{"id":"t-1","phase":"ready","source":"claude","target":"codex",
+                "message_count":12,
+                "omissions":{"tool_records":3,"reasoning_records":0,"system_records":0,
+                             "attachment_records":0,"metadata_records":0,
+                             "unsupported_blocks":0,"sidechain_records":0,
+                             "windowed_records":874}}"#,
+        )
+        .unwrap();
+        assert_eq!(windowed_records_of(staged.as_object()), 874);
+
+        // A transfer that dropped nothing, and one from a build without the field:
+        // both must read 0 — the value that means "not lossy".
+        let clean: serde_json::Value =
+            serde_json::from_str(r#"{"omissions":{"windowed_records":0}}"#).unwrap();
+        assert_eq!(windowed_records_of(clean.as_object()), 0);
+        let legacy: serde_json::Value = serde_json::from_str(r#"{"omissions":{}}"#).unwrap();
+        assert_eq!(windowed_records_of(legacy.as_object()), 0);
+        assert_eq!(windowed_records_of(None), 0);
+    }
+
+    #[test]
+    fn agent_list_accepts_json_flag_as_no_op() {
+        // Bare `agent list` already emits JSON; `--json` is copy-safe and does
+        // not trip the reject path.
+        assert_eq!(parse_agent_list_args(&[]), Ok(()));
+        assert_eq!(parse_agent_list_args(&["--json".to_string()]), Ok(()));
+    }
+
+    #[test]
+    fn agent_list_rejects_unknown_option() {
+        assert_eq!(parse_agent_list_args(&["--bogus".to_string()]), Err(2));
+        assert_eq!(
+            parse_agent_list_args(&["--json".to_string(), "--bogus".to_string()]),
+            Err(2)
+        );
+    }
+
+    #[test]
+    fn transfer_session_args_keep_prepare_and_confirm_explicit() {
+        assert_eq!(
+            parse_agent_transfer_args(&[
+                "jarvis".into(),
+                "--to".into(),
+                "codex".into(),
+                "--account".into(),
+                "codex-work".into(),
+            ]),
+            Ok(AgentTransferCliArgs {
+                target: "jarvis".into(),
+                to: AgentSessionTransferHarness::Codex,
+                account: Some("codex-work".into()),
+                confirm: None,
+                yes: false,
+            })
+        );
+        assert_eq!(
+            parse_agent_transfer_args(&[
+                "jarvis".into(),
+                "--to".into(),
+                "claude".into(),
+                "--confirm".into(),
+                "transfer-1".into(),
+            ]),
+            Ok(AgentTransferCliArgs {
+                target: "jarvis".into(),
+                to: AgentSessionTransferHarness::Claude,
+                account: None,
+                confirm: Some("transfer-1".into()),
+                yes: false,
+            })
+        );
+    }
+
+    #[test]
+    fn transfer_session_args_reject_implicit_or_double_confirmation() {
+        assert_eq!(
+            parse_agent_transfer_args(&["jarvis".into(), "--to".into(), "other".into()]),
+            Err(2)
+        );
+        assert_eq!(
+            parse_agent_transfer_args(&[
+                "jarvis".into(),
+                "--to".into(),
+                "codex".into(),
+                "--yes".into(),
+                "--confirm".into(),
+                "transfer-1".into(),
+            ]),
+            Err(2)
+        );
+    }
+
+    #[test]
+    fn transfer_session_polling_prefers_the_stable_pane_id() {
+        let response = serde_json::json!({
+            "result": {
+                "agent": {
+                    "pane_id": "w2:p7",
+                    "name": "jarvis"
+                }
+            }
+        });
+
+        assert_eq!(session_transfer_poll_target(&response, "jarvis"), "w2:p7");
+        assert_eq!(
+            session_transfer_poll_target(&serde_json::json!({}), "jarvis"),
+            "jarvis"
+        );
+        assert!(session_transfer_poll_may_retry(&serde_json::json!({
+            "error": { "code": "agent_not_found" }
+        })));
+        assert!(!session_transfer_poll_may_retry(&serde_json::json!({
+            "error": { "code": "agent_blocked" }
+        })));
+    }
 }

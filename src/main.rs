@@ -24,6 +24,8 @@ mod copy_mode;
 mod detect;
 mod events;
 use ghostty_vt as ghostty;
+#[cfg(unix)]
+mod guest;
 mod handoff_runtime;
 mod input;
 mod integration;
@@ -33,6 +35,7 @@ mod layout;
 mod logging;
 mod metadata_tokens;
 mod noninteractive_process;
+mod pairing;
 mod pane;
 use ghostty_vt::pane_graphics_files;
 mod persist;
@@ -43,6 +46,7 @@ mod popup_size;
 mod product_announcements;
 mod protocol;
 mod pty;
+mod push;
 mod raw_input;
 mod release_notes;
 mod remote;
@@ -51,6 +55,7 @@ mod render_signal;
 mod selection;
 mod server;
 mod session;
+mod session_transfer;
 mod sound;
 mod terminal;
 mod terminal_effects;
@@ -120,11 +125,12 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 
 [update]
 # Update channel used by background version checks and `herdr update`.
-# Stable builds default to "stable". Windows preview builds default to "preview"
-# so existing preview installs stay there until explicitly switched.
-# channel = "stable"
+# HerdrUp publishes only "preview" builds; "stable" refuses to update rather than
+# read upstream's herdr.dev manifest, which would replace HerdrUp with upstream Herdr.
+# Builds default to "stable" unless stamped as preview builds.
+# channel = "preview"
 
-# Check herdr.dev for new Herdr versions in the background.
+# Check the HerdrUp release manifest for new builds in the background.
 # version_check = true
 
 # Check herdr.dev for remote agent-detection manifest updates in the background.
@@ -157,8 +163,6 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # close_workspace = "prefix+shift+d"
 # previous_workspace = "" # optional, unset by default
 # next_workspace = ""     # optional, unset by default
-# swap_previous_workspace = "" # optional, move active workspace up
-# swap_next_workspace = ""     # optional, move active workspace down
 # previous_agent = ""     # optional, unset by default
 # next_agent = ""         # optional, unset by default
 # focus_agent = ""        # optional indexed binding, e.g. "prefix+alt+1..9"
@@ -169,7 +173,6 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # next_tab = "prefix+n"
 # move_tab_previous = ""   # optional, e.g. "alt+shift+left" moves the tab toward the front
 # move_tab_next = ""       # optional, e.g. "alt+shift+right" moves the tab toward the back
-# swap_wrap = true          # wrap workspace/tab moves across the first/last boundary
 # switch_tab = "prefix+1..9"
 # switch_workspace = ""   # optional indexed binding, e.g. "prefix+shift+1..9"
 # close_tab = "prefix+shift+x"
@@ -193,8 +196,6 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # resize_pane_up = ""     # optional, e.g. "ctrl+shift+alt+up"
 # resize_pane_right = ""  # optional, e.g. "ctrl+shift+alt+right"
 # toggle_sidebar = "prefix+b"
-# widen_sidebar = ""
-# narrow_sidebar = ""
 
 # Navigate-mode movement. These local shortcuts win while navigate mode is open.
 # They are independent from focus_pane_*. Do not include prefix+, esc, enter, tab, or 1..9 here.
@@ -243,9 +244,6 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 
 # Maximum sidebar width when expanded (columns)
 # sidebar_max_width = 36
-# sidebar_resize_step = 2
-# sidebar_header_bg = "#1e1e2e"
-# sidebar_header_title = " spaces"
 
 # Start with the sidebar collapsed. Changes take effect on the next launch.
 # sidebar_start_collapsed = false
@@ -520,6 +518,10 @@ fn main() -> io::Result<()> {
             std::process::exit(2);
         }
     };
+    #[cfg(windows)]
+    if let Some(result) = platform::maybe_activate_desktop_notification(&raw_args) {
+        return result;
+    }
     if let Some(outcome) = cli::maybe_run_machine(&raw_args) {
         return finish_cli(outcome);
     }
@@ -557,10 +559,10 @@ fn main() -> io::Result<()> {
     finish_cli(cli::maybe_run(&args))?;
 
     // Compatibility entrypoint for the HerdrUp app, which opens one SSH channel
-    // per request and runs `herdr api-bridge <base64(request)>`. Ported from
-    // jerryfane/herdr so their iOS client can drive this daemon's JSON API the
-    // same way it drives theirs. It bridges to the active session's API socket;
-    // `--session <name>` is already consumed by the global flag handling above.
+    // per request and runs `herdr api-bridge <base64(request)>`. #194 removed
+    // this with herdr's own SSH federation, but the app is an out-of-repo
+    // consumer that had not migrated, so every upgraded host stopped answering
+    // it. Keep it until the app ships on `remote-api-bridge`; see #206.
     if args.get(1).map(String::as_str) == Some("api-bridge") {
         return remote::run_api_client_bridge(&args[2..]);
     }
@@ -636,6 +638,7 @@ fn main() -> io::Result<()> {
         println!("       herdr notification <subcommand> ...");
         println!("       herdr agent <subcommand> ...");
         println!("       herdr pane <subcommand> ...");
+        println!("       herdr pair [options]");
         println!("       herdr session <subcommand> ...");
         println!("       herdr integration <subcommand> ...");
         println!();
@@ -694,6 +697,7 @@ fn main() -> io::Result<()> {
                 "herdr pane <subcommand>",
                 "Pane control helpers over the socket API",
             ),
+            ("herdr pair", "Connect a phone by scanning a QR code"),
             (
                 "herdr session <subcommand>",
                 "Manage named persistent sessions",
@@ -732,7 +736,7 @@ fn main() -> io::Result<()> {
 
     if args.iter().any(|a| a == "--version" || a == "-V") {
         platform::begin_cli_output();
-        println!("herdr {}", crate::build_info::version());
+        println!("herdr {}", crate::build_info::version_display());
         return Ok(());
     }
 

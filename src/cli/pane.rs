@@ -1283,6 +1283,8 @@ fn pane_report_agent(args: &[String]) -> std::io::Result<i32> {
         seq,
         agent_session_id,
         agent_session_path,
+        agent_session_cursor: None,
+        agent_process_pid: None,
         resume_argv,
     }))
 }
@@ -1295,7 +1297,7 @@ fn split_resume_argv(args: &[String]) -> (&[String], Option<Vec<String>>) {
 }
 
 fn pane_report_agent_session(args: &[String]) -> std::io::Result<i32> {
-    const USAGE: &str = "usage: herdr pane report-agent-session <pane_id> --source ID --agent LABEL [--seq N] [--agent-session-id ID] [--agent-session-path PATH] [--session-start-source SOURCE] [-- <resume-command...>]";
+    const USAGE: &str = "usage: herdr pane report-agent-session <pane_id> --source ID --agent LABEL [--seq N] [--agent-session-id ID] [--agent-session-path PATH] [--agent-session-cursor ID] [--agent-process-pid PID] [--session-start-source SOURCE] [-- <resume-command...>]";
 
     let (args, resume_argv) = split_resume_argv(args);
     let args = super::expand_equals_args(
@@ -1306,6 +1308,8 @@ fn pane_report_agent_session(args: &[String]) -> std::io::Result<i32> {
             "--seq",
             "--agent-session-id",
             "--agent-session-path",
+            "--agent-session-cursor",
+            "--agent-process-pid",
             "--session-start-source",
         ],
     );
@@ -1315,6 +1319,8 @@ fn pane_report_agent_session(args: &[String]) -> std::io::Result<i32> {
     let mut seq = None;
     let mut agent_session_id = None;
     let mut agent_session_path = None;
+    let mut agent_session_cursor = None;
+    let mut agent_process_pid = None;
     let mut session_start_source = None;
 
     let mut index = 0;
@@ -1358,6 +1364,27 @@ fn pane_report_agent_session(args: &[String]) -> std::io::Result<i32> {
                     return Ok(2);
                 };
                 agent_session_path = Some(value.clone());
+                index += 2;
+            }
+            "--agent-session-cursor" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --agent-session-cursor");
+                    return Ok(2);
+                };
+                agent_session_cursor = Some(value.clone());
+                index += 2;
+            }
+            "--agent-process-pid" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --agent-process-pid");
+                    return Ok(2);
+                };
+                agent_process_pid = Some(value.parse::<u32>().map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "invalid --agent-process-pid",
+                    )
+                })?);
                 index += 2;
             }
             "--session-start-source" => {
@@ -1407,6 +1434,8 @@ fn pane_report_agent_session(args: &[String]) -> std::io::Result<i32> {
             seq,
             agent_session_id,
             agent_session_path,
+            agent_session_cursor,
+            agent_process_pid,
             session_start_source,
             resume_argv,
         },
@@ -1699,7 +1728,7 @@ fn print_pane_help() {
     eprintln!("  herdr pane send-keys <pane_id> <key> [key ...]");
     eprintln!("  herdr pane wait-output <pane_id> (--match TEXT | --regex PATTERN) [--source visible|recent|recent-unwrapped] [--lines N] [--timeout MS] [--raw]");
     eprintln!("  herdr pane report-agent <pane_id> --source ID --agent LABEL --state idle|working|blocked|unknown [--message TEXT] [--seq N] [--agent-session-id ID] [--agent-session-path PATH]");
-    eprintln!("  herdr pane report-agent-session <pane_id> --source ID --agent LABEL [--seq N] [--agent-session-id ID] [--agent-session-path PATH]");
+    eprintln!("  herdr pane report-agent-session <pane_id> --source ID --agent LABEL [--seq N] [--agent-session-id ID] [--agent-session-path PATH] [--agent-session-cursor ID] [--agent-process-pid PID]");
     eprintln!("  herdr pane release-agent <pane_id> --source ID --agent LABEL [--seq N]");
     eprintln!("  herdr pane report-metadata <pane_id> --source ID [--agent LABEL] [--applies-to-source ID] [--title TEXT|--clear-title] [--display-agent TEXT|--clear-display-agent] [--state-label STATUS=TEXT] [--clear-state-labels] [--token NAME=VALUE] [--clear-token NAME] [--seq N] [--ttl-ms N]");
     eprintln!("  herdr pane run <pane_id> <command>");

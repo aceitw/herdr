@@ -24,6 +24,13 @@ fn is_background_completion_transition(prev_state: AgentState, new_state: AgentS
         && matches!(prev_state, AgentState::Working | AgentState::Blocked)
 }
 
+fn current_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
+}
+
 fn is_completion_transition(change: &EffectiveStateChange) -> bool {
     is_background_completion_transition(change.previous_state, change.state)
 }
@@ -172,14 +179,21 @@ pub struct PaneStateUpdate {
     pub previous_state: AgentState,
     pub previous_seen: bool,
     pub previous_presentation: crate::terminal::EffectivePresentation,
+    pub previous_input_pending: bool,
+    pub previous_input_prompt_kind: Option<crate::detect::InputPromptKind>,
     pub agent_label: Option<String>,
     pub known_agent: Option<Agent>,
     pub state: AgentState,
     pub seen: bool,
     pub presentation: crate::terminal::EffectivePresentation,
+    pub input_pending: bool,
+    pub input_prompt_kind: Option<crate::detect::InputPromptKind>,
     pub agent_name_changed: bool,
     pub agent_released: bool,
     pub agent_release_status: Option<crate::api::schema::AgentStatus>,
+    pub completed_turn: Option<crate::terminal::TurnRecord>,
+    pub turn: Option<u64>,
+    pub turn_epoch: Option<u64>,
     pub suppress_completion: bool,
 }
 
@@ -306,6 +320,16 @@ impl AppState {
                     .get_mut(&terminal_id)?
                     .expire_agent_metadata_at(scheduled_deadline, now)?;
                 let change = mutation.effective_state_change?;
+                let (input_pending, input_prompt_kind) = self
+                    .terminals
+                    .get(&terminal_id)
+                    .map(|terminal| (terminal.input_pending, terminal.input_prompt_kind))?;
+                let (turn, turn_epoch) = self
+                    .terminals
+                    .get(&terminal_id)
+                    .filter(|terminal| terminal.is_agent_terminal())
+                    .map(|terminal| (Some(terminal.turn), Some(terminal.turn_epoch)))
+                    .unwrap_or((None, None));
                 let seen = self.apply_pane_state_change(ws_idx, pane_id, &change, false)?;
                 let update = PaneStateUpdate {
                     pane_id,
@@ -315,14 +339,21 @@ impl AppState {
                     previous_state: change.previous_state,
                     previous_seen,
                     previous_presentation: change.previous_presentation.clone(),
+                    previous_input_pending: input_pending,
+                    previous_input_prompt_kind: input_prompt_kind,
                     agent_label: change.agent_label.clone(),
                     known_agent: change.known_agent,
                     state: change.state,
                     seen,
                     presentation: change.presentation.clone(),
+                    input_pending,
+                    input_prompt_kind,
                     agent_name_changed: false,
                     agent_released: false,
                     agent_release_status: None,
+                    completed_turn: None,
+                    turn,
+                    turn_epoch,
                     suppress_completion: false,
                 };
                 Some(update)
@@ -664,11 +695,15 @@ impl AppState {
     }
 
     pub fn close_selected_workspace(&mut self) {
+        let close_indices = self.workspace_close_indices(self.selected);
+        self.close_workspaces(close_indices);
+    }
+
+    pub(crate) fn close_workspaces(&mut self, close_indices: Vec<usize>) {
         if self.workspaces.is_empty() {
             return;
         }
         self.mark_session_dirty();
-        let close_indices = self.workspace_close_indices(self.selected);
 
         let mut terminal_ids = Vec::new();
         let mut pane_ids = Vec::new();
@@ -879,6 +914,20 @@ impl AppState {
     }
 
     pub(crate) fn workspace_close_indices(&self, ws_idx: usize) -> Vec<usize> {
+        let group = self.workspace_group_close_indices(ws_idx);
+        if group.iter().any(|index| {
+            *index != ws_idx
+                && self.workspaces[*index]
+                    .worktree_space()
+                    .is_some_and(|space| !space.is_linked_worktree)
+        }) {
+            vec![ws_idx]
+        } else {
+            group
+        }
+    }
+
+    pub(crate) fn workspace_group_close_indices(&self, ws_idx: usize) -> Vec<usize> {
         self.workspaces
             .get(ws_idx)
             .and_then(|ws| ws.worktree_space())
@@ -1436,6 +1485,7 @@ impl AppState {
                 pane_id,
                 agent,
                 observed_at,
+                ..
             } => self
                 .update_terminal_state(pane_id, |terminal| {
                     Some(terminal.set_detected_agent_process_at(agent, observed_at))
@@ -1456,6 +1506,7 @@ impl AppState {
                 visible_working,
                 process_exited,
                 observed_at,
+                ..
             } => self
                 .update_terminal_state(pane_id, |terminal| {
                     Some(terminal.set_detected_state_with_screen_signals_at(
@@ -1470,6 +1521,10 @@ impl AppState {
                 })
                 .into_iter()
                 .collect(),
+            AppEvent::InputStateChanged { pane_id, kind, .. } => self
+                .update_terminal_input_state(pane_id, kind)
+                .into_iter()
+                .collect(),
             AppEvent::HookStateReported {
                 pane_id,
                 source,
@@ -1478,15 +1533,19 @@ impl AppState {
                 message,
                 seq,
                 session_ref,
+                session_cursor,
+                process_pid,
             } => {
-                if crate::agent_resume::is_reserved_native_state_source(&source, &agent_label) {
-                    self.update_terminal_state(pane_id, |terminal| {
+                let native_state_only =
+                    crate::agent_resume::is_reserved_native_state_source(&source, &agent_label);
+                let runtime_source = source.clone();
+                let runtime_agent = agent_label.clone();
+                let runtime_session_ref = session_ref.clone();
+                let reports_omp_runtime = source == "herdr:omp" && agent_label == "omp";
+                self.update_terminal_state(pane_id, |terminal| {
+                    let mutation = if native_state_only {
                         terminal.set_agent_session_ref(source, agent_label, session_ref, seq)
-                    })
-                    .into_iter()
-                    .collect()
-                } else {
-                    self.update_terminal_state(pane_id, |terminal| {
+                    } else {
                         terminal.set_hook_authority_with_session_ref(
                             source,
                             agent_label,
@@ -1495,10 +1554,25 @@ impl AppState {
                             session_ref,
                             seq,
                         )
-                    })
-                    .into_iter()
-                    .collect()
-                }
+                    };
+                    if mutation.is_some() && reports_omp_runtime {
+                        if let Some(session_ref) = runtime_session_ref.as_ref() {
+                            // OMP state reports carry the same exact leaf/PID proof as
+                            // lifecycle reports. Accept it under the same sequence gate so
+                            // a later successful state report cannot leave stale proof behind.
+                            terminal.set_reported_agent_session_runtime(
+                                &runtime_source,
+                                &runtime_agent,
+                                session_ref,
+                                session_cursor,
+                                process_pid,
+                            );
+                        }
+                    }
+                    mutation
+                })
+                .into_iter()
+                .collect()
             }
             AppEvent::AgentResumeReported {
                 pane_id,
@@ -1528,16 +1602,40 @@ impl AppState {
                 agent_label,
                 seq,
                 session_ref,
+                session_path,
+                session_cursor,
+                process_pid,
                 session_start_source,
             } => self
                 .update_terminal_state(pane_id, |terminal| {
-                    terminal.set_agent_session_ref_for_session_start(
+                    let source_for_path = source.clone();
+                    let agent_for_path = agent_label.clone();
+                    let session_ref_for_path = session_ref.clone();
+                    let mutation = terminal.set_agent_session_ref_for_session_start(
                         source,
                         agent_label,
                         session_ref,
                         seq,
                         session_start_source,
-                    )
+                    );
+                    if mutation.is_some() {
+                        if let Some(session_ref) = session_ref_for_path.as_ref() {
+                            terminal.set_reported_agent_session_path(
+                                &source_for_path,
+                                &agent_for_path,
+                                session_ref,
+                                session_path,
+                            );
+                            terminal.set_reported_agent_session_runtime(
+                                &source_for_path,
+                                &agent_for_path,
+                                session_ref,
+                                session_cursor,
+                                process_pid,
+                            );
+                        }
+                    }
+                    mutation
                 })
                 .into_iter()
                 .collect(),
@@ -1634,7 +1732,13 @@ impl AppState {
             AppEvent::WorktreeRemoveFinished(_) => Vec::new(),
             AppEvent::WorktreeReadFinished(_) => Vec::new(),
             AppEvent::TabBarCommandFinished { .. } => Vec::new(),
+            AppEvent::UsageRefreshed { .. } => Vec::new(),
             AppEvent::PluginCommandFinished { .. } => Vec::new(),
+            // The server-owned App wrapper intercepts transfer worker results
+            // before delegating ordinary state events to this pure state layer.
+            AppEvent::AgentSessionTransferPrepared { .. }
+            | AppEvent::AgentSessionTransferCutoverVerified { .. }
+            | AppEvent::AgentSessionTransferRuntimeVerified { .. } => Vec::new(),
         }
     }
 
@@ -1669,11 +1773,17 @@ impl AppState {
             managed_changed,
             agent_name_changed,
             unchanged_change,
+            previous_turn_context,
+            previous_input_pending,
+            previous_input_prompt_kind,
             suppress_acquisition_completion,
             completion_reset,
         ) = {
             let terminal = self.terminals.get_mut(&terminal_id)?;
+            let previous_turn_context = terminal.turn_completion_context();
             let previous_agent_name = terminal.agent_name.clone();
+            let previous_input_pending = terminal.input_pending;
+            let previous_input_prompt_kind = terminal.input_prompt_kind;
             let had_completion = terminal.last_agent_completion_seq.is_some() || !previous_seen;
             let resume_revision = terminal.reported_resume_revision();
             let mutation = update(terminal);
@@ -1703,6 +1813,9 @@ impl AppState {
                 managed_changed,
                 agent_name_changed,
                 unchanged_change,
+                previous_turn_context,
+                previous_input_pending,
+                previous_input_prompt_kind,
                 suppress_acquisition_completion,
                 completion_reset,
             )
@@ -1716,17 +1829,37 @@ impl AppState {
         }
         let agent_released = mutation.agent_released;
         let change = mutation.effective_state_change.or(unchanged_change)?;
+        let mut completed_turn = None;
         let suppress_completion = force_suppress_completion
             || (change.state == AgentState::Idle && suppress_acquisition_completion);
         if change.previous_state != change.state {
             self.next_agent_state_change_seq += 1;
             if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
                 terminal.last_agent_state_change_seq = Some(self.next_agent_state_change_seq);
+                // Stamp when this status began, so the app can render a compact
+                // "time in current state" badge (#173). Only here, inside the
+                // previous_state != state guard, so a same-status refresh never resets it.
+                terminal.agent_status_since_unix_ms = Some(current_unix_ms());
+                if is_background_completion_transition(change.previous_state, change.state)
+                    && (change.previous_agent_label.is_some() || change.agent_label.is_some())
+                {
+                    completed_turn = Some(terminal.record_completed_turn_at(
+                        current_unix_ms(),
+                        previous_turn_context,
+                        now,
+                    ));
+                }
                 terminal.last_agent_completion_seq = (!suppress_completion
                     && is_completion_transition(&change))
                 .then_some(self.next_agent_state_change_seq);
             }
         }
+        let (turn, turn_epoch) = self
+            .terminals
+            .get(&terminal_id)
+            .filter(|terminal| terminal.is_agent_terminal() || completed_turn.is_some())
+            .map(|terminal| (Some(terminal.turn), Some(terminal.turn_epoch)))
+            .unwrap_or((None, None));
         let seen = self.apply_pane_state_change(ws_idx, pane_id, &change, suppress_completion)?;
         let update = PaneStateUpdate {
             pane_id,
@@ -1736,6 +1869,8 @@ impl AppState {
             previous_state: change.previous_state,
             previous_seen,
             previous_presentation: change.previous_presentation.clone(),
+            previous_input_pending,
+            previous_input_prompt_kind,
             agent_label: if agent_released {
                 change.previous_agent_label.clone()
             } else {
@@ -1749,12 +1884,85 @@ impl AppState {
             state: change.state,
             seen,
             presentation: change.presentation.clone(),
+            input_pending: self.terminals[&terminal_id].input_pending,
+            input_prompt_kind: self.terminals[&terminal_id].input_prompt_kind,
             agent_name_changed,
             agent_released,
             agent_release_status: agent_released.then(|| pane_agent_status(change.state, seen)),
+            completed_turn,
+            turn,
+            turn_epoch,
             suppress_completion,
         };
         Some(update)
+    }
+
+    fn update_terminal_input_state(
+        &mut self,
+        pane_id: PaneId,
+        kind: Option<crate::detect::InputPromptKind>,
+    ) -> Option<PaneStateUpdate> {
+        let ws_idx = self
+            .workspaces
+            .iter()
+            .position(|ws| ws.pane_state(pane_id).is_some())?;
+        let terminal_id = self.workspaces[ws_idx]
+            .pane_state(pane_id)?
+            .attached_terminal_id
+            .clone();
+        let previous_seen = self.workspaces[ws_idx].pane_state(pane_id)?.seen;
+        let now = Instant::now();
+        let (
+            previous_input_pending,
+            previous_input_prompt_kind,
+            change,
+            input_pending,
+            input_prompt_kind,
+            turn,
+            turn_epoch,
+        ) = {
+            let terminal = self.terminals.get_mut(&terminal_id)?;
+            let previous_input_pending = terminal.input_pending;
+            let previous_input_prompt_kind = terminal.input_prompt_kind;
+            if !terminal.set_input_prompt_kind(kind) {
+                return None;
+            }
+            (
+                previous_input_pending,
+                previous_input_prompt_kind,
+                terminal.unchanged_effective_state_change_at(now),
+                terminal.input_pending,
+                terminal.input_prompt_kind,
+                terminal.turn,
+                terminal.turn_epoch,
+            )
+        };
+        let seen = self.apply_pane_state_change(ws_idx, pane_id, &change, false)?;
+        Some(PaneStateUpdate {
+            pane_id,
+            ws_idx,
+            previous_agent_label: change.previous_agent_label.clone(),
+            previous_known_agent: change.previous_known_agent,
+            previous_state: change.previous_state,
+            previous_seen,
+            previous_presentation: change.previous_presentation.clone(),
+            previous_input_pending,
+            previous_input_prompt_kind,
+            agent_label: change.agent_label.clone(),
+            known_agent: change.known_agent,
+            state: change.state,
+            seen,
+            presentation: change.presentation,
+            suppress_completion: false,
+            input_pending,
+            input_prompt_kind,
+            agent_name_changed: false,
+            agent_released: false,
+            agent_release_status: None,
+            completed_turn: None,
+            turn: Some(turn),
+            turn_epoch: Some(turn_epoch),
+        })
     }
 
     pub(crate) fn next_managed_agent_deadline(&self) -> Option<Instant> {
@@ -1778,6 +1986,7 @@ impl AppState {
                 if agent.is_none() && !terminal.full_lifecycle_hook_authority_active() {
                     return None;
                 }
+                terminal.mark_turn_aborted();
                 Some(terminal.set_detected_state_with_screen_signals_at(
                     agent,
                     AgentState::Idle,
@@ -2111,6 +2320,16 @@ mod tests {
             state.mode = Mode::Terminal;
         }
         state
+    }
+
+    fn transition_detected_agent(
+        state: &mut AppState,
+        pane_id: PaneId,
+        agent_state: AgentState,
+    ) -> Option<PaneStateUpdate> {
+        state.update_terminal_state(pane_id, |terminal| {
+            Some(terminal.set_detected_state_with_mutation(Some(Agent::Pi), agent_state))
+        })
     }
 
     fn mark_linked_worktree(state: &mut AppState, ws_idx: usize) {
@@ -2931,6 +3150,7 @@ mod tests {
         let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
 
         state.handle_app_event(AppEvent::StateChanged {
+            runtime_epoch: None,
             pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Working,
@@ -2952,6 +3172,60 @@ mod tests {
     }
 
     #[test]
+    fn status_transition_stamps_time_in_state_and_a_same_status_refresh_does_not_reset_it() {
+        let mut state = app_with_workspaces(&["test"]);
+        let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
+        let emit = |state: &mut AppState, agent_state: AgentState| {
+            state.handle_app_event(AppEvent::StateChanged {
+                runtime_epoch: None,
+                pane_id,
+                agent: Some(Agent::Pi),
+                state: agent_state,
+                visible_blocker: false,
+                visible_working: false,
+                process_exited: false,
+                observed_at: std::time::Instant::now(),
+            });
+        };
+        let terminal_id = state.workspaces[0]
+            .panes
+            .get(&pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        let since = |state: &AppState| {
+            state
+                .terminals
+                .get(&terminal_id)
+                .unwrap()
+                .agent_status_since_unix_ms
+        };
+
+        // A transition into Working stamps the time-in-state.
+        emit(&mut state, AgentState::Working);
+        let stamped = since(&state);
+        assert!(
+            stamped.is_some(),
+            "a status transition must stamp agent_status_since_unix_ms"
+        );
+
+        // The same status again must NOT reset it (only a DIFFERENT state does).
+        emit(&mut state, AgentState::Working);
+        assert_eq!(
+            since(&state),
+            stamped,
+            "a same-status refresh must not reset time-in-state"
+        );
+
+        // A different status re-stamps (never earlier than the previous stamp).
+        emit(&mut state, AgentState::Idle);
+        assert!(
+            since(&state) >= stamped,
+            "a new status must re-stamp time-in-state"
+        );
+    }
+
+    #[test]
     fn state_changed_idle_in_background_marks_unseen() {
         let mut state = app_with_workspaces(&["active", "background"]);
         state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
@@ -2969,6 +3243,7 @@ mod tests {
 
         // Now transition to Idle while in background
         state.handle_app_event(AppEvent::StateChanged {
+            runtime_epoch: None,
             pane_id: bg_pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Idle,
@@ -3002,6 +3277,7 @@ mod tests {
         state.workspaces[0].panes.get_mut(&pane_id).unwrap().seen = false;
 
         state.handle_app_event(AppEvent::StateChanged {
+            runtime_epoch: None,
             pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Idle,
@@ -3024,6 +3300,7 @@ mod tests {
         let bg_pane_id = *state.workspaces[1].panes.keys().next().unwrap();
 
         state.handle_app_event(AppEvent::StateChanged {
+            runtime_epoch: None,
             pane_id: bg_pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Idle,
@@ -3050,6 +3327,7 @@ mod tests {
         if acquired {
             app.handle_app_event(AppEvent::AgentProcessDetected {
                 pane_id,
+                runtime_epoch: None,
                 agent: Agent::Pi,
                 observed_at: Instant::now(),
             });
@@ -3057,6 +3335,7 @@ mod tests {
         for &state in states {
             app.handle_app_event(AppEvent::StateChanged {
                 pane_id,
+                runtime_epoch: None,
                 agent: Some(Agent::Pi),
                 state,
                 visible_blocker: state == AgentState::Blocked,
@@ -3137,6 +3416,7 @@ mod tests {
             for state in [first_state, AgentState::Idle] {
                 app.handle_app_event(AppEvent::StateChanged {
                     pane_id,
+                    runtime_epoch: None,
                     agent: Some(Agent::Pi),
                     state,
                     visible_blocker: state == AgentState::Blocked,
@@ -3177,6 +3457,7 @@ mod tests {
             );
         app.handle_app_event(AppEvent::StateChanged {
             pane_id,
+            runtime_epoch: None,
             agent: Some(Agent::Codex),
             state: AgentState::Unknown,
             visible_blocker: false,
@@ -3213,6 +3494,8 @@ mod tests {
                 message: None,
                 seq: Some(seq),
                 session_ref: None,
+                session_cursor: None,
+                process_pid: None,
             });
             if seq == 2 {
                 assert!(!app.workspaces[1].panes[&pane_id].seen);
@@ -3239,12 +3522,16 @@ mod tests {
                 agent_label: "claude".into(),
                 seq: Some(seq),
                 session_ref: crate::agent_resume::AgentSessionRef::id(session),
+                session_path: None,
+                session_cursor: None,
+                process_pid: None,
                 session_start_source: Some(reason.into()),
             });
             if seq == 1 {
                 for state in [AgentState::Working, AgentState::Idle] {
                     app.handle_app_event(AppEvent::StateChanged {
                         pane_id,
+                        runtime_epoch: None,
                         agent: Some(Agent::Claude),
                         state,
                         visible_blocker: false,
@@ -3294,12 +3581,14 @@ mod tests {
         let pane_id = *state.workspaces[1].panes.keys().next().unwrap();
 
         state.handle_app_event(AppEvent::AgentProcessDetected {
+            runtime_epoch: None,
             pane_id,
             agent: Agent::Pi,
             observed_at: Instant::now(),
         });
         let direct_idle = state
             .handle_app_event(AppEvent::StateChanged {
+                runtime_epoch: None,
                 pane_id,
                 agent: Some(Agent::Pi),
                 state: AgentState::Idle,
@@ -3313,12 +3602,14 @@ mod tests {
         assert!(direct_idle.suppress_completion);
 
         state.handle_app_event(AppEvent::AgentProcessDetected {
+            runtime_epoch: None,
             pane_id,
             agent: Agent::Pi,
             observed_at: Instant::now(),
         });
         for agent_state in [AgentState::Working, AgentState::Blocked] {
             state.handle_app_event(AppEvent::StateChanged {
+                runtime_epoch: None,
                 pane_id,
                 agent: Some(Agent::Pi),
                 state: agent_state,
@@ -3330,6 +3621,7 @@ mod tests {
         }
         let update = state
             .handle_app_event(AppEvent::StateChanged {
+                runtime_epoch: None,
                 pane_id,
                 agent: Some(Agent::Pi),
                 state: AgentState::Idle,
@@ -3349,11 +3641,13 @@ mod tests {
         ));
 
         state.handle_app_event(AppEvent::AgentProcessDetected {
+            runtime_epoch: None,
             pane_id,
             agent: Agent::Codex,
             observed_at: Instant::now(),
         });
         state.handle_app_event(AppEvent::StateChanged {
+            runtime_epoch: None,
             pane_id,
             agent: Some(Agent::Codex),
             state: AgentState::Working,
@@ -3364,6 +3658,7 @@ mod tests {
         });
         let exit_update = state
             .handle_app_event(AppEvent::StateChanged {
+                runtime_epoch: None,
                 pane_id,
                 agent: Some(Agent::Codex),
                 state: AgentState::Idle,
@@ -3409,6 +3704,7 @@ mod tests {
         let bg_pane_id = *state.workspaces[1].panes.keys().next().unwrap();
 
         state.handle_app_event(AppEvent::StateChanged {
+            runtime_epoch: None,
             pane_id: bg_pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
@@ -3433,6 +3729,7 @@ mod tests {
         let bg_pane_id = *state.workspaces[1].panes.keys().next().unwrap();
 
         state.handle_app_event(AppEvent::StateChanged {
+            runtime_epoch: None,
             pane_id: bg_pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
@@ -3465,6 +3762,7 @@ mod tests {
         let bg_pane_id = *state.workspaces[1].panes.keys().next().unwrap();
 
         state.handle_app_event(AppEvent::StateChanged {
+            runtime_epoch: None,
             pane_id: bg_pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
@@ -3476,6 +3774,7 @@ mod tests {
         let deadline = state.next_pending_agent_notification_deadline().unwrap();
 
         state.handle_app_event(AppEvent::StateChanged {
+            runtime_epoch: None,
             pane_id: bg_pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Working,
@@ -3499,6 +3798,7 @@ mod tests {
         let bg_pane_id = *state.workspaces[1].panes.keys().next().unwrap();
 
         state.handle_app_event(AppEvent::StateChanged {
+            runtime_epoch: None,
             pane_id: bg_pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
@@ -3524,6 +3824,7 @@ mod tests {
         let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
 
         state.handle_app_event(AppEvent::StateChanged {
+            runtime_epoch: None,
             pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
@@ -3551,6 +3852,7 @@ mod tests {
         let bg_pane_id = *state.workspaces[1].panes.keys().next().unwrap();
 
         state.handle_app_event(AppEvent::StateChanged {
+            runtime_epoch: None,
             pane_id: bg_pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
@@ -3562,6 +3864,7 @@ mod tests {
         let deadline = state.next_pending_agent_notification_deadline().unwrap();
         state.handle_app_event(AppEvent::PaneDied {
             pane_id: bg_pane_id,
+            runtime_epoch: None,
             exit_reason: crate::platform::ChildExitReason::Exited,
         });
 
@@ -3579,6 +3882,8 @@ mod tests {
             message: None,
             seq: Some(1),
             session_ref: None,
+            session_cursor: None,
+            process_pid: None,
         });
         state.handle_app_event(AppEvent::AgentResumeReported {
             pane_id,
@@ -3595,6 +3900,88 @@ mod tests {
             .attached_terminal_id
             .clone();
         (pane_id, terminal_id)
+    }
+
+    #[test]
+    fn codex_hook_turn_lifecycle_preserves_session_and_beats_stale_working_screen() {
+        let mut state = app_with_workspaces(&["one"]);
+        let (pane_id, terminal_id) = first_pane_terminal(&state);
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id,
+            runtime_epoch: None,
+            agent: Some(Agent::Codex),
+            state: AgentState::Working,
+            visible_blocker: false,
+            visible_working: true,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+
+        for (session, seq) in [("first", 1), ("second", 4)] {
+            state.handle_app_event(AppEvent::AgentSessionReported {
+                pane_id,
+                source: "herdr:codex".into(),
+                agent_label: "codex".into(),
+                seq: Some(seq),
+                session_ref: crate::agent_resume::AgentSessionRef::id(session),
+                session_path: None,
+                session_cursor: None,
+                process_pid: None,
+                session_start_source: Some("startup".into()),
+            });
+            state.handle_app_event(AppEvent::HookStateReported {
+                pane_id,
+                source: "herdr:codex".into(),
+                agent_label: "codex".into(),
+                state: AgentState::Working,
+                message: None,
+                seq: Some(seq + 1),
+                session_ref: crate::agent_resume::AgentSessionRef::id(session),
+                session_cursor: None,
+                process_pid: None,
+            });
+            state.handle_app_event(AppEvent::HookStateReported {
+                pane_id,
+                source: "herdr:codex".into(),
+                agent_label: "codex".into(),
+                state: AgentState::Idle,
+                message: None,
+                seq: Some(seq + 2),
+                session_ref: crate::agent_resume::AgentSessionRef::id(session),
+                session_cursor: None,
+                process_pid: None,
+            });
+            assert_eq!(state.terminals[&terminal_id].state, AgentState::Idle);
+            assert!(state.terminals[&terminal_id]
+                .last_agent_completion_seq
+                .is_some());
+            assert!(state.terminals[&terminal_id].session_ref_is_current(
+                &crate::agent_resume::AgentSessionRef::id(session).unwrap()
+            ));
+        }
+        state.handle_app_event(AppEvent::HookStateReported {
+            pane_id,
+            source: "herdr:codex".into(),
+            agent_label: "codex".into(),
+            state: AgentState::Working,
+            message: None,
+            seq: Some(7),
+            session_ref: crate::agent_resume::AgentSessionRef::id("second"),
+            session_cursor: None,
+            process_pid: None,
+        });
+        state.handle_app_event(AppEvent::HookStateReported {
+            pane_id,
+            source: "herdr:codex".into(),
+            agent_label: "codex".into(),
+            state: AgentState::Idle,
+            message: None,
+            seq: Some(8),
+            session_ref: crate::agent_resume::AgentSessionRef::id("first"),
+            session_cursor: None,
+            process_pid: None,
+        });
+        assert_eq!(state.terminals[&terminal_id].state, AgentState::Working);
     }
 
     #[test]
@@ -3647,6 +4034,8 @@ mod tests {
             message: None,
             seq: None,
             session_ref: None,
+            session_cursor: None,
+            process_pid: None,
         });
 
         assert!(state.terminals[&terminal_id].reported_resume().is_none());
@@ -3659,6 +4048,7 @@ mod tests {
         let (pane_id, terminal_id) = first_pane_terminal(&state);
         state.handle_app_event(AppEvent::AgentProcessDetected {
             pane_id,
+            runtime_epoch: None,
             agent: Agent::Pi,
             observed_at: std::time::Instant::now(),
         });
@@ -3674,6 +4064,7 @@ mod tests {
 
         state.handle_app_event(AppEvent::StateChanged {
             pane_id,
+            runtime_epoch: None,
             agent: Some(Agent::Pi),
             state: AgentState::Idle,
             visible_blocker: false,
@@ -3739,6 +4130,7 @@ mod tests {
         let (pane_id, terminal_id) = first_pane_terminal(&state);
         state.handle_app_event(AppEvent::AgentProcessDetected {
             pane_id,
+            runtime_epoch: None,
             agent: Agent::Pi,
             observed_at: std::time::Instant::now(),
         });
@@ -3750,6 +4142,8 @@ mod tests {
             message: None,
             seq: Some(1),
             session_ref: None,
+            session_cursor: None,
+            process_pid: None,
         });
         assert!(!state.terminals[&terminal_id].self_reported_agent_active());
 
@@ -3779,6 +4173,8 @@ mod tests {
             message: None,
             seq: None,
             session_ref: None,
+            session_cursor: None,
+            process_pid: None,
         });
 
         let toast = state.toast.as_ref().unwrap();
@@ -3801,6 +4197,7 @@ mod tests {
             .clone();
 
         state.handle_app_event(AppEvent::StateChanged {
+            runtime_epoch: None,
             pane_id: bg_pane_id,
             agent: Some(Agent::Codex),
             state: AgentState::Idle,
@@ -3817,8 +4214,11 @@ mod tests {
             message: None,
             seq: Some(1),
             session_ref: None,
+            session_cursor: None,
+            process_pid: None,
         });
         state.handle_app_event(AppEvent::StateChanged {
+            runtime_epoch: None,
             pane_id: bg_pane_id,
             agent: Some(Agent::Codex),
             state: AgentState::Blocked,
@@ -3849,6 +4249,7 @@ mod tests {
             .clone();
 
         state.handle_app_event(AppEvent::StateChanged {
+            runtime_epoch: None,
             pane_id,
             agent: Some(Agent::Claude),
             state: AgentState::Working,
@@ -3865,6 +4266,8 @@ mod tests {
             message: None,
             seq: Some(1),
             session_ref: crate::agent_resume::AgentSessionRef::id("claude-session"),
+            session_cursor: None,
+            process_pid: None,
         });
         let terminal = state.terminals.get(&terminal_id).unwrap();
         assert_eq!(terminal.state, AgentState::Working);
@@ -3872,6 +4275,7 @@ mod tests {
         assert!(terminal.persisted_agent_session.is_some());
 
         state.handle_app_event(AppEvent::StateChanged {
+            runtime_epoch: None,
             pane_id,
             agent: Some(Agent::Claude),
             state: AgentState::Idle,
@@ -3898,6 +4302,7 @@ mod tests {
             .clone();
 
         state.handle_app_event(AppEvent::StateChanged {
+            runtime_epoch: None,
             pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Working,
@@ -3958,6 +4363,7 @@ mod tests {
             .clone();
 
         state.handle_app_event(AppEvent::StateChanged {
+            runtime_epoch: None,
             pane_id,
             agent: Some(Agent::Devin),
             state: AgentState::Idle,
@@ -3974,6 +4380,8 @@ mod tests {
             message: None,
             seq: Some(1),
             session_ref: crate::agent_resume::AgentSessionRef::id("devin-session"),
+            session_cursor: None,
+            process_pid: None,
         });
 
         let terminal = state.terminals.get(&terminal_id).unwrap();
@@ -3998,6 +4406,8 @@ mod tests {
             message: None,
             seq: Some(20),
             session_ref: crate::agent_resume::AgentSessionRef::path(first_session),
+            session_cursor: None,
+            process_pid: None,
         });
         assert_eq!(first_updates.len(), 1);
         state.session_dirty = false;
@@ -4010,6 +4420,8 @@ mod tests {
             message: None,
             seq: Some(21),
             session_ref: crate::agent_resume::AgentSessionRef::path(second_session),
+            session_cursor: None,
+            process_pid: None,
         });
 
         assert!(second_updates.is_empty());
@@ -4090,6 +4502,7 @@ mod tests {
         state.terminals.get_mut(&bg_terminal_id).unwrap().state = AgentState::Working;
 
         state.handle_app_event(AppEvent::StateChanged {
+            runtime_epoch: None,
             pane_id: bg_pane_id,
             agent: Some(Agent::Droid),
             state: AgentState::Idle,
@@ -4119,6 +4532,7 @@ mod tests {
         let bg_pane_id = state.workspaces[1].tabs[second_tab].root_pane;
 
         state.handle_app_event(AppEvent::StateChanged {
+            runtime_epoch: None,
             pane_id: bg_pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
@@ -4145,6 +4559,7 @@ mod tests {
         let bg_pane_id = state.workspaces[0].tabs[second_tab].root_pane;
 
         state.handle_app_event(AppEvent::StateChanged {
+            runtime_epoch: None,
             pane_id: bg_pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
@@ -4168,6 +4583,7 @@ mod tests {
         let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
 
         state.handle_app_event(AppEvent::StateChanged {
+            runtime_epoch: None,
             pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
@@ -4189,6 +4605,7 @@ mod tests {
         let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
 
         state.handle_app_event(AppEvent::StateChanged {
+            runtime_epoch: None,
             pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
@@ -4488,10 +4905,135 @@ mod tests {
             update.agent_release_status,
             Some(crate::api::schema::AgentStatus::Done)
         );
+        assert_eq!(
+            update.completed_turn.as_ref().map(|turn| turn.outcome),
+            Some(crate::terminal::TurnOutcome::Aborted)
+        );
         assert!(matches!(
             state.toast.as_ref().map(|toast| toast.kind),
             Some(ToastKind::Finished)
         ));
+    }
+
+    #[test]
+    fn turn_boundary_matrix_counts_only_effective_agent_closes() {
+        let mut state = app_with_workspaces(&["turns"]);
+        state.outer_terminal_focus = Some(false);
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = state.terminal_id_for_pane(0, pane_id).unwrap();
+
+        transition_detected_agent(&mut state, pane_id, AgentState::Working).unwrap();
+        transition_detected_agent(&mut state, pane_id, AgentState::Blocked).unwrap();
+        transition_detected_agent(&mut state, pane_id, AgentState::Working).unwrap();
+        assert_eq!(state.terminals[&terminal_id].turn, 0);
+
+        let working_close =
+            transition_detected_agent(&mut state, pane_id, AgentState::Idle).unwrap();
+        assert_eq!(
+            working_close
+                .completed_turn
+                .as_ref()
+                .map(|record| record.turn),
+            Some(1)
+        );
+
+        state.mark_active_tab_seen();
+        assert_eq!(
+            state.terminals[&terminal_id].turn, 1,
+            "Done-to-Idle seen projection must not create a turn"
+        );
+
+        transition_detected_agent(&mut state, pane_id, AgentState::Working).unwrap();
+        transition_detected_agent(&mut state, pane_id, AgentState::Blocked).unwrap();
+        let blocked_close =
+            transition_detected_agent(&mut state, pane_id, AgentState::Idle).unwrap();
+        assert_eq!(
+            blocked_close
+                .completed_turn
+                .as_ref()
+                .map(|record| record.turn),
+            Some(2)
+        );
+
+        let _ = transition_detected_agent(&mut state, pane_id, AgentState::Idle);
+        assert_eq!(
+            state.terminals[&terminal_id].turn, 2,
+            "a repeated stabilized idle observation must not double-count"
+        );
+
+        let mut plain_state = app_with_workspaces(&["plain"]);
+        let plain_pane_id = plain_state.workspaces[0].tabs[0].root_pane;
+        let plain_terminal_id = plain_state.terminal_id_for_pane(0, plain_pane_id).unwrap();
+        plain_state
+            .update_terminal_state(plain_pane_id, |terminal| {
+                Some(terminal.set_detected_state_with_mutation(None, AgentState::Working))
+            })
+            .unwrap();
+        let plain_close = plain_state
+            .update_terminal_state(plain_pane_id, |terminal| {
+                Some(terminal.set_detected_state_with_mutation(None, AgentState::Idle))
+            })
+            .unwrap();
+        assert!(plain_close.completed_turn.is_none());
+        assert_eq!(plain_state.terminals[&plain_terminal_id].turn, 0);
+    }
+
+    #[test]
+    fn clearing_hook_authority_does_not_mint_phantom_detector_turn() {
+        let mut state = app_with_workspaces(&["turn-clear"]);
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = state.terminal_id_for_pane(0, pane_id).unwrap();
+
+        transition_detected_agent(&mut state, pane_id, AgentState::Working).unwrap();
+        let session_ref = crate::agent_resume::AgentSessionRef::id("pi-session")
+            .expect("test session id should be valid");
+        let _ = state.update_terminal_state(pane_id, |terminal| {
+            terminal.set_agent_session_ref_for_session_start(
+                "herdr:pi".into(),
+                "pi".into(),
+                Some(session_ref.clone()),
+                Some(1),
+                Some("startup".into()),
+            )?;
+            terminal.set_hook_authority_with_session_ref(
+                "herdr:pi".into(),
+                "pi".into(),
+                AgentState::Working,
+                None,
+                Some(session_ref.clone()),
+                Some(2),
+            )
+        });
+        let completed = state
+            .update_terminal_state(pane_id, |terminal| {
+                terminal.set_hook_authority_with_session_ref(
+                    "herdr:pi".into(),
+                    "pi".into(),
+                    AgentState::Idle,
+                    None,
+                    Some(session_ref),
+                    Some(3),
+                )
+            })
+            .expect("hook idle should complete turn N");
+        assert_eq!(
+            completed.completed_turn.as_ref().map(|record| record.turn),
+            Some(1)
+        );
+
+        state
+            .update_terminal_state(pane_id, |terminal| {
+                terminal.clear_hook_authority_with_mutation(Some("herdr:pi"), Some(4))
+            })
+            .expect("clearing hook authority should reset effective state");
+        let detector_idle =
+            transition_detected_agent(&mut state, pane_id, AgentState::Idle).unwrap();
+
+        assert!(detector_idle.completed_turn.is_none());
+        assert_eq!(
+            state.terminals[&terminal_id].turn, 1,
+            "fresh detector idle after authority clear must not mint turn N+1"
+        );
     }
 
     #[test]

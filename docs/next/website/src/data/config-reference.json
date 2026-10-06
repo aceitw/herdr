@@ -1511,6 +1511,78 @@
       ]
     },
     {
+      "id": "federation",
+      "title": "Federation",
+      "keys": [
+        {
+          "key": "federation.listen",
+          "type": "boolean",
+          "default": "false",
+          "description": "Accept inbound federation connections over TCP. Default off. The listener only binds when `federation.listen_addr` is set and at least one peer token file yields a token; otherwise it refuses to start rather than expose an unauthenticated port. Each accepted TCP connection is authenticated by a shared token and restricted to the granting peer's `capability` tier, and inbound connections are capped so a peer cannot exhaust threads or file descriptors. The local unix socket and the SSH control path are never filtered by this setting."
+        },
+        {
+          "key": "federation.coordinator",
+          "type": "boolean",
+          "default": "false",
+          "description": "Reconcile enabled saved SSH profiles that have explicit `federation.saved_machines` trust policy into outbound federation peers. Default off, including on remote machines, so saved profiles never create automatic cyclic topology."
+        },
+        {
+          "key": "federation.listen_addr",
+          "type": "string",
+          "default": "unset",
+          "description": "Address the federation TCP listener binds to when `federation.listen` is enabled, for example `0.0.0.0:7020` or `127.0.0.1:7020`. Leave unset to keep the listener off."
+        },
+        {
+          "key": "federation.reverse_coordinator_machine_id",
+          "type": "string",
+          "default": "unset",
+          "description": "Pin the coordinator machine ID before this machine accepts explicitly granted reverse agent access. The remote socket is available only over saved SSH; local processes running as the same user can impersonate a pane."
+        },
+        {
+          "key": "federation.saved_machines",
+          "type": "table keyed by saved profile ID",
+          "default": "{}",
+          "description": "Opt saved SSH profiles into federation trust policy by immutable profile ID. Each entry requires expected_machine_id. Labels, targets, sessions, and enabled state remain owned by the saved-machine catalog; OpenSSH remains the credential authority."
+        },
+        {
+          "key": "federation.named_sessions",
+          "type": "array of session names",
+          "default": "[]",
+          "description": "Named sessions (`herdr --session <name>`) that federate like the default session. Every other named session ignores `coordinator`, outbound peers, and `listen`, so only the default session polls saved machines and binds `listen_addr`. Named sessions stay reachable as a remote coordinator's SSH target either way."
+        }
+      ]
+    },
+    {
+      "id": "gram_relay",
+      "title": "Gram relay",
+      "keys": [
+        {
+          "key": "gram_relay.peers",
+          "type": "array of strings",
+          "default": "unset",
+          "description": "Coordinator only. Saved-machine profile ids (32 lowercase hex characters, as shown by `herdr machine list`) whose identity-pinned saved SSH peer may relay Gram files through a restricted reverse gateway. Unset grants nothing; `[]` explicitly grants nothing and never defers to the environment. Replaces the deprecated `HERDR_GRAM_RELAY_PEERS` environment variable, which is honoured only while this key is unset: when both are set and differ (an empty list or empty variable included), the relay is disabled with a `conflict` error. Applied by `herdr server reload-config`; removing a peer tears down its gateway and rejects its next relayed request. Independent of `federation.reverse_coordinator_machine_id` and agent grants."
+        },
+        {
+          "key": "gram_relay.coordinator_machine_id",
+          "type": "string",
+          "default": "unset",
+          "description": "Remote only. Install id of the trusted coordinator (`machine_` plus 32 lowercase hex characters, from the coordinator's `machine.json`). Herdr forwards this daemon's `gram send`, `list`, file download, and delete to the reverse socket derived from this id and its own install id (`herdr gram relay-path <id>` prints it). Unset keeps Gram local; `\"\"` explicitly disables the relay and never defers to the environment. Replaces the deprecated `HERDR_GRAM_REVERSE_SOCKET`, which is honoured only while this key is unset; a differing value (an empty one included) disables the relay with a `conflict` error. Same-user processes on this machine can act as any of its panes."
+        }
+      ]
+    },
+    {
+      "id": "guest",
+      "title": "Guest access",
+      "keys": [
+        {
+          "key": "guest.relay_url",
+          "type": "string",
+          "default": "\"https://guest.herdrup.themartian.app\"",
+          "description": "Base URL of the HerdrUp guest relay. Invites created with `herdr guest invite` carry it, and the daemon keeps a relay connection open only while at least one active guest or unexpired invite exists. The relay pipes end-to-end encrypted (Noise IK) traffic and cannot read it. Unix only."
+        }
+      ]
+    },
+    {
       "id": "advanced",
       "title": "Advanced",
       "keys": [
@@ -1575,6 +1647,66 @@
           "type": "boolean",
           "default": "false",
           "description": "While prefix mode is active, temporarily switch the host input source to an ASCII-capable mode so prefix commands are read as ASCII even when an IME is active, then restore the previous input source when prefix mode exits. On macOS this selects the ASCII-capable keyboard layout; on Windows it switches the IME to English (ASCII) input. Windows support is currently limited to the Korean IME; with an IME for any other language, the input source is left unchanged. macOS and Windows only; a no-op elsewhere and a best-effort no-op if the switch fails."
+        }
+      ]
+    },
+    {
+      "id": "push",
+      "title": "Push notifications",
+      "keys": [
+        {
+          "key": "push.mode",
+          "type": "enum",
+          "default": "\"auto\"",
+          "description": "How remote push reaches registered mobile devices. auto sends directly to APNs when push.enabled and the key settings are complete, and otherwise through the HerdrUp push relay for devices the app enrolled with it. direct uses only this host's APNs key, relay uses only the relay (no key needed), and off sends nothing. The relay sees the notification text in transit but does not store it.",
+          "values": [
+            "auto",
+            "direct",
+            "relay",
+            "off"
+          ]
+        },
+        {
+          "key": "push.relay_url",
+          "type": "string",
+          "default": "\"https://push.herdrup.themartian.app\"",
+          "description": "Base URL of the HerdrUp push relay used by relay mode, and by auto mode when no APNs key is configured."
+        },
+        {
+          "key": "push.enabled",
+          "type": "boolean",
+          "default": "false",
+          "description": "Master switch for direct APNs push delivery from this host. Requires key_path, key_id, team_id, and topic to also be set. Relay delivery does not need it."
+        },
+        {
+          "key": "push.key_path",
+          "type": "string",
+          "default": "unset",
+          "description": "Filesystem path to the APNs auth key (.p8, PKCS#8 PEM). Read only when a push is sent; its contents are never persisted to Herdr state and never logged."
+        },
+        {
+          "key": "push.key_id",
+          "type": "string",
+          "default": "unset",
+          "description": "APNs auth key ID (the 10-character Key ID issued by Apple)."
+        },
+        {
+          "key": "push.team_id",
+          "type": "string",
+          "default": "unset",
+          "description": "Apple developer Team ID used as the push token JWT issuer."
+        },
+        {
+          "key": "push.topic",
+          "type": "string",
+          "default": "unset",
+          "description": "APNs topic — the app bundle identifier, e.g. com.example.herdr."
+        },
+        {
+          "key": "push.sandbox",
+          "type": "boolean",
+          "default": "false",
+          "description": "Deliver through the APNs sandbox host instead of production."
         }
       ]
     }

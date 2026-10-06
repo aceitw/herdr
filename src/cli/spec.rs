@@ -41,8 +41,11 @@ pub(super) fn command() -> Command {
         .subcommand(worktree_command())
         .subcommand(tab_command())
         .subcommand(notification_command())
+        .subcommand(gram_command())
+        .subcommand(guest_command())
         .subcommand(agent_command())
         .subcommand(pane_command())
+        .subcommand(pair_command())
         .subcommand(terminal_command())
         .subcommand(session_command())
         .subcommand(integration_command())
@@ -119,6 +122,37 @@ fn update_command() -> Command {
         .arg(flag("handoff").help("Try live handoff after installing"))
 }
 
+fn pair_command() -> Command {
+    Command::new("pair")
+        .about("Connect a phone by scanning a QR code")
+        .long_about(
+            "Print a QR code that connects a phone to this machine.\n\n\
+             The phone generates its own SSH keypair and sends only the public half, which \
+             is added to ~/.ssh/authorized_keys. No private key is ever displayed, \
+             transported, or stored by this command.\n\n\
+             Pairing binds to this machine's Tailscale address, so the listener is not \
+             reachable from the internet. The QR carries a single-use code that stops \
+             working the moment it is redeemed.",
+        )
+        .arg(flag("lan").help(crate::platform::lan_pairing_help()))
+        .arg(flag("open").help("Open a clean QR image and also print it in the terminal"))
+        .arg(
+            option("qr-file", "PATH")
+                .value_hint(ValueHint::FilePath)
+                .help("Write the pairing QR as an SVG without overwriting an existing file"),
+        )
+        .arg(
+            option("ttl", "SECONDS")
+                .value_parser(clap::value_parser!(u64).range(1..=3600))
+                .help("How long the code stays valid (default 300)"),
+        )
+        .arg(
+            option("port", "PORT")
+                .value_parser(clap::value_parser!(u16))
+                .help("Listen on a fixed port instead of one the OS picks"),
+        )
+}
+
 fn status_command() -> Command {
     Command::new("status")
         .about("Show local client and running server status")
@@ -163,7 +197,7 @@ fn server_command() -> Command {
         .subcommand(Command::new("reload-config").about("Reload config in the running server"))
         .subcommand(
             Command::new("agent-manifests")
-                .about("Show active agent detection manifests")
+                .about("Show active manifests and submission verification support")
                 .arg(json_flag()),
         )
         .subcommand(
@@ -314,16 +348,120 @@ fn notification_command() -> Command {
         )
 }
 
+fn gram_command() -> Command {
+    Command::new("gram")
+        .about("Message the owner and pick up owner-queued work (Herdr app channel)")
+        .subcommand(
+            Command::new("send")
+                .about("Send the owner a push-notified message")
+                .arg(required("text", "TEXT").required(false))
+                .arg(
+                    option("from", "LABEL")
+                        .help("Attribute the message to LABEL instead of your own identity"),
+                )
+                .arg(
+                    option("file", "PATH").help("Attach a file (text becomes an optional caption)"),
+                ),
+        )
+        .subcommand(
+            Command::new("list")
+                .about("List gram messages")
+                .arg(flag("queue").help("Only the shared, unclaimed queue"))
+                .arg(flag("unread").help("Only unread messages (owner view)"))
+                .arg(flag("owner").help("Read as the owner (omit this pane)")),
+        )
+        .subcommand(
+            Command::new("grab")
+                .about("Claim a shared queue item")
+                .arg(required("id", "ID"))
+                .arg(option("as", "LABEL")),
+        )
+        .subcommand(
+            Command::new("get-file")
+                .about("Download a message's attached file")
+                .arg(required("id", "ID"))
+                .arg(
+                    option("out", "PATH")
+                        .short('o')
+                        .help("Write the file to PATH"),
+                ),
+        )
+        .subcommand(
+            Command::new("post")
+                .about("Owner: post to the shared queue or one agent")
+                .arg(required("text", "TEXT"))
+                .arg(option("to", "AGENT")),
+        )
+        .subcommand(
+            Command::new("mark-read")
+                .about("Owner: mark an agent message read")
+                .arg(required("id", "ID")),
+        )
+        .subcommand(
+            Command::new("delete")
+                .about("Delete a message (and any attached file) for good")
+                .arg(required("id", "ID"))
+                .arg(flag("owner").help("Delete any message (owner authority)")),
+        )
+}
+
+fn guest_command() -> Command {
+    let machine = || option("machine", "ALIAS").help("Run on this saved SSH machine");
+    Command::new("guest")
+        .about("Share one agent with an outside person through HerdrUp")
+        .subcommand(
+            Command::new("invite")
+                .about("Create a single-use invite for one named, running agent")
+                .arg(required("agent", "AGENT"))
+                .arg(option("name", "NAME").help("Guest name shown in prompt labels"))
+                .arg(option("owner-name", "NAME"))
+                .arg(option("machine-label", "LABEL"))
+                .arg(option("ttl", "SECS").help("Invite lifetime (default 86400)"))
+                .arg(machine()),
+        )
+        .subcommand(
+            Command::new("list")
+                .about("List guests, invites and the relay link")
+                .arg(machine()),
+        )
+        .subcommand(
+            Command::new("revoke")
+                .about("Revoke a guest or an invite; closes live sessions")
+                .arg(required("id", "ID"))
+                .arg(machine()),
+        )
+        .subcommand(
+            Command::new("log")
+                .about("Show guest activity, newest first")
+                .arg(Arg::new("guest-id").value_name("GUEST-ID"))
+                .arg(option("limit", "N"))
+                .arg(machine()),
+        )
+}
+
 fn agent_command() -> Command {
     Command::new("agent")
         .about("Control and inspect agent panes")
         .subcommand(Command::new("list").about("List agents"))
+        .subcommand(
+            Command::new("federated-list")
+                .about("List coordinator and permitted peer agents via an explicit trusted-machine reverse grant")
+                .arg(option("caller-pane", "ID"))
+                .after_help("Requires federation.reverse_coordinator_machine_id on this machine. Same-user processes can spoof a granted HERDR_PANE_ID; this is not per-process isolation."),
+        )
+        .subcommand(
+            Command::new("federated-prompt")
+                .about("Prompt an authorized coordinator or explicitly permitted peer agent")
+                .arg(agent_target())
+                .arg(required("text", "TEXT"))
+                .arg(option("caller-pane", "ID")),
+        )
         .subcommand(id_command("get", "target", "Show an agent"))
         .subcommand(
             Command::new("read")
                 .about("Read agent terminal output")
                 .override_usage("herdr agent read <TARGET> [OPTIONS]")
-                .arg(required("target", "TARGET"))
+                .arg(agent_target())
                 .arg(read_source_option(true))
                 .arg(option("lines", "N"))
                 .arg(text_ansi_format_option())
@@ -332,7 +470,7 @@ fn agent_command() -> Command {
         .subcommand(
             Command::new("send-keys")
                 .about("Send key presses to an agent")
-                .arg(required("target", "TARGET"))
+                .arg(agent_target())
                 .arg(required("key", "KEY").num_args(1..))
                 .after_help("Use esc as the canonical Escape key name; escape is also accepted."),
         )
@@ -340,11 +478,11 @@ fn agent_command() -> Command {
             Command::new("prompt")
                 .about("Submit a prompt to an agent")
                 .override_usage("herdr agent prompt <TARGET> <TEXT> [OPTIONS]")
-                .arg(required("target", "TARGET"))
+                .arg(agent_target())
                 .arg(required("text", "TEXT"))
                 .arg(
                     flag("wait")
-                        .help("Wait for the first matching state observed after submission"),
+                        .help("Observe submission and then wait for the first matching state, when submission is verified"),
                 )
                 .arg(
                     option("until", "STATUS")
@@ -356,17 +494,31 @@ fn agent_command() -> Command {
                 .arg(
                     option("timeout", "MS")
                         .requires("wait")
-                        .help("Fail after this many milliseconds"),
+                        .help("Set a deadline for observable submission and requested state"),
                 )
                 .after_help(
-                    "If the agent is already blocked, submission is rejected with agent_blocked before any input is sent. When an accepted submission starts from another non-working state, --wait requires an observed working or blocked state within 5000ms; otherwise it returns agent_prompt_stalled. A caller timeout that expires first returns timeout. It then matches idle, done, or blocked by default, or any exact --until state. It does not track turns: if the agent is already working, that active turn's completion may match.",
+                    concat!(
+                        "A blocked agent or visible modal rejects input before any PTY write. ",
+                        "Otherwise Herdr writes text+Enter first. With --wait it observes ",
+                        "submission and, if verified, the requested agent state. A proven ",
+                        "submission returns delivery=submitted. If observation stalls or ",
+                        "composer verification is unsupported, the response is agent_prompted ",
+                        "with delivery=written_to_pty, not a confirmation of submission; ",
+                        "do not resend without checking the pane. An attributed draft still ",
+                        "visible after the observation deadline returns agent_prompt_unsubmitted. ",
+                        "A timeout before the PTY write remains an error. Run ",
+                        "`herdr server agent-manifests` to see active composer coverage. ",
+                        "A settled agent's lifecycle advance or an observed composer clear ",
+                        "confirms submission; an unrelated completion of an already-working ",
+                        "agent does not. Without --timeout, the settled-state wait is indefinite."
+                    ),
                 ),
         )
         .subcommand(
             Command::new("rename")
                 .about("Rename an agent")
                 .override_usage("herdr agent rename <TARGET> <NAME>|--clear")
-                .arg(required("target", "TARGET"))
+                .arg(agent_target())
                 .arg(Arg::new("name").value_name("NAME"))
                 .arg(flag("clear"))
                 .group(
@@ -376,11 +528,39 @@ fn agent_command() -> Command {
                 ),
         )
         .subcommand(id_command("focus", "target", "Focus an agent"))
+        .subcommand(id_command(
+            "restart",
+            "target",
+            "Restart an agent (close its session, reopen with --resume)",
+        ))
+        .subcommand(
+            Command::new("transfer-session")
+                .about("Stage or confirm a Claude Code/Codex/OMP session transfer")
+                .override_usage(
+                    "herdr agent transfer-session <TARGET> --to claude|codex|omp [OPTIONS]",
+                )
+                .arg(agent_target())
+                .arg(
+                    option("to", "HARNESS")
+                        .required(true)
+                        .value_parser(["claude", "codex", "omp"]),
+                )
+                .arg(option("account", "ID").help("Target harness account id"))
+                .arg(flag("yes").help("Confirm immediately after staging and verification"))
+                .arg(
+                    option("confirm", "TRANSFER_ID")
+                        .help("Confirm an already staged transfer"),
+                )
+                .group(ArgGroup::new("cutover").args(["yes", "confirm"]).multiple(false))
+                .after_help(
+                    "Without --yes or --confirm, Herdr stages and verifies the destination, leaves the source running, and prints the transfer id for a later confirmation.",
+                ),
+        )
         .subcommand(
             Command::new("wait")
                 .about("Wait until an agent reaches one of the requested states")
                 .override_usage("herdr agent wait <TARGET> [OPTIONS]")
-                .arg(required("target", "TARGET"))
+                .arg(agent_target())
                 .arg(
                     option("until", "STATUS")
                         .action(ArgAction::Append)
@@ -396,7 +576,7 @@ fn agent_command() -> Command {
             Command::new("attach")
                 .about("Attach directly to an agent terminal")
                 .override_usage("herdr agent attach <TARGET> [OPTIONS]")
-                .arg(required("target", "TARGET"))
+                .arg(agent_target())
                 .arg(flag("takeover")),
         )
         .subcommand(
@@ -713,7 +893,7 @@ fn terminal_command() -> Command {
                 .subcommand(
                     Command::new("control")
                         .about("Control a terminal stream")
-                        .arg(required("target", "TARGET"))
+                        .arg(agent_target())
                         .arg(flag("takeover"))
                         .arg(option("cols", "N"))
                         .arg(option("rows", "N")),
@@ -721,7 +901,7 @@ fn terminal_command() -> Command {
                 .subcommand(
                     Command::new("observe")
                         .about("Observe a terminal stream")
-                        .arg(required("target", "TARGET"))
+                        .arg(agent_target())
                         .arg(option("cols", "N"))
                         .arg(option("rows", "N")),
                 ),
@@ -989,6 +1169,18 @@ fn repeatable_option(name: &'static str, value_name: &'static str) -> Arg {
 
 fn path_option(name: &'static str, value_name: &'static str) -> Arg {
     option(name, value_name).value_hint(ValueHint::AnyPath)
+}
+
+/// The `<TARGET>` every agent subcommand takes.
+///
+/// Spelled out because it was not: `herdr agent rename --help` printed a bare
+/// `<TARGET>` with no accepted forms, so a caller hitting a resolution failure had no
+/// documented form to try instead (#181).
+fn agent_target() -> Arg {
+    required("target", "TARGET").help(
+        "Agent name, pane id (w1:p1), terminal id, tab id, or <machine>/<id> for an \
+         agent on a configured peer",
+    )
 }
 
 fn required(name: &'static str, value_name: &'static str) -> Arg {
@@ -1329,6 +1521,17 @@ mod tests {
             path.join(" ")
         );
         String::from_utf8(output).unwrap()
+    }
+
+    #[test]
+    fn pair_help_exposes_both_non_terminal_qr_paths() {
+        let help = long_help(&["pair"]);
+        assert!(help.contains("--open"), "missing open-QR option: {help}");
+        assert!(
+            help.contains("--qr-file <PATH>"),
+            "missing SVG file option: {help}"
+        );
+        assert!(help.contains(crate::platform::lan_pairing_help()));
     }
 
     #[test]

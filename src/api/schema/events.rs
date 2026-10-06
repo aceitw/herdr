@@ -11,6 +11,19 @@ use super::worktrees::WorktreeInfo;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct EventsSubscribeParams {
     pub subscriptions: Vec<Subscription>,
+    /// Opt into the stream contract a server advertises with the `events_v2`
+    /// capability: `control` lines (`lagged`, `heartbeat`) are interleaved with
+    /// events, and entries naming a pane that does not exist are reported in
+    /// the acknowledgement's `rejected` list instead of failing the request.
+    /// Servers without the capability ignore this field.
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub events_v2: bool,
+    /// Leave out events this server relays from its own federation peers, so a
+    /// coordinator relaying this server receives only this machine's events
+    /// and never re-exports a third machine's. Servers that relay no peers
+    /// have no such events, so older servers can ignore this field.
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub local_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -72,11 +85,21 @@ pub enum Subscription {
         #[serde(default = "super::common::default_true")]
         strip_ansi: bool,
     },
+    /// Omitting `pane_id` watches every pane, including panes created after
+    /// the subscription started (servers advertising `events_v2`).
     #[serde(rename = "pane.agent_status_changed")]
     PaneAgentStatusChanged {
-        pane_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_status: Option<AgentStatus>,
+    },
+    /// Omitting `pane_id` watches every pane, including panes created after
+    /// the subscription started (servers advertising `events_v2`).
+    #[serde(rename = "pane.turn_completed")]
+    PaneTurnCompleted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<String>,
     },
     #[serde(rename = "pane.scroll_changed")]
     PaneScrollChanged { pane_id: String },
@@ -217,6 +240,7 @@ pub enum EventKind {
     PaneExited,
     PaneAgentDetected,
     PaneAgentStatusChanged,
+    PaneTurnCompleted,
     LayoutUpdated,
 }
 
@@ -248,6 +272,7 @@ impl EventKind {
             EventKind::PaneExited => "pane.exited",
             EventKind::PaneAgentDetected => "pane.agent_detected",
             EventKind::PaneAgentStatusChanged => "pane.agent_status_changed",
+            EventKind::PaneTurnCompleted => "pane.turn_completed",
             EventKind::LayoutUpdated => "layout.updated",
         }
     }
@@ -280,6 +305,7 @@ pub const KNOWN_EVENT_KINDS: &[EventKind] = &[
     EventKind::PaneExited,
     EventKind::PaneAgentDetected,
     EventKind::PaneAgentStatusChanged,
+    EventKind::PaneTurnCompleted,
     EventKind::LayoutUpdated,
 ];
 
@@ -370,6 +396,8 @@ pub enum SubscriptionEventKind {
     PaneOutputMatched,
     #[serde(rename = "pane.agent_status_changed")]
     PaneAgentStatusChanged,
+    #[serde(rename = "pane.turn_completed")]
+    PaneTurnCompleted,
     #[serde(rename = "pane.scroll_changed")]
     ScrollChanged,
 }
@@ -380,11 +408,60 @@ pub struct SubscriptionEventEnvelope {
     pub data: SubscriptionEventData,
 }
 
+/// Payload of an `events.subscribe` stream event line: a lifecycle event or a
+/// pane subscription event.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum SubscriptionStreamPayload {
+    Event(Box<EventEnvelope>),
+    Subscription(Box<SubscriptionEventEnvelope>),
+}
+
+/// One event line on an `events.subscribe` stream after the acknowledgement.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SubscriptionStreamEvent {
+    /// Event hub sequence number. It never decreases along a stream. Lines for
+    /// hub events carry that event's number; lines Herdr derives from pane
+    /// state (initial or snapshot status changes, output matches, scroll
+    /// changes) carry the hub sequence they were computed at, so several lines
+    /// can share a number. Numbers restart when the server restarts.
+    pub seq: u64,
+    #[serde(flatten)]
+    pub payload: SubscriptionStreamPayload,
+}
+
+/// Stream-level line interleaved with events on an `events_v2` subscription.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "control", rename_all = "snake_case")]
+pub enum SubscriptionControlLine {
+    /// The server's event ring dropped events this stream had not read yet.
+    /// Events numbered `first_missed_seq` through `last_missed_seq` may be
+    /// missing, so resynchronize from a snapshot. `seq` equals
+    /// `last_missed_seq`; delivery continues with later events.
+    Lagged {
+        seq: u64,
+        first_missed_seq: u64,
+        last_missed_seq: u64,
+    },
+    /// Written when the stream has been otherwise quiet for 15 seconds. `seq`
+    /// is the hub sequence the stream has read through.
+    Heartbeat { seq: u64 },
+}
+
+/// A subscription entry an `events_v2` request skipped instead of failing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SubscriptionRejection {
+    /// Position of the entry in the request's `subscriptions` list.
+    pub index: usize,
+    pub error: super::ErrorBody,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum SubscriptionEventData {
     PaneOutputMatched(PaneOutputMatchedEvent),
     PaneAgentStatusChanged(PaneAgentStatusChangedEvent),
+    PaneTurnCompleted(Box<PaneTurnCompletedEvent>),
     ScrollChanged(PaneScrollChangedEvent),
 }
 
@@ -400,6 +477,10 @@ pub struct PaneAgentStatusChangedEvent {
     pub pane_id: String,
     pub workspace_id: String,
     pub agent_status: AgentStatus,
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub input_pending: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_prompt_kind: Option<crate::detect::InputPromptKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -408,6 +489,31 @@ pub struct PaneAgentStatusChangedEvent {
     pub display_agent: Option<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub state_labels: HashMap<String, String>,
+    /// Advisory hint only; use `pane.turns` replay as the completeness authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<u64>,
+    /// Advisory hint only; use `pane.turns` replay as the completeness authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_epoch: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneTurnCompletedEvent {
+    pub pane: PaneInfo,
+    pub turn: u64,
+    pub turn_epoch: u64,
+    // Required to keep this event disjoint in the untagged subscription data enum.
+    /// `completed` means the agent became idle normally; `aborted` means it
+    /// became idle within 15 seconds of an Esc or Ctrl+C interrupt.
+    pub outcome: crate::terminal::TurnOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub message_truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session_path: Option<String>,
+    /// Unix timestamp in milliseconds.
+    pub completed_unix_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -541,6 +647,10 @@ pub enum EventData {
         pane_id: String,
         workspace_id: String,
         agent_status: AgentStatus,
+        #[serde(default, skip_serializing_if = "super::is_false")]
+        input_pending: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_prompt_kind: Option<crate::detect::InputPromptKind>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -549,6 +659,28 @@ pub enum EventData {
         display_agent: Option<String>,
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         state_labels: HashMap<String, String>,
+        /// Advisory hint only; use `pane.turns` replay as the completeness authority.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn: Option<u64>,
+        /// Advisory hint only; use `pane.turns` replay as the completeness authority.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_epoch: Option<u64>,
+    },
+    PaneTurnCompleted {
+        pane: PaneInfo,
+        turn: u64,
+        turn_epoch: u64,
+        /// `completed` means the agent became idle normally; `aborted` means it
+        /// became idle within 15 seconds of an Esc or Ctrl+C interrupt.
+        outcome: crate::terminal::TurnOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+        #[serde(default, skip_serializing_if = "super::is_false")]
+        message_truncated: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_session_path: Option<String>,
+        /// Unix timestamp in milliseconds.
+        completed_unix_ms: u64,
     },
     LayoutUpdated {
         layout: super::panes::PaneLayoutSnapshot,

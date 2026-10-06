@@ -277,6 +277,7 @@ struct ServerStatusJson {
 struct ServerCapabilitiesJson {
     live_handoff: bool,
     detached_server_daemon: bool,
+    pane_input_stream: bool,
     endpoint_protocol_generation: Option<u32>,
     surface_interest: bool,
     health_check: bool,
@@ -323,6 +324,7 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
                 .map(|capabilities| ServerCapabilitiesJson {
                     live_handoff: capabilities.live_handoff,
                     detached_server_daemon: capabilities.detached_server_daemon,
+                    pane_input_stream: capabilities.pane_input_stream,
                     endpoint_protocol_generation: capabilities.endpoint_protocol_generation,
                     surface_interest: capabilities.surface_interest,
                     health_check: capabilities.health_check,
@@ -421,10 +423,16 @@ mod tests {
             capabilities: Some(crate::api::schema::ServerCapabilities {
                 live_handoff: true,
                 detached_server_daemon: true,
+                pane_input_stream: false,
+                gram_upload_stream: false,
+                agent_session_transfer: false,
+                agent_session_transfer_harnesses: Vec::new(),
+                events_v2: false,
                 endpoint_protocol_generation: endpoint_generation,
                 surface_interest: true,
                 health_check: true,
                 ssh_agent_registration: false,
+                agent_forget: false,
             }),
         }
     }

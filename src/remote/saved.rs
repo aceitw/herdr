@@ -1,7 +1,11 @@
 use std::io;
 use std::path::PathBuf;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, OnceLock,
+};
 
-use super::attach::{find_installed_remote_herdr, RemoteSsh, SshStdioBridge};
+use super::attach::{find_installed_remote_herdr, ManagedSshOptions, RemoteSsh, SshStdioBridge};
 
 pub(crate) struct SavedSshBridge {
     _bridge: SshStdioBridge,
@@ -54,7 +58,38 @@ impl SavedSshApiBridge {
         session: &str,
         use_cached_metadata: bool,
     ) -> io::Result<Self> {
-        let ssh = validated_saved_ssh(profile_id, target, session)?;
+        Self::start_inner(profile_id, target, session, use_cached_metadata, None)
+    }
+
+    pub(crate) fn start_cancellable(
+        profile_id: &str,
+        target: &str,
+        session: &str,
+        use_cached_metadata: bool,
+        cancellation: Arc<AtomicBool>,
+    ) -> io::Result<Self> {
+        Self::start_inner(
+            profile_id,
+            target,
+            session,
+            use_cached_metadata,
+            Some(cancellation),
+        )
+    }
+
+    fn start_inner(
+        profile_id: &str,
+        target: &str,
+        session: &str,
+        use_cached_metadata: bool,
+        cancellation: Option<Arc<AtomicBool>>,
+    ) -> io::Result<Self> {
+        let ssh = validated_saved_ssh_with_cancellation(
+            profile_id,
+            target,
+            session,
+            cancellation.clone(),
+        )?;
         let metadata_cache =
             crate::client::endpoint::SshMetadataCache::new(profile_id, target, session)?;
         let cached = use_cached_metadata.then(|| metadata_cache.load()).flatten();
@@ -67,6 +102,15 @@ impl SavedSshApiBridge {
                 metadata
             }
         };
+        if cancellation
+            .as_deref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "saved SSH bridge startup cancelled",
+            ));
+        }
         let command = super::attach::cached_remote_api_command(&metadata, session);
         let path = crate::platform::remote_bridge_endpoint_path(
             &format!("herdr-api-ssh-{}-{profile_id}.sock", std::process::id()),
@@ -80,7 +124,7 @@ impl SavedSshApiBridge {
             target.to_owned(),
             command,
             path.clone(),
-            ssh.options(),
+            saved_federation_ssh_options(),
             true,
         )?;
         Ok(Self {
@@ -99,6 +143,10 @@ impl SavedSshApiBridge {
         self.bridge.reported_failure()
     }
 
+    pub(crate) fn try_reported_failure(&self) -> io::Result<Option<io::Error>> {
+        self.bridge.try_reported_failure()
+    }
+
     pub(crate) fn invalidate_metadata(&self) {
         self.metadata_cache.invalidate();
     }
@@ -108,6 +156,221 @@ impl SavedSshApiBridge {
             .to_string()
             .contains(super::attach::STALE_API_METADATA)
     }
+}
+
+/// Dedicated reverse stream-local forward; NEVER point this at the unrestricted
+/// coordinator API socket. The caller provides its restricted per-peer gateway.
+#[cfg(unix)]
+pub(crate) fn reverse_forward_command(
+    profile_id: &str,
+    target: &str,
+    session: &str,
+    remote_socket: &std::path::Path,
+    local_gateway: &std::path::Path,
+    cancellation: Arc<AtomicBool>,
+) -> io::Result<std::process::Command> {
+    let _ = validated_saved_ssh(profile_id, target, session)?;
+    // sshd leaves a stream-local -R socket pathname behind after the forwarding
+    // session exits. StreamLocalBindUnlink is client-side and does not remove
+    // that remote pathname on ordinary sshd installations. Clear only the
+    // socket reserved for this pinned machine pair before every (re)bind.
+    let quoted = super::shell_quote(&remote_socket.to_string_lossy());
+    let cleanup = format!(
+        "if [ -e {quoted} ] || [ -L {quoted} ]; then\n  [ ! -L {quoted} ] && [ -S {quoted} ] || exit 1\n  rm -- {quoted}\nfi"
+    );
+    let preflight =
+        super::attach::RemoteSsh::new_noninteractive_cancellable(target.to_owned(), cancellation)
+            .sh_output(&cleanup)?;
+    if !preflight.status.success() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "remote Gram reverse socket preflight failed: {}",
+                preflight.status
+            ),
+        ));
+    }
+    let mut command = std::process::Command::new("ssh");
+    // A persistent multiplexing master exits successfully after forking, which
+    // makes the gateway treat a live -R forward as a failed startup and remove
+    // its local listener. Keep this dedicated forward in the foreground.
+    command.arg("-C").arg("-S").arg("none");
+    if let Some(options) = saved_federation_ssh_options() {
+        command.arg("-F").arg(&options.config_path);
+    }
+    command
+        .arg("-o")
+        .arg("ControlMaster=no")
+        .arg("-o")
+        .arg("ControlPersist=no");
+    command
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=yes")
+        .arg("-o")
+        .arg("ExitOnForwardFailure=yes")
+        .arg("-o")
+        .arg("StreamLocalBindMask=0177")
+        .arg("-o")
+        .arg("StreamLocalBindUnlink=yes")
+        .arg("-N")
+        .arg("-R")
+        .arg(format!(
+            "{}:{}",
+            remote_socket.display(),
+            local_gateway.display()
+        ))
+        .arg("--")
+        .arg(target)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    Ok(command)
+}
+
+fn saved_federation_ssh_options() -> Option<&'static ManagedSshOptions> {
+    static OPTIONS: OnceLock<Option<ManagedSshOptions>> = OnceLock::new();
+    OPTIONS
+        .get_or_init(|| {
+            super::attach::build_federation_ssh_options()
+                .inspect_err(|error| {
+                    tracing::warn!(%error, "could not create saved federation SSH config; using plain SSH");
+                })
+                .ok()
+        })
+        .as_ref()
+}
+
+/// Establish an authenticated SSH streamlocal reverse forward, never a forward
+/// to the unrestricted Herdr API. A readiness marker is emitted by the remote
+/// command only after OpenSSH has accepted all requested forwards.
+#[cfg(unix)]
+pub(crate) fn spawn_saved_reverse_forward(
+    profile_id: &str,
+    target: &str,
+    remote_socket: &std::path::Path,
+    gateway_socket: &std::path::Path,
+) -> io::Result<std::process::Child> {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    validate_profile_path_id(profile_id)?;
+    if target.is_empty() || target.starts_with('-') || target.chars().any(char::is_whitespace) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid saved SSH target",
+        ));
+    }
+    let options = saved_federation_ssh_options().ok_or_else(|| {
+        io::Error::other("managed SSH configuration unavailable; reverse forwarding refused")
+    })?;
+    // sshd retains the remote socket pathname after disconnect. Remove only
+    // this socket (never a file or symlink) before binding the new forward.
+    let quoted = super::shell_quote(&remote_socket.to_string_lossy());
+    let cleanup = format!(
+        "if [ -e {quoted} ] || [ -L {quoted} ]; then\n  [ ! -L {quoted} ] && [ -S {quoted} ] || exit 1\n  rm -- {quoted}\nfi"
+    );
+    let preflight =
+        super::attach::RemoteSsh::new_noninteractive(target.to_owned()).sh_output(&cleanup)?;
+    if !preflight.status.success() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "remote reverse socket preflight failed: {}",
+                preflight.status
+            ),
+        ));
+    }
+    let mut command = Command::new("ssh");
+    // A managed multiplexing master may return before the dedicated forward
+    // closes. Keep this transport owned by the gateway for its entire lifetime.
+    command
+        .arg("-C")
+        .arg("-S")
+        .arg("none")
+        .arg("-F")
+        .arg(&options.config_path)
+        .arg("-o")
+        .arg("ControlMaster=no")
+        .arg("-o")
+        .arg("ControlPersist=no");
+    super::attach::apply_noninteractive_ssh_options(&mut command);
+    command
+        .arg("-T")
+        .arg("-o")
+        .arg("ExitOnForwardFailure=yes")
+        .arg("-o")
+        .arg("StreamLocalBindMask=0177")
+        .arg("-o")
+        .arg("StreamLocalBindUnlink=yes")
+        .arg("-R")
+        .arg(format!(
+            "{}:{}",
+            remote_socket.display(),
+            gateway_socket.display()
+        ))
+        .arg(target)
+        .arg("printf 'herdr-reverse-ready\\n'; exec sleep 2147483647")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = command.spawn()?;
+    let stdout = child.stdout.take().expect("piped SSH stdout");
+    let (tx, rx) = mpsc::sync_channel(1);
+    let reader = std::thread::spawn(move || {
+        let mut output = BufReader::new(stdout);
+        let mut line = Vec::new();
+        let mut total = 0usize;
+        let result = loop {
+            let available = match output.fill_buf() {
+                Ok(bytes) if !bytes.is_empty() => bytes,
+                Ok(_) => {
+                    break Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "SSH closed before reverse forward readiness",
+                    ))
+                }
+                Err(error) => break Err(error),
+            };
+            let newline = available.iter().position(|byte| *byte == b'\n');
+            let count = newline.map_or(available.len(), |position| position + 1);
+            total += count;
+            if total > 16 * 1024 {
+                break Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "SSH stdout exceeded readiness limit",
+                ));
+            }
+            line.extend_from_slice(&available[..count]);
+            output.consume(count);
+            if newline.is_some() {
+                if line == b"herdr-reverse-ready\n" {
+                    break Ok(());
+                }
+                line.clear();
+            }
+        };
+        let _ = tx.send(result);
+    });
+    let ready = rx.recv_timeout(Duration::from_secs(20));
+    if !matches!(ready, Ok(Ok(()))) {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = reader.join();
+        return Err(match ready {
+            Err(mpsc::RecvTimeoutError::Timeout) => io::Error::new(
+                io::ErrorKind::TimedOut,
+                "SSH reverse streamlocal forwarding did not become ready within 20 seconds",
+            ),
+            Ok(Err(error)) => error,
+            _ => io::Error::other("SSH reverse streamlocal forwarding rejected"),
+        });
+    }
+    let _ = reader.join();
+    Ok(child)
 }
 
 pub(crate) fn saved_ssh_bootstrap_command(target: &str, session: &str) -> String {
@@ -134,6 +397,7 @@ pub(crate) fn saved_ssh_failure_needs_attention(error: &io::Error) -> bool {
         "permission denied",
         "host key verification failed",
         "remote host identification has changed",
+        "could not resolve hostname",
         "no matching host key",
         "unsupported remote platform",
         "not ready",
@@ -153,10 +417,24 @@ fn saved_bridge_path(profile_id: &str) -> PathBuf {
 }
 
 fn validated_saved_ssh(profile_id: &str, target: &str, session: &str) -> io::Result<RemoteSsh> {
+    validated_saved_ssh_with_cancellation(profile_id, target, session, None)
+}
+
+fn validated_saved_ssh_with_cancellation(
+    profile_id: &str,
+    target: &str,
+    session: &str,
+    cancellation: Option<Arc<AtomicBool>>,
+) -> io::Result<RemoteSsh> {
     validate_profile_path_id(profile_id)?;
     crate::session::validate_name(session)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-    Ok(RemoteSsh::new_noninteractive(target.to_owned()))
+    Ok(match cancellation {
+        Some(cancellation) => {
+            RemoteSsh::new_noninteractive_cancellable(target.to_owned(), cancellation)
+        }
+        None => RemoteSsh::new_noninteractive(target.to_owned()),
+    })
 }
 
 fn validate_profile_path_id(profile_id: &str) -> io::Result<()> {
@@ -207,9 +485,14 @@ mod tests {
                 message
             )));
         }
-        assert!(!saved_ssh_failure_needs_attention(&io::Error::new(
-            io::ErrorKind::TimedOut,
-            "network timed out"
-        )));
+        for message in [
+            "ssh: connect to host build port 22: Connection timed out",
+            "ssh: connect to host build port 22: Connection refused",
+        ] {
+            assert!(
+                !saved_ssh_failure_needs_attention(&io::Error::other(message)),
+                "transient reachability failures must remain retryable"
+            );
+        }
     }
 }

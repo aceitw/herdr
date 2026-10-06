@@ -27,6 +27,62 @@ pub(crate) fn resolve_new_terminal_cwd(
     }
 }
 
+fn composer_info_from_assessment(
+    assessment: crate::terminal::ComposerAssessment,
+) -> crate::api::schema::ComposerInfo {
+    use crate::api::schema::{
+        ComposerCursorEvidence as Cursor, ComposerProvenance as Provenance,
+        ComposerRegionEvidence as Region, ComposerState as State, ComposerStyleEvidence as Style,
+    };
+    use crate::terminal::{
+        ComposerAssessmentState, ComposerCursorObservation, ComposerInputSource,
+        ComposerRegionObservation, ComposerStyleObservation,
+    };
+
+    crate::api::schema::ComposerInfo {
+        submit_abandoned: false,
+        author: match assessment.source {
+            Some(ComposerInputSource::Human) => Some(crate::api::schema::ComposerAuthor::Human),
+            Some(ComposerInputSource::Api) | Some(ComposerInputSource::AgentPrompt) => {
+                Some(crate::api::schema::ComposerAuthor::ApiClient)
+            }
+            None => None,
+        },
+        state: match assessment.state {
+            ComposerAssessmentState::Empty => State::Empty,
+            ComposerAssessmentState::DraftPresent => State::DraftPresent,
+            ComposerAssessmentState::Unknown => State::Unknown,
+        },
+        attempt_id: assessment.attempt_id,
+        evidence: crate::api::schema::ComposerEvidence {
+            provenance: match assessment.source {
+                Some(ComposerInputSource::Human) => Provenance::Human,
+                Some(ComposerInputSource::Api) => Provenance::Api,
+                Some(ComposerInputSource::AgentPrompt) => Provenance::AgentPrompt,
+                None => Provenance::None,
+            },
+            region: match assessment.visual.region {
+                ComposerRegionObservation::Empty => Region::Empty,
+                ComposerRegionObservation::Text => Region::Text,
+                ComposerRegionObservation::Missing => Region::Missing,
+                ComposerRegionObservation::Unavailable => Region::Unavailable,
+            },
+            cursor: match assessment.visual.cursor {
+                ComposerCursorObservation::Draft => Cursor::Draft,
+                ComposerCursorObservation::Suggestion => Cursor::Suggestion,
+                ComposerCursorObservation::Conflict => Cursor::Conflict,
+                ComposerCursorObservation::Unavailable => Cursor::Unavailable,
+            },
+            style: match assessment.visual.style {
+                ComposerStyleObservation::Neutral => Style::Neutral,
+                ComposerStyleObservation::Conflict => Style::Conflict,
+                ComposerStyleObservation::Unavailable => Style::Unavailable,
+            },
+            frame_stable: assessment.visual.frame_stable,
+        },
+    }
+}
+
 pub(super) fn launch_cwd_for_terminal(
     terminal_id: &crate::terminal::TerminalId,
     terminals: &std::collections::HashMap<
@@ -46,6 +102,90 @@ pub(super) fn launch_cwd_for_terminal(
 }
 
 impl App {
+    pub(crate) fn record_pane_composer_write(
+        &mut self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        source: crate::terminal::ComposerInputSource,
+        baseline_content_seq: u64,
+        create_if_absent: bool,
+        force_new_attempt: bool,
+    ) -> Option<String> {
+        let terminal_id = self
+            .state
+            .workspaces
+            .get(ws_idx)?
+            .terminal_id(pane_id)?
+            .clone();
+        self.record_terminal_composer_write(
+            &terminal_id,
+            source,
+            baseline_content_seq,
+            create_if_absent,
+            force_new_attempt,
+        )
+    }
+
+    /// Remember the flag a delayed submission will raise if its guard refuses to
+    /// write, so `agent get` can report that the prompt never submitted.
+    pub(crate) fn record_pane_prompt_submit_watch(
+        &mut self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        flag: std::sync::Arc<crate::terminal::PromptSubmitWatch>,
+    ) {
+        let Some(terminal_id) = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.terminal_id(pane_id))
+            .cloned()
+        else {
+            return;
+        };
+        if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+            // A second prompt inside the delay window would otherwise orphan the
+            // first watch, and any abandonment it later raises becomes
+            // unobservable — a silent-loss channel in the very mechanism that
+            // exists to make loss visible. Displacing an ARMED watch is itself
+            // an unknown outcome, so record it rather than dropping it.
+            // A retirement belongs to the prompt that earned it. Arming a NEW
+            // watch means a new claim exists, so the old verdict must not be
+            // applied to it — left sticky, `spent` degenerates into
+            // "has this pane ever retired", and every later prompt is stripped
+            // of provenance, attempt_id and author at report time. That is the
+            // same degeneration family as the dead turn_at_write predicate.
+            terminal.prompt_claim_retired = false;
+            if let Some(previous) = terminal.prompt_submit_abandoned.replace(flag) {
+                // "Unresolved" now means neither outcome was recorded: the
+                // watch grew a second flag in #31, so checking abandonment
+                // alone would treat a SUBMITTED prompt as displaced-unknown.
+                let resolved = previous.abandoned.load(std::sync::atomic::Ordering::SeqCst)
+                    || previous.submitted.load(std::sync::atomic::Ordering::SeqCst);
+                if !resolved {
+                    terminal.displaced_submit_unknown = true;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn record_terminal_composer_write(
+        &mut self,
+        terminal_id: &crate::terminal::TerminalId,
+        source: crate::terminal::ComposerInputSource,
+        baseline_content_seq: u64,
+        create_if_absent: bool,
+        force_new_attempt: bool,
+    ) -> Option<String> {
+        let terminal = self.state.terminals.get_mut(terminal_id)?;
+        if terminal.composer_write.is_none() && !create_if_absent {
+            return None;
+        }
+        terminal.is_agent_terminal().then(|| {
+            terminal.record_composer_write(source, baseline_content_seq, force_new_attempt)
+        })
+    }
+
     pub(super) fn seed_cwd_from_workspace(&self, ws_idx: usize) -> Option<PathBuf> {
         self.state
             .workspaces
@@ -225,6 +365,9 @@ impl App {
             focused: self.state.active == Some(ws_idx) && ws.active_tab == tab_idx,
             pane_count: tab.panes.len(),
             agent_status: pane_agent_status(agg_state, seen),
+            machine_id: None,
+            machine_profile_id: None,
+            machine_label: None,
         })
     }
 
@@ -322,12 +465,78 @@ impl App {
                 max_offset_from_bottom: metrics.max_offset_from_bottom as u64,
                 viewport_rows: metrics.viewport_rows as u64,
             });
+        let alternate_screen = self
+            .state
+            .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
+            .and_then(|runtime| runtime.active_screen())
+            .map(|screen| screen == crate::ghostty::ActiveScreen::Alternate)
+            .unwrap_or(false);
         let focused = self.state.active == Some(ws_idx)
             && ws.active_tab == tab_idx
             && ws
                 .focused_pane_id()
                 .is_some_and(|focused| focused == pane_id);
         let presentation = terminal.effective_presentation();
+        let composer = self
+            .state
+            .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
+            .and_then(|runtime| {
+                terminal.effective_known_agent().map(|agent| {
+                    let (frame, content_seq) = runtime.composer_frame();
+                    crate::terminal::assess_composer(
+                        terminal.composer_write.as_ref(),
+                        crate::detect::manifest::composer_visual_observation(
+                            agent,
+                            &frame.screen,
+                            frame.cursor,
+                            frame.frame_stable,
+                            content_seq,
+                        ),
+                    )
+                })
+            })
+            .map(composer_info_from_assessment)
+            .map(|mut composer| {
+                use std::sync::atomic::Ordering;
+                let watch = terminal.prompt_submit_abandoned.as_ref();
+                // Union of both lines: master's displaced-watch signal (#32 F2)
+                // OR this watch's own abandonment.
+                composer.submit_abandoned = terminal.displaced_submit_unknown
+                    || watch.is_some_and(|watch| watch.abandoned.load(Ordering::SeqCst));
+
+                // #31: a submitted prompt empties the composer, so it cannot be
+                // the author of text seen afterwards. Without this, keyboard
+                // input inherits the last prompter's identity and a stale
+                // attempt_id — reported confidently, and wrongly.
+                // Retire the prompt's claim only when the key was written AND a
+                // turn has COMPLETED since. `turn` increments in
+                // record_completed_turn_at (src/terminal/state.rs:388), so it
+                // counts completions, not starts — an earlier comment here
+                // claimed "a turn has begun" and was wrong.
+                //
+                // Completion is a conservative proxy: it lags, so a prompt that
+                // submitted but whose turn is still running keeps its claim for
+                // longer than strictly necessary. That errs toward RETAINING
+                // attribution, which is the safe direction — the failure this
+                // issue exists to fix is claiming authorship we cannot support,
+                // not holding a true claim slightly too long. A stranded prompt
+                // never completes a turn, so it keeps its draft forever, which
+                // is correct.
+                // Set by record_completed_turn_at when a SUBMITTED watch was
+                // discarded. Reading it here cannot race the clear, because the
+                // clear is what produces it.
+                let spent = terminal.prompt_claim_retired;
+                if spent
+                    && composer.evidence.provenance
+                        == crate::api::schema::ComposerProvenance::AgentPrompt
+                {
+                    composer.evidence.provenance = crate::api::schema::ComposerProvenance::None;
+                    composer.attempt_id = None;
+                    composer.author = None;
+                }
+                composer
+            })
+            .unwrap_or_default();
         Some(crate::api::schema::PaneInfo {
             pane_id: self.public_pane_id(ws_idx, pane_id)?,
             terminal_id: terminal.id.to_string(),
@@ -348,10 +557,23 @@ impl App {
             terminal_title_stripped: terminal.terminal_title_stripped(),
             display_agent: presentation.display_agent,
             agent_status: pane_agent_status(terminal.state, pane.seen),
+            input_pending: terminal.input_pending,
+            input_prompt_kind: terminal.input_prompt_kind,
+            composer,
             state_labels: presentation.state_labels,
             tokens: terminal.metadata_tokens.values(),
             agent_session: terminal_agent_session_info(terminal),
+            last_completed_turn: terminal.last_completed_turn().map(|record| {
+                crate::api::schema::LastCompletedTurn {
+                    turn: record.turn,
+                    turn_epoch: record.turn_epoch,
+                    completed_unix_ms: record.completed_unix_ms,
+                }
+            }),
+            turn: terminal.is_agent_terminal().then_some(terminal.turn),
+            turn_epoch: terminal.is_agent_terminal().then_some(terminal.turn_epoch),
             scroll,
+            alternate_screen,
             revision: terminal.revision,
         })
     }
@@ -400,6 +622,11 @@ impl App {
                     checkout_path: space.checkout_path.display().to_string(),
                     is_linked_worktree: space.is_linked_worktree,
                 }),
+            machine_id: None,
+            machine_profile_id: None,
+            machine_label: None,
+            reachability: None,
+            last_known_status: None,
         }
     }
 }

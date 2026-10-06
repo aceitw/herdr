@@ -33,7 +33,34 @@ pub struct ServerCapabilities {
     /// Whether this server supports endpoint health probes.
     #[serde(default)]
     pub health_check: bool,
+    /// The daemon serves the persistent `pane.input.stream` write channel
+    /// (issue #62). Clients feature-detect this before using it and otherwise
+    /// fall back to per-call `pane.send_text` / `pane.send_input`.
+    #[serde(default)]
+    pub pane_input_stream: bool,
+    /// The daemon serves `gram.upload.stream`, uploading a whole file over one
+    /// connection instead of one connection per chunk. Clients feature-detect this
+    /// and otherwise fall back to per-chunk `gram.upload_chunk`.
+    #[serde(default)]
+    pub gram_upload_stream: bool,
+    /// The server can transactionally transfer visible session history between
+    /// Claude Code, Codex, and OMP in the same logical pane.
+    #[serde(default)]
+    pub agent_session_transfer: bool,
+    /// Native harnesses this daemon can use as session-transfer sources and
+    /// destinations. Empty means the older Claude/Codex-only capability shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_session_transfer_harnesses: Vec<super::AgentSessionTransferHarness>,
+    /// `events.subscribe` accepts `events_v2: true` (sequence-numbered lines,
+    /// `lagged` and `heartbeat` control lines, per-entry `pane_not_found`
+    /// rejection) and all-pane `pane.agent_status_changed` and
+    /// `pane.turn_completed` entries without a `pane_id`.
+    #[serde(default)]
+    pub events_v2: bool,
     /// Supports connection-scoped `server.ssh_agent.register` on the local JSON API.
     #[serde(default)]
     pub ssh_agent_registration: bool,
+    /// Supports `agent.forget` (remove an archived agent's record).
+    #[serde(default)]
+    pub agent_forget: bool,
 }

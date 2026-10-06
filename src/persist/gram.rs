@@ -58,6 +58,13 @@ pub const MAX_TEXT_BYTES: usize = 8 * 1024;
 /// from bypassing the text budget and bloating the store.
 pub const MAX_LABEL_BYTES: usize = 128;
 
+/// Maximum bytes of a file's persisted `mime`. A real content type is short
+/// (`application/octet-stream` is 24 bytes); capping it keeps a caller from
+/// smuggling large data through the one attachment field the text budget does not
+/// account for. The name is bounded by the blob store's basename sanitizer and the
+/// sha256 is fixed-width, so this is the last unbounded per-file field.
+pub const MAX_MIME_BYTES: usize = 255;
+
 /// Whether a message flows from an agent to the owner or the other way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -233,9 +240,11 @@ fn update_in_checked<T>(
         if changed {
             let dropped_ids = normalize(&mut items);
             save_json_to_path(&path, &items)?;
-            // Attachment bytes are not managed by this build; the normalization
-            // results stay dead without them.
-            let _ = (&dropped_ids, &dir);
+            // Only after the record eviction is durable do we remove the bytes,
+            // so a failed save never leaves a message pointing at a deleted file.
+            for id in &dropped_ids {
+                crate::persist::gram_files::remove_message_files_in(dir, id);
+            }
         }
         Ok((result, items))
     })

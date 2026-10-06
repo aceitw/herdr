@@ -1,14 +1,8 @@
 //! Self-update mechanism.
 //!
-//! Checks the hosted update manifest for newer versions.
-//!
-//! Living-fork digest: this fork publishes its own release manifests (and no
-//! previews), so self-updates must come from this repository, never from
-//! upstream herdr.dev. An upstream binary shipped over this fork would lose the
-//! HerdrUp api-bridge and every other living-fork feature, so the stable URL
-//! points at this fork's manifest and the preview URL reuses the same stable
-//! manifest, whose `channel: stable` makes a preview-channel update fail
-//! loudly instead of silently replacing the fork build.
+//! Checks this fork's (HerdrUp's) preview manifest for newer builds. HerdrUp
+//! publishes no stable release stream, so the stable channel refuses instead of
+//! falling back to upstream's herdr.dev manifest.
 //! Manual `herdr update` downloads and installs the binary.
 //! Background checks only surface availability and release notes.
 //! Uses `curl` as a subprocess for HTTP — no additional Rust HTTP dependencies.
@@ -30,18 +24,27 @@ use std::time::{Duration, Instant};
 use interprocess::local_socket::traits::Stream as _;
 use serde::{Deserialize, Deserializer};
 
-const STABLE_UPDATE_MANIFEST_URL: &str =
+/// The only release stream HerdrUp publishes: the manifest `install.sh:12` reads.
+/// Remote seeding (`remote/attach.rs`) resolves the same constant, so a fork build
+/// has exactly one manifest URL to keep pointed at itself; the pin test in this
+/// module fails if an upstream sync repoints it.
+pub(crate) const PREVIEW_UPDATE_MANIFEST_URL: &str =
     "https://raw.githubusercontent.com/aceitw/herdr/master/latest.json";
-/// The fork publishes no preview manifests. Reusing the stable manifest keeps a
-/// configured-preview install from silently receiving upstream preview binaries;
-/// `release_info_from_preview_manifest` rejects its stable `channel` outright.
-const PREVIEW_UPDATE_MANIFEST_URL: &str =
-    "https://raw.githubusercontent.com/aceitw/herdr/master/latest.json";
-const HOMEBREW_FORMULA_API_URL: &str = "https://formulae.brew.sh/api/formula/herdr.json";
+/// Every downloadable asset MUST come from this fork's own releases.
+///
+/// `install.sh:277` has enforced this since the fork existed. Upstream publishes
+/// the SAME version numbers this fork builds from while serving `herdrdev/herdr`
+/// binaries, and an upstream sync has already overwritten
+/// `distribution/preview.json` with upstream's copy once (cee4fc2d), so a version
+/// or build-id comparison alone cannot tell a fork release from a foreign one.
+/// The asset origin can.
+const EXPECTED_RELEASE_ROOT: &str = "https://github.com/aceitw/herdr/releases/download/";
+/// The one path that always lands a HerdrUp build (the installer the README
+/// documents). Every refusal to update names it, so a user who hits one knows
+/// what to run instead of reaching for upstream's installer.
+pub(crate) const FORK_INSTALL_COMMAND: &str =
+    "curl -fsSL https://raw.githubusercontent.com/aceitw/herdr/master/website/install.sh | sh";
 const HERDR_UPDATE_COMMAND: &str = "herdr update";
-const HOMEBREW_UPDATE_COMMAND: &str = "brew update && brew upgrade herdr";
-const MISE_UPDATE_COMMAND: &str = "mise upgrade herdr";
-const NIX_UPDATE_COMMAND: &str = "update through Nix";
 const MISE_INSTALLS_DIR_ENV: &str = "MISE_INSTALLS_DIR";
 const FAKE_UPDATE_VERSION_ENV: &str = "HERDR_FAKE_UPDATE_VERSION";
 const FAKE_UPDATE_NOTES_VERSION_ENV: &str = "HERDR_FAKE_UPDATE_NOTES_VERSION";
@@ -208,42 +211,6 @@ impl AssetRef {
 }
 
 #[derive(Deserialize)]
-struct UpdateManifest {
-    version: String,
-    #[cfg(not(windows))]
-    endpoint_generation: Option<u32>,
-    /// Thin-client protocol spoken by this release, when advertised by the manifest.
-    #[cfg(not(windows))]
-    protocol: Option<u32>,
-    notes: String,
-    assets: BTreeMap<String, AssetRef>,
-    #[serde(default)]
-    sha256: BTreeMap<String, String>,
-    announcement: Option<serde_json::Value>,
-    #[serde(default, deserialize_with = "deserialize_manifest_releases")]
-    releases: BTreeMap<String, serde_json::Value>,
-}
-
-fn deserialize_manifest_releases<'de, D>(
-    deserializer: D,
-) -> Result<BTreeMap<String, serde_json::Value>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
-    Ok(match value {
-        Some(serde_json::Value::Object(object)) => object.into_iter().collect(),
-        _ => BTreeMap::new(),
-    })
-}
-
-#[derive(Deserialize)]
-struct ManifestReleaseMetadata {
-    notes: String,
-    announcement: Option<serde_json::Value>,
-}
-
-#[derive(Deserialize)]
 struct PreviewManifest {
     channel: String,
     base_version: String,
@@ -266,47 +233,6 @@ struct PreviewBuildMetadata {
     protocol: u32,
     endpoint_generation: Option<u32>,
     assets: BTreeMap<String, AssetRef>,
-}
-
-#[derive(Deserialize)]
-struct HomebrewFormula {
-    versions: HomebrewFormulaVersions,
-}
-
-#[derive(Deserialize)]
-struct HomebrewFormulaVersions {
-    stable: String,
-}
-
-impl UpdateManifest {
-    #[cfg(all(test, unix))]
-    fn download_url_for(&self, os: &str, arch: &str) -> Option<String> {
-        self.assets
-            .get(&format!("{os}-{arch}"))
-            .map(|asset| asset.url.clone())
-    }
-
-    fn metadata_for_version(&self, version: &Version) -> Option<ManifestReleaseMetadata> {
-        let version = version.to_string();
-        if self.version.trim_start_matches('v') == version {
-            return Some(ManifestReleaseMetadata {
-                notes: self.notes.clone(),
-                announcement: self.announcement.clone(),
-            });
-        }
-
-        self.releases.get(&version).and_then(|release| {
-            let metadata =
-                serde_json::from_value::<ManifestReleaseMetadata>(release.clone()).ok()?;
-            (!metadata.notes_body().is_empty()).then_some(metadata)
-        })
-    }
-}
-
-impl ManifestReleaseMetadata {
-    fn notes_body(&self) -> String {
-        self.notes.trim().to_string()
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -338,12 +264,27 @@ impl ReleaseInfo {
     }
 }
 
-fn fetch_update_manifest() -> Result<UpdateManifest, String> {
-    fetch_json_manifest(STABLE_UPDATE_MANIFEST_URL)
+/// The manifest a fork build resolves for `channel`, or why it has none.
+///
+/// HerdrUp publishes only the preview stream. The stable channel used to read
+/// `herdr.dev/latest.json`, which is upstream-owned: it advertised herdrdev
+/// binaries under the same version numbers as fork builds, so it could either
+/// install upstream over the fork or report "already up to date" against a
+/// release the fork never made. It now refuses and names the fork installer.
+fn update_manifest_url(channel: UpdateChannel) -> Result<&'static str, String> {
+    match channel {
+        UpdateChannel::Preview => Ok(PREVIEW_UPDATE_MANIFEST_URL),
+        UpdateChannel::Stable => Err(stable_channel_refusal()),
+    }
 }
 
-fn fetch_preview_manifest() -> Result<PreviewManifest, String> {
-    fetch_json_manifest(PREVIEW_UPDATE_MANIFEST_URL)
+/// Why a HerdrUp build cannot follow the stable channel, with the paths that work.
+pub(crate) fn stable_channel_refusal() -> String {
+    format!(
+        "HerdrUp publishes no stable release channel, and the upstream stable channel \
+         (herdr.dev) would replace this build with upstream Herdr. Run `herdr channel set \
+         preview` to follow HerdrUp builds, or reinstall with `{FORK_INSTALL_COMMAND}`"
+    )
 }
 
 fn fetch_json_manifest<T>(url: &str) -> Result<T, String>
@@ -372,84 +313,17 @@ where
         .map_err(|e| format!("failed to parse update manifest JSON: {e}"))
 }
 
-fn handle_manifest_announcement(version: &str, value: Option<&serde_json::Value>) {
-    let announcement = match value {
-        Some(value) => match serde_json::from_value::<
-            crate::product_announcements::ManifestAnnouncement,
-        >(value.clone())
-        {
-            Ok(announcement) => Some(announcement),
-            Err(err) => {
-                tracing::warn!("skipping invalid product announcement in update manifest: {err}");
-                None
-            }
-        },
-        None => None,
-    };
-
-    if let Err(err) =
-        crate::product_announcements::save_manifest_announcement(version, announcement.as_ref())
-    {
-        tracing::warn!("failed to save product announcement: {err}");
+/// Refuse any asset this fork did not publish. Remote seeding applies the same
+/// check before installing on another host.
+pub(crate) fn ensure_fork_release_asset(url: &str) -> Result<(), String> {
+    if url.starts_with(EXPECTED_RELEASE_ROOT) {
+        return Ok(());
     }
-}
-
-fn release_info_from_manifest(manifest: &UpdateManifest) -> Result<Option<ReleaseInfo>, String> {
-    let current = Version::current();
-    let latest = Version::parse(&manifest.version)
-        .ok_or_else(|| format!("invalid version in update manifest: {}", manifest.version))?;
-
-    if !stable_channel_should_install(&latest, &current, crate::build_info::is_preview()) {
-        return Ok(None); // up to date
-    }
-
-    let metadata = manifest
-        .metadata_for_version(&latest)
-        .ok_or_else(|| format!("missing release metadata for v{latest}"))?;
-    let notes_body = metadata.notes_body();
-    if notes_body.is_empty() {
-        return Err("update manifest notes are empty".into());
-    }
-
-    let (os, arch) = platform_target();
-    let asset_key = format!("{os}-{arch}");
-    let asset = manifest
-        .assets
-        .get(&asset_key)
-        .ok_or_else(|| format!("no binary for {asset_key} in update manifest"))?;
-    let download_url = asset.url.clone();
-    let sha256 = asset
-        .sha256
-        .clone()
-        .or_else(|| manifest.sha256.get(&asset_key).cloned())
-        .ok_or_else(|| {
-            format!("update manifest asset {asset_key} is missing a SHA-256 checksum")
-        })?;
-
-    Ok(Some(ReleaseInfo {
-        identity: latest.to_string(),
-        version: latest,
-        channel: UpdateChannel::Stable,
-        build_id: None,
-        commit: None,
-        #[cfg(not(windows))]
-        target_protocol: manifest.protocol,
-        #[cfg(not(windows))]
-        target_endpoint_generation: manifest.endpoint_generation,
-        download_url,
-        sha256: Some(sha256),
-        #[cfg(windows)]
-        package_format: asset.package_format()?,
-        notes_body,
-    }))
-}
-
-fn stable_channel_should_install(
-    latest: &Version,
-    current: &Version,
-    installed_is_preview: bool,
-) -> bool {
-    installed_is_preview || latest > current
+    Err(format!(
+        "refusing to install {url}: it is not published by jerryfane/herdr, and installing \
+         it would replace HerdrUp with a foreign build. Install HerdrUp with \
+         `{FORK_INSTALL_COMMAND}`"
+    ))
 }
 
 fn preview_display_version(base_version: &str, build_id: &str) -> String {
@@ -458,6 +332,24 @@ fn preview_display_version(base_version: &str, build_id: &str) -> String {
         base_version.trim_start_matches('v'),
         build_id
     )
+}
+
+/// Preview assets in this fork have historically been built with a stable version
+/// stamp. Compare the git commit as well as a preview build id, or those installed
+/// assets advertise themselves as an update forever. Neither comparison substitutes
+/// for checking the manifest asset's origin before reporting "up to date".
+fn matches_installed_preview(
+    manifest: &PreviewManifest,
+    installed_version: &str,
+    installed_build_id: Option<&str>,
+    installed_commit: Option<&str>,
+) -> bool {
+    if manifest.base_version.trim_start_matches('v') != installed_version {
+        return false;
+    }
+    installed_build_id.is_some_and(|id| id == manifest.build_id)
+        || installed_commit
+            .is_some_and(|commit| commit.len() >= 7 && manifest.commit.starts_with(commit))
 }
 
 fn release_info_from_preview_manifest(
@@ -472,11 +364,6 @@ fn release_info_from_preview_manifest(
     let build_id = manifest.build_id.trim();
     if build_id.is_empty() {
         return Err("preview manifest build_id is empty".into());
-    }
-    if crate::build_info::is_preview()
-        && crate::build_info::build_id().is_some_and(|current| current == build_id)
-    {
-        return Ok(None);
     }
 
     let version = Version::parse(&manifest.base_version).ok_or_else(|| {
@@ -515,6 +402,15 @@ fn release_info_from_preview_manifest(
         })
         .ok_or_else(|| format!("no binary for {asset_key} in preview manifest"))?;
     let download_url = asset.url.clone();
+    ensure_fork_release_asset(&download_url)?;
+    if matches_installed_preview(
+        manifest,
+        crate::build_info::BASE_VERSION,
+        crate::build_info::build_id(),
+        crate::build_info::commit(),
+    ) {
+        return Ok(None);
+    }
 
     Ok(Some(ReleaseInfo {
         identity: preview_display_version(&manifest.base_version, build_id),
@@ -534,83 +430,10 @@ fn release_info_from_preview_manifest(
     }))
 }
 
-/// Check the hosted update manifest for the latest release. Returns release info if newer.
-fn first_windows_stable_is_pending(
-    manifest: &UpdateManifest,
-    is_windows: bool,
-    installed_is_preview: bool,
-) -> bool {
-    is_windows && installed_is_preview && !manifest.assets.contains_key("windows-x86_64")
-}
-
+/// Check this fork's manifest for the configured channel. Returns release info if newer.
 fn check_latest() -> Result<Option<ReleaseInfo>, String> {
-    let channel = UpdateChannel::configured();
-    if channel == UpdateChannel::Preview {
-        return release_info_from_preview_manifest(&fetch_preview_manifest()?);
-    }
-
-    let manifest = fetch_update_manifest()?;
-    if first_windows_stable_is_pending(&manifest, cfg!(windows), crate::build_info::is_preview()) {
-        tracing::info!("waiting for the first stable Windows release");
-        return Ok(None);
-    }
-    let release = release_info_from_manifest(&manifest)?;
-    if let Some(release) = &release {
-        if let Some(metadata) = manifest.metadata_for_version(&release.version) {
-            handle_manifest_announcement(
-                &release.version.to_string(),
-                metadata.announcement.as_ref(),
-            );
-        }
-    }
-    Ok(release)
-}
-
-fn parse_homebrew_formula_stable_version(input: &[u8]) -> Result<Version, String> {
-    let formula: HomebrewFormula = serde_json::from_slice(input)
-        .map_err(|e| format!("failed to parse Homebrew formula JSON: {e}"))?;
-    Version::parse(&formula.versions.stable).ok_or_else(|| {
-        format!(
-            "invalid stable version in Homebrew formula JSON: {}",
-            formula.versions.stable
-        )
-    })
-}
-
-fn homebrew_update_from_formula_json(
-    input: &[u8],
-    current: &Version,
-) -> Result<Option<Version>, String> {
-    let latest = parse_homebrew_formula_stable_version(input)?;
-    if &latest <= current {
-        return Ok(None);
-    }
-
-    Ok(Some(latest))
-}
-
-fn check_homebrew_latest() -> Result<Option<Version>, String> {
-    let current = Version::current();
-
-    let output = crate::noninteractive_process::curl_command()
-        .args([
-            "-sfL",
-            "--retry",
-            "2",
-            "--connect-timeout",
-            "5",
-            "--max-time",
-            "10",
-            HOMEBREW_FORMULA_API_URL,
-        ])
-        .output()
-        .map_err(|e| format!("curl failed: {e}"))?;
-
-    if !output.status.success() {
-        return Err("failed to fetch Homebrew formula JSON".into());
-    }
-
-    homebrew_update_from_formula_json(&output.stdout, &current)
+    let url = update_manifest_url(UpdateChannel::configured())?;
+    release_info_from_preview_manifest(&fetch_json_manifest(url)?)
 }
 
 // ---------------------------------------------------------------------------
@@ -1895,34 +1718,19 @@ fn print_running_session_update_outcomes(
 // ---------------------------------------------------------------------------
 
 pub(crate) fn update_install_command() -> &'static str {
-    if is_homebrew_managed_install() {
-        HOMEBREW_UPDATE_COMMAND
-    } else if is_mise_managed_install() {
-        MISE_UPDATE_COMMAND
-    } else if is_nix_managed_install() {
-        NIX_UPDATE_COMMAND
+    if is_package_manager_managed_install() {
+        FORK_INSTALL_COMMAND
     } else {
         HERDR_UPDATE_COMMAND
     }
 }
 
 pub(crate) fn update_install_instruction(install_command: &str) -> String {
-    match install_command {
-        HERDR_UPDATE_COMMAND => {
-            "detach, run `herdr update`, then run Herdr again to reconnect".to_string()
-        }
-        HOMEBREW_UPDATE_COMMAND => {
-            "detach, run `brew update && brew upgrade herdr`, then run Herdr again to reconnect"
-                .to_string()
-        }
-        MISE_UPDATE_COMMAND => {
-            "detach, run `mise upgrade herdr`, then run Herdr again to reconnect".to_string()
-        }
-        NIX_UPDATE_COMMAND => {
-            "detach, update through Nix, then run Herdr again to reconnect".to_string()
-        }
-        command => format!("detach, run `{command}`, then run Herdr again to reconnect"),
-    }
+    format!("detach, run `{install_command}`, then run Herdr again to reconnect")
+}
+
+fn is_package_manager_managed_install() -> bool {
+    is_homebrew_managed_install() || is_mise_managed_install() || is_nix_managed_install()
 }
 
 fn is_homebrew_managed_install() -> bool {
@@ -1959,28 +1767,19 @@ pub(crate) fn preview_channel_rejection_for_current_install() -> Option<&'static
 
 pub(crate) fn package_manager_channel_update_guidance_for_current_install() -> Option<&'static str>
 {
-    if is_homebrew_managed_install() {
-        Some("Use `brew update && brew upgrade herdr` to update Homebrew installs.")
-    } else if is_mise_managed_install() {
-        Some("Use `mise upgrade herdr` to update mise installs.")
-    } else if is_nix_managed_install() {
-        Some("Update through Nix to update Nix-managed Herdr installs.")
+    if is_package_manager_managed_install() {
+        Some("A package-manager upgrade may install upstream Herdr, not this fork; install HerdrUp directly with `curl -fsSL https://raw.githubusercontent.com/aceitw/herdr/master/website/install.sh | sh`.")
     } else {
         None
     }
 }
 
 fn preview_channel_rejection_for_exe_path(path: &Path) -> Option<&'static str> {
-    if is_homebrew_managed_exe_path_following_links(path) {
-        Some(
-            "preview channel is only available for direct Herdr installs; Homebrew installs update through `brew update && brew upgrade herdr`",
-        )
-    } else if is_mise_managed_exe_path_following_links(path) {
-        Some(
-            "preview channel is only available for direct Herdr installs; mise installs update through `mise upgrade herdr`",
-        )
-    } else if is_nix_store_exe_path_following_links(path) {
-        Some("preview channel is only available for direct Herdr installs; Nix installs update through Nix")
+    if is_homebrew_managed_exe_path_following_links(path)
+        || is_mise_managed_exe_path_following_links(path)
+        || is_nix_store_exe_path_following_links(path)
+    {
+        Some("Preview updates require a direct HerdrUp install; a package-manager upgrade may install upstream Herdr. Use `curl -fsSL https://raw.githubusercontent.com/aceitw/herdr/master/website/install.sh | sh` instead")
     } else {
         None
     }
@@ -2122,37 +1921,10 @@ fn homebrew_cellar_keg_root(path: &Path) -> Option<PathBuf> {
 pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
     let channel = UpdateChannel::configured();
 
-    if is_homebrew_managed_install() {
-        if channel == UpdateChannel::Preview {
-            return Err(
-                "self-update is disabled for Homebrew installs; preview is only available for direct Herdr installs".into(),
-            );
-        }
+    if is_package_manager_managed_install() {
         return Err(format!(
-            "self-update is disabled for Homebrew installs; run `{HOMEBREW_UPDATE_COMMAND}`"
+            "self-update is disabled for package-managed installs; a package-manager upgrade may install upstream Herdr, not HerdrUp. Install HerdrUp directly with `{FORK_INSTALL_COMMAND}`"
         ));
-    }
-
-    if is_mise_managed_install() {
-        if channel == UpdateChannel::Preview {
-            return Err(
-                "self-update is disabled for mise installs; preview is only available for direct Herdr installs".into(),
-            );
-        }
-        return Err(format!(
-            "self-update is disabled for mise installs; run `{MISE_UPDATE_COMMAND}`"
-        ));
-    }
-
-    if is_nix_managed_install() {
-        if channel == UpdateChannel::Preview {
-            return Err(
-                "self-update is disabled for Nix installs; preview is only available for direct Herdr installs".into(),
-            );
-        }
-        return Err(
-            "self-update is disabled for Nix installs; update with `nix profile upgrade` or update the flake input that provides Herdr".into(),
-        );
     }
 
     if running_inside_herdr() {
@@ -2381,26 +2153,10 @@ pub fn auto_update(events: tokio::sync::mpsc::Sender<crate::events::AppEvent>) {
         return;
     }
 
-    let configured_channel = UpdateChannel::configured();
-    if is_homebrew_managed_install() {
-        if configured_channel == UpdateChannel::Preview {
-            crate::logging::update_check_failed(
-                "preview channel is not available for Homebrew installs",
-            );
-            return;
-        }
-        auto_update_homebrew(events);
-        return;
-    }
-
-    if is_mise_managed_install() && configured_channel == UpdateChannel::Preview {
-        crate::logging::update_check_failed("preview channel is not available for mise installs");
-        return;
-    }
-
-    let nix_managed_install = is_nix_managed_install();
-    if nix_managed_install && configured_channel == UpdateChannel::Preview {
-        crate::logging::update_check_failed("preview channel is not available for Nix installs");
+    if is_package_manager_managed_install() {
+        crate::logging::update_check_failed(
+            "package-managed Herdr cannot be upgraded to this fork; install HerdrUp directly instead",
+        );
         return;
     }
 
@@ -2434,53 +2190,6 @@ pub fn auto_update(events: tokio::sync::mpsc::Sender<crate::events::AppEvent>) {
         version: release.label().to_string(),
         install_command: update_install_command().to_string(),
     });
-}
-
-fn auto_update_homebrew(events: tokio::sync::mpsc::Sender<crate::events::AppEvent>) {
-    let version = match check_homebrew_latest() {
-        Ok(Some(version)) => version,
-        Ok(None) => return,
-        Err(err) => {
-            crate::logging::update_check_failed(&err);
-            return;
-        }
-    };
-
-    crate::logging::update_available(&version.to_string());
-    let notes_body = homebrew_release_notes_body(&version);
-    if let Err(e) = crate::release_notes::save_pending(&version.to_string(), &notes_body) {
-        tracing::warn!("failed to save pending release notes: {e}");
-    }
-
-    tracing::info!(
-        "auto-update check: v{} available through Homebrew, waiting for explicit install",
-        version
-    );
-
-    let _ = events.blocking_send(crate::events::AppEvent::UpdateReady {
-        version: version.to_string(),
-        install_command: HOMEBREW_UPDATE_COMMAND.to_string(),
-    });
-}
-
-fn homebrew_release_notes_body(version: &Version) -> String {
-    let manifest = fetch_update_manifest().ok();
-    homebrew_release_notes_body_from_manifest(version, manifest.as_ref())
-}
-
-fn homebrew_release_notes_body_from_manifest(
-    version: &Version,
-    manifest: Option<&UpdateManifest>,
-) -> String {
-    if let Some(metadata) = manifest.and_then(|manifest| manifest.metadata_for_version(version)) {
-        let notes_body = metadata.notes_body();
-        if !notes_body.is_empty() {
-            handle_manifest_announcement(&version.to_string(), metadata.announcement.as_ref());
-            return notes_body;
-        }
-    }
-
-    format!("### Changed\n- v{version} is available through Homebrew.")
 }
 
 // ---------------------------------------------------------------------------
@@ -2690,7 +2399,9 @@ mod tests {
             target_endpoint_generation: Some(
                 crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION,
             ),
-            download_url: "https://example.com/herdr".to_string(),
+            download_url:
+                "https://github.com/aceitw/herdr/releases/download/v9.9.9/herdr-linux-x86_64"
+                    .to_string(),
             sha256: None,
             notes_body: "### Changed\n- One".to_string(),
         }
@@ -2881,18 +2592,18 @@ mod tests {
 
     #[test]
     fn preview_channel_is_rejected_for_package_manager_paths() {
-        let homebrew = Path::new("/opt/homebrew/Cellar/herdr/0.6.6/bin/herdr");
-        let mise = Path::new("/home/user/.local/share/mise/installs/herdr/0.6.6/bin/herdr");
-        let nix = Path::new("/nix/store/abc123-herdr-0.6.6/bin/herdr");
-        let direct = Path::new("/home/user/.local/bin/herdr");
-
-        assert!(preview_channel_rejection_for_exe_path(homebrew)
-            .is_some_and(|message| message.contains("Homebrew")));
-        assert!(preview_channel_rejection_for_exe_path(mise)
-            .is_some_and(|message| message.contains("mise")));
-        assert!(preview_channel_rejection_for_exe_path(nix)
-            .is_some_and(|message| message.contains("Nix")));
-        assert!(preview_channel_rejection_for_exe_path(direct).is_none());
+        for path in [
+            Path::new("/opt/homebrew/Cellar/herdr/0.6.6/bin/herdr"),
+            Path::new("/home/user/.local/share/mise/installs/herdr/0.6.6/bin/herdr"),
+            Path::new("/nix/store/abc123-herdr-0.6.6/bin/herdr"),
+        ] {
+            let refusal = preview_channel_rejection_for_exe_path(path).unwrap();
+            assert!(refusal.contains(FORK_INSTALL_COMMAND), "{refusal}");
+        }
+        assert!(
+            preview_channel_rejection_for_exe_path(Path::new("/home/user/.local/bin/herdr"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -2900,85 +2611,6 @@ mod tests {
         let path = Path::new("/usr/local/bin/herdr");
 
         assert!(!is_nix_store_exe_path(path));
-    }
-
-    #[test]
-    fn parse_homebrew_formula_stable_version_reads_versions_stable() {
-        let version = parse_homebrew_formula_stable_version(
-            br#"{"versions":{"stable":"0.5.10","head":"HEAD","bottle":true}}"#,
-        )
-        .unwrap();
-
-        assert_eq!(version, Version::parse("0.5.10").unwrap());
-    }
-
-    #[test]
-    fn homebrew_formula_update_uses_formula_stable_not_manifest_latest() {
-        let current = Version::parse("0.6.1").unwrap();
-        let update = homebrew_update_from_formula_json(
-            br#"{"versions":{"stable":"0.6.2","head":"HEAD","bottle":true}}"#,
-            &current,
-        )
-        .unwrap();
-
-        assert_eq!(update, Some(Version::parse("0.6.2").unwrap()));
-    }
-
-    #[test]
-    fn homebrew_formula_update_ignores_versions_that_are_not_newer() {
-        let current = Version::parse("0.6.2").unwrap();
-        let update = homebrew_update_from_formula_json(
-            br#"{"versions":{"stable":"0.6.2","head":"HEAD","bottle":true}}"#,
-            &current,
-        )
-        .unwrap();
-
-        assert_eq!(update, None);
-    }
-
-    #[test]
-    fn homebrew_release_notes_use_package_manager_guidance() {
-        let body =
-            homebrew_release_notes_body_from_manifest(&Version::parse("0.6.3").unwrap(), None);
-
-        assert_eq!(body, "### Changed\n- v0.6.3 is available through Homebrew.");
-    }
-
-    #[test]
-    fn homebrew_release_notes_can_use_manifest_metadata() {
-        let manifest: UpdateManifest = serde_json::from_str(
-            r####"{
-                "version": "0.6.3",
-                "protocol": 10,
-                "notes": "### Fixed\n- Brew notes",
-                "assets": {
-                    "linux-x86_64": "https://example.com/herdr-linux-x86_64"
-                }
-            }"####,
-        )
-        .unwrap();
-        let body = homebrew_release_notes_body_from_manifest(
-            &Version::parse("0.6.3").unwrap(),
-            Some(&manifest),
-        );
-
-        assert_eq!(body, "### Fixed\n- Brew notes");
-    }
-
-    #[test]
-    fn update_install_instruction_distinguishes_install_from_restart() {
-        assert_eq!(
-            update_install_instruction(HERDR_UPDATE_COMMAND),
-            "detach, run `herdr update`, then run Herdr again to reconnect"
-        );
-        assert_eq!(
-            update_install_instruction(HOMEBREW_UPDATE_COMMAND),
-            "detach, run `brew update && brew upgrade herdr`, then run Herdr again to reconnect"
-        );
-        assert_eq!(
-            update_install_instruction(MISE_UPDATE_COMMAND),
-            "detach, run `mise upgrade herdr`, then run Herdr again to reconnect"
-        );
     }
 
     #[test]
@@ -3067,7 +2699,13 @@ mod tests {
                 ),
                 surface_interest: true,
                 health_check: true,
+                pane_input_stream: false,
+                gram_upload_stream: false,
+                agent_session_transfer: false,
+                agent_session_transfer_harnesses: Vec::new(),
+                events_v2: false,
                 ssh_agent_registration: false,
+                agent_forget: false,
             }),
         };
         let missing_baseline = crate::api::RuntimeStatus {
@@ -3142,7 +2780,13 @@ mod tests {
                     ),
                     surface_interest: true,
                     health_check: true,
+                    pane_input_stream: false,
+                    gram_upload_stream: false,
+                    agent_session_transfer: false,
+                    agent_session_transfer_harnesses: Vec::new(),
+                    events_v2: false,
                     ssh_agent_registration: false,
+                    agent_forget: false,
                 }),
             },
         };
@@ -3339,7 +2983,9 @@ mod tests {
             target_endpoint_generation: Some(
                 crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION,
             ),
-            download_url: "https://example.com/herdr".to_string(),
+            download_url:
+                "https://github.com/aceitw/herdr/releases/download/v9.9.9/herdr-linux-x86_64"
+                    .to_string(),
             sha256: None,
             notes_body: "### Changed\n- One".to_string(),
         };
@@ -3401,7 +3047,13 @@ mod tests {
                     ),
                     surface_interest: true,
                     health_check: true,
+                    pane_input_stream: false,
+                    gram_upload_stream: false,
+                    agent_session_transfer: false,
+                    agent_session_transfer_harnesses: Vec::new(),
+                    events_v2: false,
                     ssh_agent_registration: false,
+                    agent_forget: false,
                 }),
             },
         };
@@ -3524,7 +3176,9 @@ mod tests {
             target_endpoint_generation: Some(
                 crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION,
             ),
-            download_url: "https://example.com/herdr".to_string(),
+            download_url:
+                "https://github.com/aceitw/herdr/releases/download/v9.9.9/herdr-linux-x86_64"
+                    .to_string(),
             sha256: None,
             notes_body: "### Changed\n- One".to_string(),
         };
@@ -3630,228 +3284,6 @@ mod tests {
     }
 
     #[test]
-    fn update_manifest_deserializes() {
-        let json = "{\n\
-            \"version\": \"0.2.0\",\n\
-            \"protocol\": 4,\n\
-            \"endpoint_generation\": 1,\n\
-            \"notes\": \"### Changed\\n- One\",\n\
-            \"announcement\": {\n\
-                \"id\": \"keymap-v2\",\n\
-                \"title\": \"Keymap changes\",\n\
-                \"body\": \"### Heads up\\n- Defaults changed\"\n\
-            },\n\
-            \"assets\": {\n\
-                \"linux-x86_64\": \"https://example.com/herdr-linux-x86_64\",\n\
-                \"macos-aarch64\": \"https://example.com/herdr-macos-aarch64\"\n\
-            }\n\
-        }";
-        let manifest: UpdateManifest = serde_json::from_str(json).unwrap();
-        assert_eq!(manifest.version, "0.2.0");
-        assert_eq!(manifest.protocol, Some(4));
-        assert_eq!(manifest.endpoint_generation, Some(1));
-        assert_eq!(manifest.assets.len(), 2);
-        assert_eq!(
-            manifest
-                .metadata_for_version(&Version::parse("0.2.0").unwrap())
-                .expect("metadata")
-                .notes_body(),
-            "### Changed\n- One"
-        );
-        assert_eq!(
-            manifest
-                .announcement
-                .as_ref()
-                .and_then(|announcement| announcement.get("id"))
-                .and_then(serde_json::Value::as_str),
-            Some("keymap-v2")
-        );
-        assert_eq!(
-            manifest.download_url_for("linux", "x86_64").as_deref(),
-            Some("https://example.com/herdr-linux-x86_64")
-        );
-    }
-
-    #[test]
-    fn update_manifest_reads_archived_release_metadata() {
-        let json = r####"{
-            "version": "0.3.0",
-            "protocol": 4,
-            "notes": "### Changed\n- Three",
-            "assets": {
-                "linux_x86_64": "https://example.com/unused"
-            },
-            "releases": {
-                "0.2.0": {
-                    "notes": "### Changed\n- Two",
-                    "announcement": {
-                        "id": "two",
-                        "title": "Two",
-                        "body": "### Two"
-                    }
-                }
-            }
-        }"####;
-        let manifest: UpdateManifest = serde_json::from_str(json).unwrap();
-        let version = Version::parse("0.2.0").unwrap();
-        let metadata = manifest.metadata_for_version(&version).expect("metadata");
-
-        assert_eq!(metadata.notes_body(), "### Changed\n- Two");
-        assert_eq!(
-            metadata
-                .announcement
-                .as_ref()
-                .and_then(|announcement| announcement.get("id"))
-                .and_then(serde_json::Value::as_str),
-            Some("two")
-        );
-    }
-
-    #[test]
-    fn update_manifest_root_metadata_wins_for_latest_version() {
-        let json = r####"{
-            "version": "0.3.0",
-            "protocol": 4,
-            "notes": "### Changed\n- Root",
-            "announcement": {
-                "id": "root",
-                "title": "Root",
-                "body": "### Root"
-            },
-            "assets": {
-                "linux_x86_64": "https://example.com/unused"
-            },
-            "releases": {
-                "0.3.0": {
-                    "notes": "### Changed\n- Stale",
-                    "announcement": {
-                        "id": "stale",
-                        "title": "Stale",
-                        "body": "### Stale"
-                    }
-                }
-            }
-        }"####;
-        let manifest: UpdateManifest = serde_json::from_str(json).unwrap();
-        let version = Version::parse("0.3.0").unwrap();
-        let metadata = manifest.metadata_for_version(&version).expect("metadata");
-
-        assert_eq!(metadata.notes_body(), "### Changed\n- Root");
-        assert_eq!(
-            metadata
-                .announcement
-                .as_ref()
-                .and_then(|announcement| announcement.get("id"))
-                .and_then(serde_json::Value::as_str),
-            Some("root")
-        );
-    }
-
-    #[test]
-    fn update_manifest_ignores_malformed_releases_container() {
-        let json = r####"{
-            "version": "0.3.0",
-            "protocol": 4,
-            "notes": "### Changed\n- Root",
-            "assets": {
-                "linux_x86_64": "https://example.com/unused"
-            },
-            "releases": []
-        }"####;
-        let manifest: UpdateManifest = serde_json::from_str(json).unwrap();
-
-        assert!(manifest.releases.is_empty());
-        assert_eq!(
-            manifest
-                .metadata_for_version(&Version::parse("0.3.0").unwrap())
-                .expect("metadata")
-                .notes_body(),
-            "### Changed\n- Root"
-        );
-    }
-
-    #[test]
-    fn update_manifest_requires_notes_field() {
-        let json = r#"{
-            "version": "0.2.0",
-            "assets": {
-                "linux-x86_64": "https://example.com/herdr-linux-x86_64"
-            }
-        }"#;
-
-        assert!(serde_json::from_str::<UpdateManifest>(json).is_err());
-    }
-
-    #[test]
-    fn stable_update_requires_asset_checksum() {
-        let (os, arch) = platform_target();
-        let asset_key = format!("{os}-{arch}");
-        let json = format!(
-            r####"{{
-                "version": "99.99.99",
-                "notes": "### Changed\n- One",
-                "assets": {{
-                    "{asset_key}": "https://example.com/herdr"
-                }}
-            }}"####
-        );
-        let manifest: UpdateManifest = serde_json::from_str(&json).unwrap();
-
-        assert!(release_info_from_manifest(&manifest)
-            .unwrap_err()
-            .contains("missing a SHA-256 checksum"));
-    }
-
-    #[test]
-    fn invalid_manifest_announcement_does_not_block_release_info() {
-        let (os, arch) = platform_target();
-        let asset_key = format!("{os}-{arch}");
-        let json = format!(
-            r####"{{
-                "version": "99.99.99",
-                "protocol": 4,
-                "notes": "### Changed\n- One",
-                "announcement": {{
-                    "id": 123,
-                    "title": "Keymap changes",
-                    "body": "### Heads up\n- Defaults changed"
-                }},
-                "assets": {{
-                    "{asset_key}": {{
-                        "url": "https://example.com/herdr",
-                        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                    }}
-                }}
-            }}"####
-        );
-
-        let manifest: UpdateManifest = serde_json::from_str(&json).unwrap();
-        handle_manifest_announcement(&manifest.version, manifest.announcement.as_ref());
-        let release = release_info_from_manifest(&manifest)
-            .unwrap()
-            .expect("release info");
-
-        assert_eq!(release.version, Version::parse("99.99.99").unwrap());
-        assert_eq!(release.download_url, "https://example.com/herdr");
-    }
-
-    #[test]
-    fn stable_channel_installs_stable_asset_when_current_binary_is_preview() {
-        let latest_stable = Version::parse("0.6.6").unwrap();
-        let installed_base = Version::parse("0.6.6").unwrap();
-        assert!(stable_channel_should_install(
-            &latest_stable,
-            &installed_base,
-            true
-        ));
-        assert!(!stable_channel_should_install(
-            &latest_stable,
-            &installed_base,
-            false
-        ));
-    }
-
-    #[test]
     fn preview_manifest_reports_update_when_build_id_differs() {
         let (os, arch) = platform_target();
         let asset_key = format!("{os}-{arch}");
@@ -3866,7 +3298,7 @@ mod tests {
                 "notes": "### Fixed\n- One",
                 "assets": {{
                     "{asset_key}": {{
-                        "url": "https://example.com/herdr-linux-x86_64",
+                        "url": "https://github.com/aceitw/herdr/releases/download/v9.9.9/herdr-linux-x86_64",
                         "sha256": "deadbeef"
                     }}
                 }},
@@ -3878,7 +3310,7 @@ mod tests {
                         "protocol": 77,
                         "assets": {{
                             "{asset_key}": {{
-                                "url": "https://example.com/herdr-linux_x86_64",
+                                "url": "https://github.com/aceitw/herdr/releases/download/v9.9.9/herdr-linux-x86_64",
                                 "sha256": "deadbeef"
                             }}
                         }}
@@ -3899,134 +3331,92 @@ mod tests {
     }
 
     #[test]
-    fn preview_windows_build_waits_for_first_stable_asset() {
-        let without_windows: UpdateManifest = serde_json::from_str(
-            r#"{"version":"9.9.9","notes":"notes","assets":{},"announcement":null}"#,
+    fn stable_stamped_fork_build_does_not_reoffer_its_own_preview_asset() {
+        let manifest: PreviewManifest = serde_json::from_str(
+            r#"{
+                "channel": "preview",
+                "base_version": "0.9.1",
+                "build_id": "2026-09-20-d79b0216a175",
+                "commit": "d79b0216a175d4707c8b3a18cbf50f362dcc2325",
+                "built_at": "2026-09-20T20:40:00Z",
+                "protocol": 22,
+                "notes": "Preview build",
+                "assets": {}
+            }"#,
         )
         .unwrap();
-        assert!(first_windows_stable_is_pending(
-            &without_windows,
-            true,
-            true
-        ));
-        assert!(!first_windows_stable_is_pending(
-            &without_windows,
-            true,
-            false
-        ));
-        assert!(!first_windows_stable_is_pending(
-            &without_windows,
-            false,
-            true
-        ));
 
-        let with_windows: UpdateManifest = serde_json::from_str(
-            r#"{"version":"9.9.9","notes":"notes","assets":{"windows-x86_64":"https://example.com/herdr-windows-x86_64.zip"},"announcement":null}"#,
-        )
-        .unwrap();
-        assert!(!first_windows_stable_is_pending(&with_windows, true, true));
+        // Published fork assets have a stable channel stamp but carry the commit
+        // in `herdr --version`; matching only the preview build id loops forever.
+        assert!(matches_installed_preview(
+            &manifest,
+            "0.9.1",
+            None,
+            Some("d79b021")
+        ));
+        assert!(!matches_installed_preview(
+            &manifest,
+            "0.9.0",
+            None,
+            Some("d79b021")
+        ));
+        assert!(!matches_installed_preview(
+            &manifest,
+            "0.9.1",
+            None,
+            Some("f15e5ddb")
+        ));
     }
 
     #[test]
-    fn checked_in_distribution_manifest_matches_update_schema() {
-        #[derive(Deserialize)]
-        struct LegacyUpdateManifest {
-            assets: BTreeMap<String, String>,
-        }
+    fn preview_asset_from_another_repository_is_refused_with_the_fork_installer() {
+        // An upstream sync overwrote distribution/preview.json with herdrdev's copy
+        // once (cee4fc2d). Its build ids and version numbers look like ours, so the
+        // asset origin is the only thing that tells the two apart, and the refusal
+        // has to name the path that does install a fork build.
+        let (os, arch) = platform_target();
+        let asset_key = format!("{os}-{arch}");
+        let json = format!(
+            r####"{{
+                "channel": "preview",
+                "base_version": "9.9.9",
+                "build_id": "2026-09-16-2c29fb29e302",
+                "commit": "2c29fb29e302",
+                "built_at": "2026-09-16T16:38:38Z",
+                "protocol": 22,
+                "notes": "Preview build",
+                "assets": {{
+                    "{asset_key}": {{
+                        "url": "https://github.com/herdrdev/herdr/releases/download/preview-2026-09-16-2c29fb29e302/herdr-{asset_key}",
+                        "sha256": "deadbeef"
+                    }}
+                }}
+            }}"####
+        );
+        let manifest: PreviewManifest = serde_json::from_str(&json).unwrap();
 
-        let json = include_str!("../distribution/latest.json");
-        let legacy: LegacyUpdateManifest = serde_json::from_str(json)
-            .expect("distribution/latest.json should keep legacy string asset URLs");
-        assert!(legacy.assets.len() >= 4);
+        let error = release_info_from_preview_manifest(&manifest)
+            .expect_err("an upstream-hosted asset must not be installable over a fork build");
+        assert!(
+            error.contains("not published by jerryfane/herdr")
+                && error.contains(FORK_INSTALL_COMMAND),
+            "unexpected error: {error}"
+        );
+    }
 
-        let manifest: UpdateManifest = serde_json::from_str(json)
-            .expect("distribution/latest.json should match updater schema");
-
-        assert!(!manifest
-            .metadata_for_version(&Version::parse(&manifest.version).unwrap())
-            .expect("metadata")
-            .notes_body()
-            .is_empty());
-        // distribution/latest.json describes the latest released binaries, not the
-        // current unreleased checkout. Its protocol is updated by the release
-        // flow together with the release assets.
-        assert!(manifest.protocol.is_some());
-        assert!(manifest.assets.len() >= 4);
-        assert!(manifest.releases.contains_key(&manifest.version));
-
-        for target in [
-            "linux-x86_64",
-            "linux-aarch64",
-            "macos-x86_64",
-            "macos-aarch64",
-        ] {
-            let asset = manifest
-                .assets
-                .get(target)
-                .unwrap_or_else(|| panic!("missing asset URL for {target}"));
-            let url = &asset.url;
-            assert_eq!(
-                manifest.sha256.get(target).map(String::len),
-                Some(64),
-                "missing SHA-256 checksum for {target}"
-            );
-            // Fork tags may carry a suffix (v0.9.3-fork) while the manifest
-            // version stays the base semver, so only the asset name is pinned.
-            assert!(
-                url.ends_with(&format!("herdr-{target}")),
-                "unexpected asset name for {target}: {url}"
-            );
-        }
-
-        if let Some(windows) = manifest.assets.get("windows-x86_64") {
-            assert!(windows.url.ends_with("/herdr-windows-x86_64.zip"));
-            assert_eq!(
-                manifest.sha256.get("windows-x86_64").map(String::len),
-                Some(64),
-                "missing SHA-256 checksum for windows-x86_64"
-            );
-        }
-
-        for (version, release) in &manifest.releases {
-            let assets = release
-                .get("assets")
-                .and_then(serde_json::Value::as_object)
-                .unwrap_or_else(|| panic!("missing assets for release {version}"));
-            for target in [
-                "linux-x86_64",
-                "linux-aarch64",
-                "macos-x86_64",
-                "macos-aarch64",
-            ] {
-                let asset = assets
-                    .get(target)
-                    .cloned()
-                    .unwrap_or_else(|| panic!("missing asset URL for {version} {target}"));
-                let asset: AssetRef = serde_json::from_value(asset)
-                    .unwrap_or_else(|_| panic!("invalid asset for {version} {target}"));
-                let url = &asset.url;
-                assert!(
-                    url.contains("/releases/download/"),
-                    "unexpected release URL for {version} {target}: {url}"
-                );
-                assert!(
-                    url.ends_with(&format!("herdr-{target}")),
-                    "unexpected asset name for {version} {target}: {url}"
-                );
-            }
-            if let Some(windows) = assets.get("windows-x86_64") {
-                let windows: AssetRef = serde_json::from_value(windows.clone())
-                    .unwrap_or_else(|_| panic!("invalid Windows asset for release {version}"));
-                assert!(windows.url.ends_with("/herdr-windows-x86_64.zip"));
-                let checksums = release
-                    .get("sha256")
-                    .and_then(serde_json::Value::as_object)
-                    .unwrap_or_else(|| panic!("missing checksums for release {version}"));
-                assert!(checksums
-                    .get("windows-x86_64")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|value| value.len() == 64));
-            }
-        }
+    #[test]
+    fn every_update_channel_resolves_a_committed_fork_manifest_or_refuses() {
+        // Pin the actual URL, not merely the GitHub account: distribution/latest.json
+        // exists in this checkout but still points at upstream assets. A future sync
+        // must not quietly switch the updater to it or to herdr.dev/latest.json.
+        assert_eq!(
+            update_manifest_url(UpdateChannel::Preview).unwrap(),
+            "https://raw.githubusercontent.com/aceitw/herdr/master/latest.json"
+        );
+        assert!(Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("distribution/preview.json")
+            .is_file());
+        let refusal = update_manifest_url(UpdateChannel::Stable).unwrap_err();
+        assert!(refusal.contains(FORK_INSTALL_COMMAND), "{refusal}");
     }
 }

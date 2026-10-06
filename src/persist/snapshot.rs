@@ -9,7 +9,11 @@ use crate::terminal::TerminalRuntimeRegistry;
 use crate::workspace::Workspace;
 
 /// Current snapshot format version.
-pub(super) const SNAPSHOT_VERSION: u32 = 3;
+///
+/// Bumped 3 → 4 for the additive `archived_agents` collection. The new field is
+/// `#[serde(default)]`, so a v3 `session.json` still deserializes into a v4
+/// `SessionSnapshot` with an empty `archived_agents`.
+pub(super) const SNAPSHOT_VERSION: u32 = 4;
 
 /// Serializable snapshot of the entire herdr session.
 #[derive(Serialize, Deserialize)]
@@ -26,6 +30,12 @@ pub struct SessionSnapshot {
     pub sidebar_section_split: Option<f32>,
     #[serde(default)]
     pub collapsed_space_keys: std::collections::HashSet<String>,
+    /// Agents taken out of active rotation (issue #173, "archive"). Paneless:
+    /// each record freezes the resume identity of an agent whose pane was
+    /// released, so it can be resumed later without recreating the session.
+    /// Additive — a v3 snapshot lacking this field restores to an empty list.
+    #[serde(default)]
+    pub archived_agents: Vec<ArchivedAgentSnapshot>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -111,6 +121,32 @@ pub struct PaneSnapshot {
     pub agent_resume: Option<PaneAgentResumeSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_argv: Option<Vec<String>>,
+    /// Persisted terminal identity, so the terminal keeps the same
+    /// [`crate::terminal::TerminalId`] across a daemon restart instead of being
+    /// re-minted. Additive + optional: an old snapshot without it restores to a
+    /// freshly allocated id (previous behavior).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<String>,
+    /// Occupant generation at capture time — bumped each time a different agent
+    /// seizes the terminal — rehydrated on restore so the global identity
+    /// `machine_id / terminal_id / occupant_generation` survives a restart.
+    /// Additive: an old snapshot defaults it to 0.
+    #[serde(default)]
+    pub occupant_generation: u64,
+    /// WHICH ACCOUNT THIS PANE RUNS UNDER — the registry id only.
+    ///
+    /// Account routing was previously not persisted at all, so every restore put every
+    /// pane back on the harness default. A fleet that had been switched to a secondary
+    /// account came back on the primary and kept writing to the PRIMARY transcript, which
+    /// looked exactly like hours of work vanishing — the records were intact the whole
+    /// time, in the other account's file.
+    ///
+    /// An ID, never an environment or a token. The launch env is REBUILT from the account
+    /// registry at restore time, so a rotated config-home follows the registry and no
+    /// credential material is ever written to the snapshot. An id that no longer resolves
+    /// simply restores to the default, which is the old behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_account: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,6 +162,69 @@ pub struct PaneAgentSessionSnapshot {
     pub agent: String,
     pub kind: crate::agent_resume::AgentSessionRefKind,
     pub value: String,
+}
+
+/// A single archived agent (issue #173). Frozen at archive time: the resume
+/// identity (`agent_session`), the stable `terminal_id` and `occupant_generation`
+/// so an unarchive keeps the same global identity, the launch `cwd`, and the
+/// opaque `parked_work` that gitmoot supplies and renders (herdr stores it
+/// verbatim). This is both the durable serialized form and the runtime
+/// `AppState.archived_agents` element — the two would be byte-identical given
+/// `agent_session` already reuses the serializable [`PaneAgentSessionSnapshot`],
+/// so they are one type rather than a lock-step-divergent pair.
+///
+/// `PartialEq` (not `Eq`) because `parked_work` holds arbitrary JSON.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArchivedAgentSnapshot {
+    /// The agent's display name (`agent rename`), if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The agent kind label (e.g. `claude`, `codex`), for display and resume.
+    pub kind: String,
+    /// The stable terminal identity, preserved across the archive so an
+    /// unarchive resumes into the same `machine_id / terminal_id` slot.
+    pub terminal_id: String,
+    /// The resumable session identity, frozen from the live terminal.
+    pub agent_session: PaneAgentSessionSnapshot,
+    pub cwd: PathBuf,
+    /// Occupant generation at archive time, rehydrated on unarchive.
+    #[serde(default)]
+    pub occupant_generation: u64,
+    /// Who archived it and when, plus an optional reason.
+    pub archived: ArchivedAgentMeta,
+    /// Opaque open-work list, stored and returned verbatim.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parked_work: Vec<serde_json::Value>,
+    /// WHERE THE AGENT CAME FROM, so an unarchive can put it back rather than
+    /// stranding it somewhere new.
+    ///
+    /// Without these, unarchive allocated a fresh pane in a brand-new workspace and
+    /// the pane LABEL — which lived on the pane that archiving destroyed — could not
+    /// come back at all. That is not cosmetic: fleet tooling binds a role to its pane
+    /// BY LABEL, so every restored agent silently lost its binding and became
+    /// unreachable on that channel while looking perfectly healthy.
+    ///
+    /// All three are optional and `#[serde(default)]` so snapshots written before this
+    /// existed still load (same contract as `archived_agents` itself). `None` means
+    /// "origin unknown" and the restore falls back to a new workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_tab_id: Option<String>,
+    /// The pane's user-facing label at archive time (what `pane.rename` sets).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_label: Option<String>,
+}
+
+/// The `archived { at, by, reason }` provenance block on an [`ArchivedAgentSnapshot`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchivedAgentMeta {
+    /// RFC3339 timestamp of when the agent was archived.
+    pub at: String,
+    /// Who requested the archive (caller-supplied identity).
+    pub by: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -195,6 +294,8 @@ struct RawSessionSnapshot {
     sidebar_section_split: Option<f32>,
     #[serde(default)]
     collapsed_space_keys: std::collections::HashSet<String>,
+    #[serde(default)]
+    archived_agents: Vec<ArchivedAgentSnapshot>,
 }
 
 fn migrate_snapshot(raw: RawSessionSnapshot) -> Result<SessionSnapshot, String> {
@@ -210,6 +311,7 @@ fn migrate_snapshot(raw: RawSessionSnapshot) -> Result<SessionSnapshot, String> 
         sidebar_width: raw.sidebar_width,
         sidebar_section_split: raw.sidebar_section_split,
         collapsed_space_keys: raw.collapsed_space_keys,
+        archived_agents: raw.archived_agents,
     })
 }
 
@@ -269,6 +371,7 @@ pub fn capture(
     terminal_runtimes: &TerminalRuntimeRegistry,
     active: Option<usize>,
     selected: usize,
+    archived_agents: &[ArchivedAgentSnapshot],
 ) -> SessionSnapshot {
     SessionSnapshot {
         version: SNAPSHOT_VERSION,
@@ -281,6 +384,7 @@ pub fn capture(
         sidebar_width: None,
         sidebar_section_split: None,
         collapsed_space_keys: std::collections::HashSet::new(),
+        archived_agents: archived_agents.to_vec(),
     }
 }
 
@@ -338,7 +442,7 @@ fn capture_tab(
             .or_else(|| terminal.map(|terminal| terminal.cwd.clone()))
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| "/".into()));
         let label = terminal.and_then(|terminal| terminal.manual_label.clone());
-        let (agent_name, managed_agent_kind) = terminal
+        let (mut agent_name, mut managed_agent_kind) = terminal
             .filter(|terminal| !terminal.managed_agent_launch_pending())
             .map(|terminal| {
                 (
@@ -349,30 +453,60 @@ fn capture_tab(
                 )
             })
             .unwrap_or_default();
+        let guarded_transfer = terminal
+            .and_then(|terminal| terminal.session_transfer.as_ref())
+            .filter(|transfer| transfer.restart_owns_source());
+        if let Some(transfer) = guarded_transfer {
+            agent_name = terminal.and_then(|terminal| terminal.agent_name.clone());
+            managed_agent_kind = Some(transfer.source_kind.label().to_string());
+        }
         let launch_argv = terminal.and_then(|terminal| terminal.launch_argv.clone());
-        let agent_session = terminal.and_then(|terminal| {
-            if let Some(authority) = terminal.hook_authority.as_ref() {
-                if let Some(session_ref) = authority.session_ref.as_ref() {
-                    return Some(PaneAgentSessionSnapshot {
-                        source: authority.source.clone(),
-                        agent: authority.agent_label.clone(),
-                        kind: session_ref.kind,
-                        value: session_ref.value.clone(),
-                    });
-                }
-            }
-            terminal
-                .persisted_agent_session
-                .as_ref()
-                .map(|session| PaneAgentSessionSnapshot {
-                    source: session.source.clone(),
-                    agent: session.agent.clone(),
-                    kind: session.session_ref.kind,
-                    value: session.session_ref.value.clone(),
+        // Capture the account BEFORE the terminal is gone; without it a restore silently
+        // re-homes the pane onto the harness default.
+        let agent_account = guarded_transfer
+            .map(|transfer| transfer.source_account.clone())
+            .unwrap_or_else(|| terminal.and_then(|terminal| terminal.agent_account.clone()));
+        let agent_session = guarded_transfer
+            .map(|transfer| PaneAgentSessionSnapshot {
+                source: transfer.source_session.source.clone(),
+                agent: transfer.source_session.agent.clone(),
+                kind: transfer.source_session.session_ref.kind,
+                value: transfer.source_session.session_ref.value.clone(),
+            })
+            .or_else(|| {
+                terminal.and_then(|terminal| {
+                    if let Some(authority) = terminal.hook_authority.as_ref() {
+                        if let Some(session_ref) = authority.session_ref.as_ref() {
+                            return Some(PaneAgentSessionSnapshot {
+                                source: authority.source.clone(),
+                                agent: authority.agent_label.clone(),
+                                kind: session_ref.kind,
+                                value: session_ref.value.clone(),
+                            });
+                        }
+                    }
+                    terminal.persisted_agent_session.as_ref().map(|session| {
+                        PaneAgentSessionSnapshot {
+                            source: session.source.clone(),
+                            agent: session.agent.clone(),
+                            kind: session.session_ref.kind,
+                            value: session.session_ref.value.clone(),
+                        }
+                    })
                 })
-        });
+            });
+        // A transfer that still owns the source restores the pinned source session
+        // above. A resume command reported by any other agent (the target being
+        // launched) must not outrank it, or a restart would relaunch the target
+        // under the source's account.
         let agent_resume = terminal
             .and_then(|terminal| terminal.reported_resume())
+            .filter(|resume| {
+                guarded_transfer.is_none_or(|transfer| {
+                    resume.source == transfer.source_session.source
+                        && resume.agent == transfer.source_session.agent
+                })
+            })
             .map(|resume| PaneAgentResumeSnapshot {
                 source: resume.source.clone(),
                 agent: resume.agent.clone(),
@@ -388,6 +522,11 @@ fn capture_tab(
                 agent_session,
                 agent_resume,
                 launch_argv,
+                terminal_id: terminal.map(|terminal| terminal.id.to_string()),
+                occupant_generation: terminal
+                    .map(|terminal| terminal.occupant_generation)
+                    .unwrap_or(0),
+                agent_account,
             },
         );
     }
@@ -576,6 +715,7 @@ mod tests {
             terminal_runtimes,
             state.active,
             state.selected,
+            &state.archived_agents,
         )
     }
 
@@ -663,6 +803,7 @@ mod tests {
             sidebar_width: Some(26),
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
+            archived_agents: Vec::new(),
         };
         let json = serde_json::to_string(&snap).unwrap();
         let restored = parse_snapshot(&json).unwrap();
@@ -670,6 +811,168 @@ mod tests {
         assert_eq!(restored.active, None);
         assert_eq!(restored.sidebar_width, Some(26));
         assert_eq!(restored.sidebar_section_split, Some(0.5));
+    }
+
+    #[test]
+    fn v3_snapshot_without_archived_agents_still_parses() {
+        // A pre-#173 (v3) session.json has no `archived_agents` key. Serde default
+        // must fill it with an empty list so an old session still loads.
+        let v3 = serde_json::json!({
+            "version": 3,
+            "workspaces": [],
+            "active": null,
+            "selected": 0,
+            "sidebar_width": 26,
+            "sidebar_section_split": 0.5,
+            "collapsed_space_keys": [],
+        })
+        .to_string();
+        let restored = parse_snapshot(&v3).expect("v3 snapshot parses");
+        assert_eq!(restored.version, 3);
+        assert!(restored.archived_agents.is_empty());
+    }
+
+    /// An archived record written BEFORE the origin fields existed must still load,
+    /// with the origin simply absent — that record then restores into a new workspace,
+    /// exactly as it did before.
+    ///
+    /// Built from raw JSON rather than the struct, because the struct cannot express
+    /// "these keys were never written": constructing it with `None` would test the
+    /// defaults, not the parser.
+    #[test]
+    fn archived_record_without_origin_fields_still_parses() {
+        let raw = serde_json::json!({
+            "name": "reviewer",
+            "kind": "claude",
+            "terminal_id": "term-1",
+            "agent_session": {
+                "source": "herdr:claude",
+                "agent": "claude",
+                "kind": "id",
+                "value": "sess-123"
+            },
+            "cwd": "/work",
+            "occupant_generation": 7,
+            "archived": { "at": "2026-08-26T00:00:00Z", "by": "tester" }
+        });
+        let record: ArchivedAgentSnapshot =
+            serde_json::from_value(raw).expect("an old archived record must still load");
+        assert_eq!(record.name.as_deref(), Some("reviewer"));
+        assert!(record.origin_workspace_id.is_none());
+        assert!(record.origin_tab_id.is_none());
+        assert!(record.pane_label.is_none());
+    }
+
+    /// Account routing is CAPTURED FROM LIVE STATE and survives the round trip.
+    ///
+    /// It previously was not persisted at all, so every restore re-homed every pane onto
+    /// the harness default. A fleet switched to a secondary account came back on the
+    /// primary and appended to the PRIMARY transcript — which looked exactly like hours of
+    /// work disappearing, while the records sat intact in the other account's file.
+    ///
+    /// This drives the real `capture` path rather than building a `PaneSnapshot` literal:
+    /// a literal-based test passes even when the capture drops the field, which makes it a
+    /// test of serde and not of the behaviour.
+    #[test]
+    fn pane_account_routing_is_captured_and_round_trips() {
+        let mut state = AppState::test_new();
+        state.workspaces = vec![Workspace::test_new("agent")];
+        state.ensure_test_terminals();
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("terminal")
+            .agent_account = Some("claudecrazy".to_string());
+
+        let snapshot = capture_from_state(&state);
+        let pane = snapshot.workspaces[0].tabs[0]
+            .panes
+            .get(&pane_id.raw())
+            .expect("pane captured");
+        assert_eq!(
+            pane.agent_account.as_deref(),
+            Some("claudecrazy"),
+            "the pane's account must be captured, or a restore silently re-homes it"
+        );
+
+        // And it survives the wire, carrying an ID and nothing credential-shaped.
+        let json = serde_json::to_string(&snapshot).expect("serialize");
+        assert!(json.contains("claudecrazy"));
+        assert!(
+            !json.to_lowercase().contains("oauth_token"),
+            "the snapshot must never carry credential material"
+        );
+        let back: SessionSnapshot = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            back.workspaces[0].tabs[0].panes[&pane_id.raw()]
+                .agent_account
+                .as_deref(),
+            Some("claudecrazy")
+        );
+    }
+
+    /// A pane written before routing was persisted must still load, with no account — which
+    /// restores to the default, i.e. exactly the old behaviour.
+    #[test]
+    fn a_pane_without_account_routing_still_parses() {
+        let raw = serde_json::json!({
+            "cwd": "/work",
+            "label": "reviewer",
+            "terminal_id": "term-1",
+            "occupant_generation": 0
+        });
+        let pane: PaneSnapshot =
+            serde_json::from_value(raw).expect("an old pane record must still load");
+        assert!(pane.agent_account.is_none());
+        assert_eq!(pane.label.as_deref(), Some("reviewer"));
+    }
+
+    #[test]
+    fn archived_agents_round_trip_through_the_snapshot() {
+        let snap = SessionSnapshot {
+            version: SNAPSHOT_VERSION,
+            workspaces: vec![],
+            active: None,
+            selected: 0,
+            sidebar_width: Some(26),
+            sidebar_section_split: Some(0.5),
+            collapsed_space_keys: std::collections::HashSet::new(),
+            archived_agents: vec![ArchivedAgentSnapshot {
+                name: Some("reviewer".into()),
+                kind: "claude".into(),
+                terminal_id: "term-1".into(),
+                agent_session: PaneAgentSessionSnapshot {
+                    source: "herdr:claude".into(),
+                    agent: "claude".into(),
+                    kind: crate::agent_resume::AgentSessionRefKind::Id,
+                    value: "sess-123".into(),
+                },
+                cwd: PathBuf::from("/work"),
+                occupant_generation: 7,
+                archived: ArchivedAgentMeta {
+                    at: "2026-08-26T00:00:00Z".into(),
+                    by: "tester".into(),
+                    reason: Some("parked".into()),
+                },
+                parked_work: vec![serde_json::json!({"pr": 42})],
+                origin_workspace_id: Some("w1".into()),
+                origin_tab_id: Some("w1:t2".into()),
+                pane_label: Some("reviewer".into()),
+            }],
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let restored = parse_snapshot(&json).unwrap();
+        assert_eq!(restored.archived_agents.len(), 1);
+        let record = &restored.archived_agents[0];
+        assert_eq!(record.terminal_id, "term-1");
+        assert_eq!(record.occupant_generation, 7);
+        assert_eq!(record.agent_session.value, "sess-123");
+        assert_eq!(record.archived.by, "tester");
+        assert_eq!(record.parked_work, vec![serde_json::json!({"pr": 42})]);
     }
 
     #[test]
@@ -707,6 +1010,9 @@ mod tests {
                 agent_session: None,
                 agent_resume: None,
                 launch_argv: None,
+                terminal_id: None,
+                occupant_generation: 0,
+                agent_account: None,
             },
         );
         panes.insert(
@@ -719,6 +1025,9 @@ mod tests {
                 agent_session: None,
                 agent_resume: None,
                 launch_argv: None,
+                terminal_id: None,
+                occupant_generation: 0,
+                agent_account: None,
             },
         );
 
@@ -752,6 +1061,7 @@ mod tests {
             sidebar_width: Some(26),
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
+            archived_agents: Vec::new(),
             version: SNAPSHOT_VERSION,
         };
 
@@ -1263,6 +1573,66 @@ mod tests {
     }
 
     #[test]
+    fn capture_persists_terminal_id_and_occupant_generation() {
+        let mut state = state_with_workspaces(&["one"]);
+        let root = state.workspaces[0].tabs[0].root_pane;
+        state.ensure_test_terminals();
+        let terminal_id = state.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .occupant_generation = 5;
+
+        let snapshot = capture_from_state(&state);
+        let pane = &snapshot.workspaces[0].tabs[0].panes[&root.raw()];
+        assert_eq!(
+            pane.terminal_id.as_deref(),
+            Some(terminal_id.to_string().as_str()),
+            "captured pane must carry the terminal's persisted id"
+        );
+        assert_eq!(
+            pane.occupant_generation, 5,
+            "captured pane must carry the terminal's occupant generation"
+        );
+    }
+
+    #[test]
+    fn capture_defaults_occupant_generation_and_terminal_id_are_additive() {
+        // A snapshot written before W6 has neither field; both decode to their
+        // additive defaults (terminal_id: None, occupant_generation: 0) without
+        // failing the load, and re-serializing omits the absent optional.
+        let json = serde_json::json!({
+            "version": SNAPSHOT_VERSION,
+            "workspaces": [{
+                "id": "wtest",
+                "identity_cwd": "/tmp",
+                "tabs": [{
+                    "layout": { "Pane": 0 },
+                    "panes": { "0": { "cwd": "/tmp" } },
+                    "zoomed": false,
+                    "focused": 0,
+                    "root_pane": 0
+                }],
+                "active_tab": 0
+            }],
+            "active": 0,
+            "selected": 0
+        })
+        .to_string();
+
+        let restored = parse_snapshot(&json).unwrap();
+        let pane = &restored.workspaces[0].tabs[0].panes[&0];
+        assert_eq!(pane.terminal_id, None);
+        assert_eq!(pane.occupant_generation, 0);
+
+        let encoded = serde_json::to_string(&restored).unwrap();
+        assert!(!encoded.contains("terminal_id"));
+    }
+
+    #[test]
     fn capture_contract_tracks_hook_authority_agent_session() {
         let mut state = state_with_workspaces(&["one"]);
         let session_path = test_session_path("pi-session.jsonl");
@@ -1373,6 +1743,218 @@ mod tests {
     }
 
     #[test]
+    fn transfer_snapshot_keeps_source_ownership_until_target_is_verified() {
+        let mut state = state_with_workspaces(&["one"]);
+        let root = state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = state.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.agent_account = Some("codex-work".into());
+        terminal.set_hook_authority_with_session_ref(
+            "herdr:codex".into(),
+            "codex".into(),
+            crate::detect::AgentState::Idle,
+            None,
+            Some(crate::agent_resume::AgentSessionRef::id("codex-target").unwrap()),
+            Some(20),
+        );
+        terminal.begin_managed_agent(
+            "jarvis".into(),
+            crate::detect::Agent::Codex,
+            std::time::Instant::now(),
+            std::time::Duration::from_secs(3),
+            std::time::Duration::from_secs(30),
+        );
+        terminal.session_transfer = Some(claude_to_codex_transfer_awaiting_target());
+
+        let guarded = capture_from_state(&state);
+        let pane = &guarded.workspaces[0].tabs[0].panes[&root.raw()];
+        let session = pane.agent_session.as_ref().expect("source session");
+        assert_eq!(session.source, "herdr:claude");
+        assert_eq!(session.agent, "claude");
+        assert_eq!(session.value, "claude-source");
+        assert_eq!(pane.agent_account.as_deref(), Some("claude-work"));
+        assert_eq!(pane.managed_agent_kind.as_deref(), Some("claude"));
+        assert_eq!(
+            pane.agent_name.as_deref(),
+            Some("jarvis"),
+            "a guarded transfer snapshot must retain the durable name even while the target launch is pending"
+        );
+
+        #[cfg(unix)]
+        {
+            let (events, _event_rx) = tokio::sync::mpsc::channel(4);
+            let (_workspaces, restored_terminals, restored_runtimes) =
+                crate::persist::restore::restore(
+                    &guarded,
+                    None,
+                    24,
+                    80,
+                    0,
+                    "/bin/sh",
+                    crate::config::ShellModeConfig::NonLogin,
+                    true,
+                    events,
+                    std::sync::Arc::new(tokio::sync::Notify::new()),
+                    std::sync::Arc::new(crate::render_signal::RenderSignal::new()),
+                );
+            assert!(restored_runtimes.is_empty());
+            let restored = restored_terminals.values().next().unwrap();
+            assert_eq!(restored.agent_name.as_deref(), Some("jarvis"));
+            assert_eq!(
+                restored.managed_agent_kind(),
+                Some(crate::detect::Agent::Claude)
+            );
+        }
+
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .restore_managed_agent("jarvis".into(), crate::detect::Agent::Codex);
+
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .session_transfer
+            .as_mut()
+            .unwrap()
+            .phase = crate::api::schema::AgentSessionTransferPhase::Completed;
+        let completed = capture_from_state(&state);
+        let pane = &completed.workspaces[0].tabs[0].panes[&root.raw()];
+        let session = pane.agent_session.as_ref().expect("target session");
+        assert_eq!(session.source, "herdr:codex");
+        assert_eq!(session.agent, "codex");
+        assert_eq!(session.value, "codex-target");
+        assert_eq!(pane.agent_account.as_deref(), Some("codex-work"));
+
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .session_transfer
+            .as_mut()
+            .unwrap()
+            .awaiting_deferred_target_report = true;
+        let deferred = capture_from_state(&state);
+        let pane = &deferred.workspaces[0].tabs[0].panes[&root.raw()];
+        let session = pane.agent_session.as_ref().expect("source session");
+        assert_eq!(session.source, "herdr:claude");
+        assert_eq!(session.agent, "claude");
+        assert_eq!(session.value, "claude-source");
+        assert_eq!(pane.agent_account.as_deref(), Some("claude-work"));
+        assert_eq!(pane.agent_name.as_deref(), Some("jarvis"));
+    }
+
+    fn claude_to_codex_transfer_awaiting_target() -> crate::session_transfer::RuntimeSessionTransfer
+    {
+        crate::session_transfer::RuntimeSessionTransfer {
+            id: "transfer-1".into(),
+            source_kind: crate::session_transfer::HarnessKind::Claude,
+            source_session: crate::agent_resume::PersistedAgentSession {
+                source: "herdr:claude".into(),
+                agent: "claude".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id("claude-source").unwrap(),
+            },
+            source_account: Some("claude-work".into()),
+            source_config_home: PathBuf::from("/tmp/claude-home"),
+            source_sessions_root: PathBuf::from("/tmp/claude-home"),
+            source_cursor: None,
+            source_process_pid: None,
+            target_kind: crate::session_transfer::HarnessKind::Codex,
+            target_account: Some("codex-work".into()),
+            target_config_home: PathBuf::from("/tmp/codex-home"),
+            target_sessions_root: PathBuf::from("/tmp/codex-home"),
+            phase: crate::api::schema::AgentSessionTransferPhase::AwaitingTarget,
+            message_count: 3,
+            omissions: Default::default(),
+            error: None,
+            source_path: None,
+            source_fingerprint: None,
+            target_session_ref: crate::agent_resume::AgentSessionRef::id("codex-target"),
+            target_cursor: None,
+            target_transcript_path: None,
+            target_fingerprint: None,
+            target_deadline: None,
+            target_process: None,
+            source_rollback_process: None,
+            verification_in_flight: None,
+            verification_observation_deadline: None,
+            awaiting_deferred_target_report: false,
+            target_report_accepted: false,
+        }
+    }
+
+    /// While a transfer still owns the source, a restart restores the source
+    /// session. A resume command the not-yet-verified target reported must not
+    /// override that: it would relaunch the target under the source's account.
+    #[test]
+    fn guarded_transfer_snapshot_drops_a_target_reported_resume() {
+        let mut state = state_with_workspaces(&["one"]);
+        let root = state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = state.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_hook_authority_with_session_ref(
+            "herdr:codex".into(),
+            "codex".into(),
+            crate::detect::AgentState::Idle,
+            None,
+            Some(crate::agent_resume::AgentSessionRef::id("codex-target").unwrap()),
+            Some(20),
+        );
+        assert!(terminal.record_reported_resume(
+            "herdr:codex",
+            "codex",
+            Some(21),
+            vec!["codex".into(), "resume".into(), "codex-target".into()],
+        ));
+        terminal.session_transfer = Some(claude_to_codex_transfer_awaiting_target());
+
+        let guarded = capture_from_state(&state);
+        let pane = &guarded.workspaces[0].tabs[0].panes[&root.raw()];
+        assert_eq!(pane.agent_session.as_ref().unwrap().agent, "claude");
+        assert!(
+            pane.agent_resume.is_none(),
+            "the target's resume command must not outrank the pinned source session"
+        );
+
+        // The source's own reported resume still names the session being restored.
+        let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.restore_reported_resume(crate::agent_resume::ReportedAgentResume {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            argv: vec!["claude".into(), "--resume".into(), "claude-source".into()],
+        });
+        let guarded = capture_from_state(&state);
+        let resume = guarded.workspaces[0].tabs[0].panes[&root.raw()]
+            .agent_resume
+            .as_ref()
+            .expect("the source's reported resume is kept");
+        assert_eq!(resume.agent, "claude");
+
+        // Once the target is verified the transfer no longer guards the pane.
+        let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+        assert!(terminal.record_reported_resume(
+            "herdr:codex",
+            "codex",
+            Some(22),
+            vec!["codex".into(), "resume".into(), "codex-target".into()],
+        ));
+        terminal.session_transfer.as_mut().unwrap().phase =
+            crate::api::schema::AgentSessionTransferPhase::Completed;
+        let completed = capture_from_state(&state);
+        let resume = completed.workspaces[0].tabs[0].panes[&root.raw()]
+            .agent_resume
+            .as_ref()
+            .expect("a completed transfer keeps the target's reported resume");
+        assert_eq!(resume.agent, "codex");
+    }
+
+    #[test]
     fn old_unversioned_snapshot_loads_as_version_0() {
         let json = r#"{"workspaces":[],"active":null,"selected":0}"#;
         let snap = parse_snapshot(json).unwrap();
@@ -1405,6 +1987,9 @@ mod tests {
                 agent_session: None,
                 agent_resume: None,
                 launch_argv: None,
+                terminal_id: None,
+                occupant_generation: 0,
+                agent_account: None,
             },
         );
         panes.insert(
@@ -1419,6 +2004,9 @@ mod tests {
                 agent_session: None,
                 agent_resume: None,
                 launch_argv: None,
+                terminal_id: None,
+                occupant_generation: 0,
+                agent_account: None,
             },
         );
 
@@ -1453,6 +2041,7 @@ mod tests {
             sidebar_width: Some(26),
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
+            archived_agents: Vec::new(),
         };
 
         let json = serde_json::to_string(&snap).unwrap();

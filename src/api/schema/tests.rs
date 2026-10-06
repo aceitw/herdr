@@ -2,6 +2,101 @@ use std::collections::HashMap;
 
 use super::*;
 
+#[test]
+fn agent_list_params_preserve_aggregate_default_and_local_only_wire_shape() {
+    let legacy: Request = serde_json::from_value(serde_json::json!({
+        "id": "list",
+        "method": "agent.list",
+        "params": {}
+    }))
+    .expect("legacy empty params remain valid");
+    let Method::AgentList(legacy_params) = legacy.method else {
+        panic!("expected agent.list");
+    };
+    assert!(!legacy_params.local_only);
+
+    let local = Request {
+        id: "local".into(),
+        method: Method::AgentList(AgentListParams { local_only: true }),
+    };
+    let encoded = serde_json::to_value(&local).expect("encode local-only agent.list");
+    assert_eq!(encoded["params"]["local_only"], true);
+    assert_eq!(serde_json::from_value::<Request>(encoded).unwrap(), local);
+}
+
+#[test]
+fn agent_list_response_preserves_legacy_shape_and_reports_origin_identity() {
+    let legacy: SuccessResponse = serde_json::from_value(serde_json::json!({
+        "id": "legacy",
+        "result": {
+            "type": "agent_list",
+            "agents": []
+        }
+    }))
+    .expect("legacy response without origin identity remains valid");
+    let ResponseResult::AgentList {
+        agents,
+        origin_machine_id,
+        origin_boot_id,
+        ..
+    } = legacy.result
+    else {
+        panic!("expected agent_list");
+    };
+    assert!(agents.is_empty());
+    assert_eq!(origin_machine_id, None);
+    assert_eq!(origin_boot_id, None);
+
+    let current = SuccessResponse {
+        id: "current".into(),
+        result: ResponseResult::AgentList {
+            agents: Vec::new(),
+            origin_machine_id: Some("machine_current".into()),
+            origin_boot_id: Some("boot_current".into()),
+            origin_version: Some("0.9.1".into()),
+            origin_protocol: Some(2),
+            origin_capabilities: None,
+        },
+    };
+    let encoded = serde_json::to_value(&current).unwrap();
+    assert_eq!(encoded["result"]["origin_machine_id"], "machine_current");
+    assert_eq!(encoded["result"]["origin_boot_id"], "boot_current");
+    assert_eq!(encoded["result"]["origin_version"], "0.9.1");
+    assert_eq!(encoded["result"]["origin_protocol"], 2);
+}
+
+#[test]
+fn pane_info_without_composer_deserializes_as_unknown() {
+    let pane: PaneInfo = serde_json::from_value(serde_json::json!({
+        "pane_id": "pane_1",
+        "terminal_id": "term_1",
+        "workspace_id": "ws_1",
+        "tab_id": "tab_1",
+        "focused": true,
+        "agent_status": "idle",
+        "revision": 1
+    }))
+    .expect("old pane shape remains readable");
+    assert_eq!(pane.composer.state, ComposerState::Unknown);
+    assert!(!pane.composer.evidence.frame_stable);
+}
+
+#[test]
+fn agent_info_without_composer_deserializes_as_unknown() {
+    let agent: AgentInfo = serde_json::from_value(serde_json::json!({
+        "terminal_id": "term_1",
+        "agent_status": "idle",
+        "workspace_id": "ws_1",
+        "tab_id": "tab_1",
+        "pane_id": "pane_1",
+        "focused": true,
+        "revision": 1
+    }))
+    .expect("old agent shape remains readable");
+    assert_eq!(agent.composer.state, ComposerState::Unknown);
+    assert!(!agent.composer.evidence.frame_stable);
+}
+
 fn protocol_schema_entry<T: schemars::JsonSchema>(name: &str) -> serde_json::Value {
     let mut schema = serde_json::to_value(schemars::schema_for!(T)).unwrap();
     rewrite_schema_refs(&mut schema, name);
@@ -41,6 +136,8 @@ fn protocol_schema_document() -> serde_json::Value {
             "error_response": protocol_schema_entry::<ErrorResponse>("error_response"),
             "event": protocol_schema_entry::<EventEnvelope>("event"),
             "subscription_event": protocol_schema_entry::<SubscriptionEventEnvelope>("subscription_event"),
+            "subscription_stream_event": protocol_schema_entry::<SubscriptionStreamEvent>("subscription_stream_event"),
+            "subscription_control": protocol_schema_entry::<SubscriptionControlLine>("subscription_control"),
         },
     })
 }
@@ -100,6 +197,7 @@ fn agent_start_and_prompt_requests_round_trip() {
             pane_id: "w1:p2".into(),
             args: vec!["--no-session".into()],
             timeout_ms: Some(30_000),
+            account: None,
         }),
     };
     let start_json = serde_json::to_value(&start).unwrap();
@@ -531,6 +629,119 @@ fn pane_process_info_request_round_trips() {
 }
 
 #[test]
+fn pane_set_pty_size_request_and_response_round_trip() {
+    let request = Request {
+        id: "req_set_pty_size".into(),
+        method: Method::PaneSetPtySize(PaneSetPtySizeParams {
+            pane_id: Some("w1-1".into()),
+            cols: 100,
+            rows: 40,
+            cell_width_px: Some(8),
+            cell_height_px: Some(16),
+            lock: true,
+            viewer_id: Some("viewer-a".into()),
+            ttl_ms: Some(60_000),
+            require_stream: false,
+        }),
+    };
+    let json = serde_json::to_value(&request).unwrap();
+    assert_eq!(json["method"], "pane.set_pty_size");
+    assert_eq!(json["params"]["cols"], 100);
+    assert_eq!(json["params"]["rows"], 40);
+    assert_eq!(json["params"]["lock"], true);
+    assert_eq!(json["params"]["viewer_id"], "viewer-a");
+    assert_eq!(json["params"]["ttl_ms"], 60_000);
+    let restored: Request = serde_json::from_value(json).unwrap();
+    assert_eq!(restored, request);
+
+    // cell_*_px, lock, viewer_id, and ttl_ms are optional/defaulted on the wire.
+    let minimal: Request = serde_json::from_str(
+        r#"{"id":"req_2","method":"pane.set_pty_size","params":{"cols":80,"rows":24}}"#,
+    )
+    .unwrap();
+    let Method::PaneSetPtySize(params) = minimal.method else {
+        panic!("wrong method parsed");
+    };
+    assert_eq!((params.cols, params.rows), (80, 24));
+    assert_eq!(params.cell_width_px, None);
+    assert_eq!(params.cell_height_px, None);
+    assert!(!params.lock);
+    assert_eq!(params.viewer_id, None);
+    assert_eq!(params.ttl_ms, None);
+
+    let response = SuccessResponse {
+        id: "req_set_pty_size".into(),
+        result: ResponseResult::PanePtySize {
+            pane_id: "w1-1".into(),
+            cols: 100,
+            rows: 40,
+            locked: true,
+        },
+    };
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("\"type\":\"pane_pty_size\""));
+    let restored: SuccessResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(restored, response);
+}
+
+#[test]
+fn pane_stream_request_round_trips_and_defaults() {
+    let request = Request {
+        id: "req_stream".into(),
+        method: Method::PaneStream(PaneStreamParams {
+            pane_id: "w1:p1".into(),
+            include_history: true,
+            resume_from: Some(918_273),
+            epoch: Some(7),
+            max_frame_bytes: Some(65_536),
+            scrollback_lines: Some(200),
+            viewer_id: Some("viewer-1".into()),
+        }),
+    };
+    let json = serde_json::to_value(&request).unwrap();
+    assert_eq!(json["method"], "pane.stream");
+    assert_eq!(json["params"]["pane_id"], "w1:p1");
+    assert_eq!(json["params"]["max_frame_bytes"], 65_536);
+    assert_eq!(json["params"]["viewer_id"], "viewer-1");
+    let restored: Request = serde_json::from_value(json).unwrap();
+    assert_eq!(restored, request);
+
+    // Only pane_id is required; include_history defaults to true and the resume
+    // axis is optional on the wire.
+    let minimal: Request =
+        serde_json::from_str(r#"{"id":"req_2","method":"pane.stream","params":{"pane_id":"p"}}"#)
+            .unwrap();
+    let Method::PaneStream(params) = minimal.method else {
+        panic!("wrong method parsed");
+    };
+    assert_eq!(params.pane_id, "p");
+    assert!(params.include_history);
+    assert_eq!(params.resume_from, None);
+    assert_eq!(params.epoch, None);
+    assert_eq!(params.max_frame_bytes, None);
+    assert_eq!(params.viewer_id, None);
+}
+
+#[test]
+fn stream_started_response_round_trips() {
+    let response = SuccessResponse {
+        id: "req_stream".into(),
+        result: ResponseResult::StreamStarted {
+            pane_id: "w1:p1".into(),
+            epoch: 7,
+            cols: 80,
+            rows: 24,
+            base_seq: 918_273,
+            resync: true,
+        },
+    };
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("\"type\":\"stream_started\""));
+    let restored: SuccessResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(restored, response);
+}
+
+#[test]
 fn event_envelope_round_trips() {
     let events = [
         EventEnvelope {
@@ -624,6 +835,10 @@ fn subscribe_request_parses_parameterized_subscriptions() {
                     "agent_status": "done"
                 },
                 {
+                    "type": "pane.turn_completed",
+                    "pane_id": "p_1_1"
+                },
+                {
                     "type": "pane.scroll_changed",
                     "pane_id": "p_1_1"
                 }
@@ -636,7 +851,7 @@ fn subscribe_request_parses_parameterized_subscriptions() {
     let Method::EventsSubscribe(params) = request.method else {
         panic!("wrong method parsed");
     };
-    assert_eq!(params.subscriptions.len(), 3);
+    assert_eq!(params.subscriptions.len(), 4);
     assert!(matches!(
         &params.subscriptions[0],
         Subscription::PaneOutputMatched {
@@ -652,10 +867,14 @@ fn subscribe_request_parses_parameterized_subscriptions() {
         Subscription::PaneAgentStatusChanged {
             pane_id,
             agent_status: Some(AgentStatus::Done),
-        } if pane_id == "p_1_1"
+        } if pane_id.as_deref() == Some("p_1_1")
     ));
     assert!(matches!(
         &params.subscriptions[2],
+        Subscription::PaneTurnCompleted { pane_id } if pane_id.as_deref() == Some("p_1_1")
+    ));
+    assert!(matches!(
+        &params.subscriptions[3],
         Subscription::PaneScrollChanged { pane_id } if pane_id == "p_1_1"
     ));
 }
@@ -714,6 +933,173 @@ fn agent_status_request_values_remain_strict() {
 }
 
 #[test]
+fn old_agent_status_event_shape_deserializes_without_turn_hints() {
+    let event: PaneAgentStatusChangedEvent = serde_json::from_value(serde_json::json!({
+        "pane_id": "p_1_1",
+        "workspace_id": "w_1",
+        "agent_status": "idle",
+        "state_labels": {}
+    }))
+    .unwrap();
+
+    assert_eq!(event.turn, None);
+    assert_eq!(event.turn_epoch, None);
+    assert!(!event.input_pending);
+    assert_eq!(event.input_prompt_kind, None);
+    let serialized = serde_json::to_value(event).unwrap();
+    assert!(serialized.get("input_pending").is_none());
+    assert!(serialized.get("input_prompt_kind").is_none());
+}
+
+#[test]
+fn old_agent_info_shape_defaults_and_omits_the_input_tuple() {
+    let agent: AgentInfo = serde_json::from_value(serde_json::json!({
+        "terminal_id": "term_1",
+        "agent_status": "idle",
+        "workspace_id": "w_1",
+        "tab_id": "t_1",
+        "pane_id": "p_1",
+        "focused": true,
+        "revision": 3
+    }))
+    .unwrap();
+
+    assert!(!agent.input_pending);
+    assert_eq!(agent.input_prompt_kind, None);
+    let serialized = serde_json::to_value(agent).unwrap();
+    assert!(serialized.get("input_pending").is_none());
+    assert!(serialized.get("input_prompt_kind").is_none());
+}
+
+#[test]
+fn old_pane_info_shape_defaults_and_omits_the_input_tuple() {
+    let pane: PaneInfo = serde_json::from_value(serde_json::json!({
+        "pane_id": "p_1",
+        "terminal_id": "term_1",
+        "workspace_id": "w_1",
+        "tab_id": "t_1",
+        "focused": true,
+        "agent_status": "idle",
+        "revision": 3
+    }))
+    .unwrap();
+
+    assert!(!pane.input_pending);
+    assert_eq!(pane.input_prompt_kind, None);
+    let serialized = serde_json::to_value(pane).unwrap();
+    assert!(serialized.get("input_pending").is_none());
+    assert!(serialized.get("input_prompt_kind").is_none());
+}
+
+#[test]
+fn old_pane_info_shape_defaults_alternate_screen_false_and_omits_it() {
+    let pane: PaneInfo = serde_json::from_value(serde_json::json!({
+        "pane_id": "p_1",
+        "terminal_id": "term_1",
+        "workspace_id": "w_1",
+        "tab_id": "t_1",
+        "focused": true,
+        "agent_status": "idle",
+        "revision": 3
+    }))
+    .unwrap();
+
+    assert!(!pane.alternate_screen);
+    let serialized = serde_json::to_value(pane).unwrap();
+    assert!(serialized.get("alternate_screen").is_none());
+}
+
+#[test]
+fn old_event_data_agent_status_shape_defaults_and_omits_the_input_tuple() {
+    let event: EventData = serde_json::from_value(serde_json::json!({
+        "type": "pane_agent_status_changed",
+        "pane_id": "p_1",
+        "workspace_id": "w_1",
+        "agent_status": "idle"
+    }))
+    .unwrap();
+
+    let EventData::PaneAgentStatusChanged {
+        input_pending,
+        input_prompt_kind,
+        ..
+    } = &event
+    else {
+        panic!("expected pane agent status event");
+    };
+    assert!(!input_pending);
+    assert_eq!(*input_prompt_kind, None);
+    let serialized = serde_json::to_value(event).unwrap();
+    assert!(serialized.get("input_pending").is_none());
+    assert!(serialized.get("input_prompt_kind").is_none());
+}
+
+#[test]
+fn old_agent_prompted_response_defaults_delivery_to_none() {
+    let response: SuccessResponse = serde_json::from_value(serde_json::json!({
+        "id": "prompt",
+        "result": {
+            "type": "agent_prompted",
+            "agent": {
+                "terminal_id": "term_1",
+                "agent_status": "idle",
+                "workspace_id": "w_1",
+                "tab_id": "t_1",
+                "pane_id": "p_1",
+                "focused": true,
+                "revision": 3
+            }
+        }
+    }))
+    .unwrap();
+
+    let ResponseResult::AgentPrompted { delivery, .. } = response.result else {
+        panic!("expected prompted response");
+    };
+    assert_eq!(delivery, None);
+}
+
+#[test]
+fn turn_completed_subscription_event_round_trips_as_disjoint_variant() {
+    let json = serde_json::json!({
+        "event": "pane.turn_completed",
+        "data": {
+            "pane": {
+                "pane_id": "p_1_1",
+                "terminal_id": "term_1",
+                "workspace_id": "w_1",
+                "tab_id": "t_1",
+                "focused": true,
+                "agent_status": "idle",
+                "revision": 4
+            },
+            "turn": 7,
+            "turn_epoch": 99,
+            "outcome": "completed",
+            "message": "done",
+            "message_truncated": true,
+            "agent_session_path": "/tmp/session.jsonl",
+            "completed_unix_ms": 1234
+        }
+    });
+    let event: SubscriptionEventEnvelope = serde_json::from_value(json).unwrap();
+    assert_eq!(event.event, SubscriptionEventKind::PaneTurnCompleted);
+    let SubscriptionEventData::PaneTurnCompleted(data) = &event.data else {
+        panic!("turn_completed was shadowed by another untagged event variant");
+    };
+    assert_eq!(data.outcome, crate::terminal::TurnOutcome::Completed);
+    assert!(data.message_truncated);
+    assert_eq!(
+        data.agent_session_path.as_deref(),
+        Some("/tmp/session.jsonl")
+    );
+
+    let restored: SubscriptionEventEnvelope =
+        serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+    assert_eq!(restored, event);
+}
+
+#[test]
 fn success_response_round_trips() {
     let response = SuccessResponse {
         id: "req_1".into(),
@@ -726,12 +1112,27 @@ fn success_response_round_trips() {
                 endpoint_protocol_generation: Some(1),
                 surface_interest: true,
                 health_check: true,
+                pane_input_stream: false,
+                gram_upload_stream: true,
+                agent_session_transfer: true,
+                agent_session_transfer_harnesses: vec![
+                    AgentSessionTransferHarness::Claude,
+                    AgentSessionTransferHarness::Codex,
+                    AgentSessionTransferHarness::Omp,
+                ],
+                events_v2: false,
                 ssh_agent_registration: false,
+                agent_forget: false,
             }),
         },
     };
 
     let json = serde_json::to_string(&response).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        value["result"]["capabilities"]["agent_session_transfer_harnesses"],
+        serde_json::json!(["claude", "codex", "omp"])
+    );
     let restored: SuccessResponse = serde_json::from_str(&json).unwrap();
     assert_eq!(restored, response);
 }
@@ -801,6 +1202,11 @@ fn worktree_request_and_response_round_trip() {
                 active_tab_id: "w_1:1".into(),
                 agent_status: AgentStatus::Unknown,
                 tokens: HashMap::new(),
+                machine_id: None,
+                machine_profile_id: None,
+                machine_label: None,
+                reachability: None,
+                last_known_status: None,
                 worktree: Some(WorkspaceWorktreeInfo {
                     repo_key: "/repo/herdr/.git".into(),
                     repo_name: "herdr".into(),
@@ -817,6 +1223,9 @@ fn worktree_request_and_response_round_trip() {
                 focused: true,
                 pane_count: 1,
                 agent_status: AgentStatus::Unknown,
+                machine_id: None,
+                machine_profile_id: None,
+                machine_label: None,
             },
             root_pane: PaneInfo {
                 pane_id: "w_1-1".into(),
@@ -834,10 +1243,17 @@ fn worktree_request_and_response_round_trip() {
                 terminal_title_stripped: None,
                 display_agent: None,
                 agent_status: AgentStatus::Unknown,
+                input_pending: false,
+                input_prompt_kind: None,
+                composer: Default::default(),
                 state_labels: HashMap::new(),
                 tokens: HashMap::new(),
                 agent_session: None,
+                last_completed_turn: None,
+                turn: None,
+                turn_epoch: None,
                 scroll: None,
+                alternate_screen: false,
                 revision: 0,
             },
             worktree: WorktreeInfo {
@@ -869,6 +1285,8 @@ fn worktree_lifecycle_events_round_trip() {
                 Subscription::WorktreeOpened {},
                 Subscription::WorktreeRemoved {},
             ],
+            events_v2: false,
+            local_only: false,
         }),
     };
     let json = serde_json::to_string(&subscription).unwrap();
@@ -888,6 +1306,11 @@ fn worktree_lifecycle_events_round_trip() {
         active_tab_id: "w_2:1".into(),
         agent_status: AgentStatus::Unknown,
         tokens: HashMap::new(),
+        machine_id: None,
+        machine_profile_id: None,
+        machine_label: None,
+        reachability: None,
+        last_known_status: None,
         worktree: Some(WorkspaceWorktreeInfo {
             repo_key: "/repo/herdr/.git".into(),
             repo_name: "herdr".into(),
@@ -1222,6 +1645,8 @@ fn authority_mutation_requests_round_trip() {
                 Subscription::TabMoved {},
                 Subscription::LayoutUpdated {},
             ],
+            events_v2: false,
+            local_only: false,
         }),
     };
     let json = serde_json::to_string(&subscription).unwrap();
@@ -1246,6 +1671,9 @@ fn create_response_round_trips_with_root_pane() {
                 focused: false,
                 pane_count: 1,
                 agent_status: AgentStatus::Unknown,
+                machine_id: None,
+                machine_profile_id: None,
+                machine_label: None,
             },
             root_pane: PaneInfo {
                 pane_id: "w_1-3".into(),
@@ -1263,10 +1691,17 @@ fn create_response_round_trips_with_root_pane() {
                 terminal_title_stripped: None,
                 display_agent: None,
                 agent_status: AgentStatus::Unknown,
+                input_pending: false,
+                input_prompt_kind: None,
+                composer: Default::default(),
                 state_labels: HashMap::new(),
                 tokens: HashMap::new(),
                 agent_session: None,
+                last_completed_turn: None,
+                turn: None,
+                turn_epoch: None,
                 scroll: None,
+                alternate_screen: false,
                 revision: 0,
             },
         },
@@ -1457,5 +1892,58 @@ fn pane_link_resolve_round_trips() {
     assert_eq!(
         serde_json::from_value::<ResponseResult>(json).unwrap(),
         result
+    );
+}
+
+#[test]
+fn notification_registrations_accept_legacy_and_relay_capability_payloads() {
+    let legacy: Request = serde_json::from_value(serde_json::json!({
+        "id": "reg",
+        "method": "notifications.register_device",
+        "params": {"device_token": "ab", "platform": "ios"}
+    }))
+    .expect("legacy register_device decodes");
+    let Method::NotificationsRegisterDevice(params) = legacy.method else {
+        panic!("expected register_device");
+    };
+    assert_eq!(params.relay_capability, None);
+
+    let relayed: Request = serde_json::from_value(serde_json::json!({
+        "id": "reg",
+        "method": "notifications.register_activity",
+        "params": {"activity_push_token": "ab", "relay_capability": "hpr1.AbC"}
+    }))
+    .expect("register_activity with capability decodes");
+    let Method::NotificationsRegisterActivity(params) = relayed.method else {
+        panic!("expected register_activity");
+    };
+    assert_eq!(params.relay_capability.as_deref(), Some("hpr1.AbC"));
+}
+
+#[test]
+fn notifications_status_response_wire_shape() {
+    let response = SuccessResponse {
+        id: "status".into(),
+        result: ResponseResult::NotificationsStatus {
+            state: NotificationsStatusState::RelayReady,
+            mode: crate::config::PushMode::Auto,
+            relay_url: "https://push.herdrup.themartian.app".into(),
+            devices: 2,
+            relay_devices: 1,
+        },
+    };
+    assert_eq!(
+        serde_json::to_value(&response).unwrap(),
+        serde_json::json!({
+            "id": "status",
+            "result": {
+                "type": "notifications_status",
+                "state": "relay_ready",
+                "mode": "auto",
+                "relay_url": "https://push.herdrup.themartian.app",
+                "devices": 2,
+                "relay_devices": 1
+            }
+        })
     );
 }

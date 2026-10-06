@@ -77,7 +77,7 @@ pub fn restore(
     render_dirty: Arc<RenderSignal>,
 ) -> RestoredSession {
     let mut imported_panes = HashMap::new();
-    restore_with_imports(
+    let mut restored = restore_with_imports(
         snapshot,
         history,
         rows,
@@ -89,7 +89,11 @@ pub fn restore(
         events,
         render_notify,
         render_dirty,
-    )
+    );
+    for terminal in restored.1.values_mut() {
+        terminal.reset_turn_counter(crate::terminal::TurnCounterResetPath::SessionRestore);
+    }
+    restored
 }
 
 #[cfg(unix)]
@@ -103,7 +107,7 @@ pub fn restore_handoff(
     render_notify: Arc<Notify>,
     render_dirty: Arc<RenderSignal>,
 ) -> std::io::Result<RestoredSession> {
-    restore_with_imports_strict(
+    let mut restored = restore_with_imports_strict(
         snapshot,
         None,
         24,
@@ -115,7 +119,11 @@ pub fn restore_handoff(
         events,
         render_notify,
         render_dirty,
-    )
+    )?;
+    for terminal in restored.1.values_mut() {
+        terminal.reset_turn_counter(crate::terminal::TurnCounterResetPath::SelfUpdateHandoff);
+    }
+    Ok(restored)
 }
 
 #[cfg(unix)]
@@ -477,9 +485,16 @@ fn restored_worktree_space_membership(
     space: Option<crate::workspace::WorktreeSpaceMembership>,
 ) -> Option<crate::workspace::WorktreeSpaceMembership> {
     space.filter(|space| {
-        space.checkout_path.exists()
-            && crate::workspace::git_space_metadata(&space.checkout_path)
-                .is_some_and(|current| current.key == space.key)
+        crate::workspace::git_space_metadata(&space.checkout_path).is_none_or(|current| {
+            // Discovery may find an ancestor repo, or fall back to a per-worktree
+            // Git directory without objects when common-directory metadata is unreadable.
+            current.checkout_key
+                != crate::worktree::canonical_or_original(&space.checkout_path)
+                    .display()
+                    .to_string()
+                || current.key == space.key
+                || !std::path::Path::new(&current.key).join("objects").is_dir()
+        })
     })
 }
 
@@ -533,6 +548,10 @@ fn restore_tab(
             .and_then(|pane| pane.managed_agent_kind.as_deref())
             .and_then(crate::detect::parse_canonical_agent_label);
         let saved_launch_argv = saved_pane.and_then(|p| p.launch_argv.clone());
+        // Which account this pane was running under. The ID only — the launch env is
+        // rebuilt from the account registry when the agent is next spawned, so nothing
+        // credential-shaped is carried through the snapshot.
+        let saved_agent_account = saved_pane.and_then(|p| p.agent_account.clone());
         let saved_agent_session = saved_pane.and_then(|p| p.agent_session.as_ref());
         let saved_agent_resume = saved_pane.and_then(saved_reported_resume);
         let saved_history =
@@ -585,12 +604,21 @@ fn restore_tab(
             startup.restore_plan.clone()
         };
         if let Some(plan) = pending_native_agent_restore {
-            let terminal_id = TerminalId::alloc();
+            // Reuse the persisted terminal identity so it survives the restart;
+            // fall back to a fresh id only for pre-W6 snapshots that lack one.
+            let terminal_id = saved_pane
+                .and_then(|p| p.terminal_id.clone())
+                .map(TerminalId::from_persisted)
+                .unwrap_or_else(TerminalId::alloc);
             let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone())
-                .with_pending_agent_resume_plan(plan);
+                .with_pending_agent_resume_plan(plan)
+                .with_occupant_generation(saved_pane.map(|p| p.occupant_generation).unwrap_or(0));
             if let Some(label) = saved_label {
                 terminal.set_manual_label(label);
             }
+            // Restore account routing. Without this the pane comes back on the harness
+            // default and writes to the WRONG account's transcript, which reads as lost work.
+            terminal.agent_account = saved_agent_account.clone();
             if let Some(session) = restored_agent_session {
                 terminal.set_persisted_agent_session(session);
             }
@@ -601,7 +629,12 @@ fn restore_tab(
                 (Some(agent_name), Some(agent)) => {
                     terminal.restore_managed_agent(agent_name, agent)
                 }
-                (Some(_), None) => {}
+                // A name set via `agent rename` has no managed_agent; restore it too so it
+                // survives a restart (the snapshot already carries it). `set_persisted_agent_session`
+                // ran above, so the name anchors to the resumed session and `reconcile_agent_name_owner`
+                // keeps it when the agent re-attaches, rather than being dropped. See issue: agent
+                // names wiped on restart.
+                (Some(agent_name), None) => terminal.set_agent_name(agent_name),
                 (None, _) => {}
             }
             if let Some(agent) = initial_restore_agent {
@@ -681,8 +714,16 @@ fn restore_tab(
 
         match runtime_result {
             Ok(runtime) => {
-                let terminal_id = TerminalId::alloc();
-                let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone());
+                // Reuse the persisted terminal identity so it survives the
+                // restart; fall back to a fresh id only for pre-W6 snapshots.
+                let terminal_id = saved_pane
+                    .and_then(|p| p.terminal_id.clone())
+                    .map(TerminalId::from_persisted)
+                    .unwrap_or_else(TerminalId::alloc);
+                let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone())
+                    .with_occupant_generation(
+                        saved_pane.map(|p| p.occupant_generation).unwrap_or(0),
+                    );
                 if was_imported {
                     if let Some(argv) = saved_launch_argv {
                         terminal = terminal.with_launch_argv(argv).with_respawn_shell_on_exit();
@@ -691,6 +732,7 @@ fn restore_tab(
                 if let Some(label) = saved_label {
                     terminal.set_manual_label(label);
                 }
+                terminal.agent_account = saved_agent_account.clone();
                 if let Some(session) = restored_agent_session {
                     terminal.set_persisted_agent_session(session);
                 }
@@ -702,8 +744,10 @@ fn restore_tab(
                         terminal.restore_managed_agent(agent_name, agent)
                     }
                     (Some(_), Some(_)) => {}
-                    (Some(agent_name), None) if was_imported => terminal.set_agent_name(agent_name),
-                    (Some(_), None) => {}
+                    // A name set via `agent rename` (no managed_agent) is restored whether or
+                    // not the pane was imported, so it survives a restart instead of coming
+                    // back nameless. The snapshot already carries it.
+                    (Some(agent_name), None) => terminal.set_agent_name(agent_name),
                     (None, _) => {}
                 }
                 if let Some(agent) = initial_restore_agent {
@@ -1027,6 +1071,151 @@ mod tests {
         "/bin/sh"
     }
 
+    fn snapshot_with_deferred_native_agent() -> SessionSnapshot {
+        let cwd = std::env::current_dir().unwrap();
+        SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("turn-epoch".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Pane(0),
+                    panes: HashMap::from([(
+                        0,
+                        super::super::snapshot::PaneSnapshot {
+                            cwd,
+                            label: None,
+                            agent_name: None,
+                            managed_agent_kind: None,
+                            agent_session: Some(super::super::snapshot::PaneAgentSessionSnapshot {
+                                source: "herdr:codex".into(),
+                                agent: "codex".into(),
+                                kind: crate::agent_resume::AgentSessionRefKind::Id,
+                                value: "turn-epoch-session".into(),
+                            }),
+                            agent_resume: None,
+                            launch_argv: None,
+                            terminal_id: None,
+                            occupant_generation: 0,
+                            agent_account: None,
+                        },
+                    )]),
+                    zoomed: false,
+                    focused: Some(0),
+                    root_pane: Some(0),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+            archived_agents: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn restore_changes_turn_epoch_via_session_restore_path() {
+        let baseline = crate::terminal::TerminalState::new(
+            crate::terminal::TerminalId::alloc(),
+            std::env::current_dir().unwrap(),
+        )
+        .turn_epoch;
+        let (events, _event_rx) = mpsc::channel(4);
+        let (_workspaces, terminals, runtimes) = restore(
+            &snapshot_with_deferred_native_agent(),
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            true,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+        let restored_epoch = terminals.values().next().unwrap().turn_epoch;
+
+        assert!(runtimes.is_empty());
+        assert_ne!(restored_epoch, baseline);
+        assert_eq!(
+            crate::terminal::state::turn_epoch_reset_path_for_test(restored_epoch),
+            crate::terminal::TurnCounterResetPath::SessionRestore
+        );
+    }
+
+    /// The NATIVE-RESUME path (a `systemctl restart` relaunch with `--resume`) must retain an
+    /// unmanaged (renamed) agent name — not only the cold-restore path. Guards restore.rs:569:
+    /// mutating it back to `(Some(_), None) => {}` makes THIS test go red (the inert half of a
+    /// two-site fix the cold-restore test alone could not catch).
+    #[test]
+    fn native_resume_retains_unmanaged_agent_name() {
+        let mut snapshot = snapshot_with_deferred_native_agent();
+        // A pane renamed via `agent rename` (unmanaged) that also has a resumable session, so
+        // resume_agents_on_restore = true routes it through the native-resume branch.
+        if let Some(pane) = snapshot.workspaces[0].tabs[0].panes.get_mut(&0) {
+            pane.agent_name = Some("planner".into());
+        }
+        let (events, _event_rx) = mpsc::channel(4);
+        let (_workspaces, terminals, runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            true,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+        // Deferred native resume launches no runtime yet; the terminal exists with the name.
+        assert!(runtimes.is_empty());
+        let terminal = terminals.values().next().expect("one restored terminal");
+        assert_eq!(terminal.agent_name.as_deref(), Some("planner"));
+        assert_eq!(terminal.managed_agent_kind(), None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn restore_handoff_changes_turn_epoch_via_handoff_path() {
+        let baseline = crate::terminal::TerminalState::new(
+            crate::terminal::TerminalId::alloc(),
+            std::env::current_dir().unwrap(),
+        )
+        .turn_epoch;
+        let mut imports = HashMap::new();
+        let (_workspaces, terminals, runtimes) = restore_handoff(
+            &snapshot_with_deferred_native_agent(),
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            &mut imports,
+            mpsc::channel(4).0,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        )
+        .unwrap();
+        let restored_epoch = terminals.values().next().unwrap().turn_epoch;
+
+        assert!(runtimes.is_empty());
+        assert_ne!(restored_epoch, baseline);
+        assert_eq!(
+            crate::terminal::state::turn_epoch_reset_path_for_test(restored_epoch),
+            crate::terminal::TurnCounterResetPath::SelfUpdateHandoff
+        );
+    }
+
     #[test]
     fn capture_and_restore_node_round_trip() {
         let node = Node::Split {
@@ -1087,18 +1276,173 @@ mod tests {
     }
 
     #[test]
-    fn restored_worktree_space_membership_drops_missing_checkout() {
-        let missing =
-            std::env::temp_dir().join(format!("herdr-missing-worktree-{}", std::process::id()));
+    fn restored_worktree_space_membership_preserves_unavailable_checkout_and_rejects_replacement() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-restored-worktree-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join(".git/objects")).unwrap();
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        let ancestor = crate::workspace::git_space_metadata(&root).unwrap();
+        let checkout = root.join("checkout");
         let membership = crate::workspace::WorktreeSpaceMembership {
-            key: "repo-key".into(),
+            key: "original-repo-key".into(),
             label: "herdr".into(),
-            repo_root: missing.join("repo"),
-            checkout_path: missing.join("checkout"),
+            repo_root: root.join("original-repo"),
+            checkout_path: checkout.clone(),
             is_linked_worktree: true,
         };
 
-        assert_eq!(restored_worktree_space_membership(Some(membership)), None);
+        // Missing and leftover directories may discover an unrelated ancestor repo.
+        assert_eq!(
+            restored_worktree_space_membership(Some(membership.clone())),
+            Some(membership.clone())
+        );
+        std::fs::create_dir_all(&checkout).unwrap();
+        assert_eq!(
+            restored_worktree_space_membership(Some(membership.clone())),
+            Some(membership.clone())
+        );
+
+        // A real repository at the saved checkout path can prove replacement.
+        std::fs::create_dir_all(checkout.join(".git/objects")).unwrap();
+        std::fs::write(checkout.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        assert_eq!(
+            restored_worktree_space_membership(Some(membership.clone())),
+            None
+        );
+        let current = crate::workspace::git_space_metadata(&checkout).unwrap();
+        assert_ne!(current.key, ancestor.key);
+        let matching = crate::workspace::WorktreeSpaceMembership {
+            key: current.key,
+            ..membership.clone()
+        };
+        assert_eq!(
+            restored_worktree_space_membership(Some(matching.clone())),
+            Some(matching)
+        );
+
+        // Partial linked-worktree metadata is not evidence of replacement.
+        std::fs::remove_dir_all(checkout.join(".git")).unwrap();
+        let git_dir = root.join(".git/worktrees/restored");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(
+            checkout.join(".git"),
+            format!("gitdir: {}\n", git_dir.display()),
+        )
+        .unwrap();
+        let linked = crate::workspace::WorktreeSpaceMembership {
+            key: ancestor.key,
+            ..membership.clone()
+        };
+        assert_eq!(
+            restored_worktree_space_membership(Some(linked.clone())),
+            Some(linked)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(crate::workspace::git_space_metadata(&checkout).is_none());
+        assert_eq!(
+            restored_worktree_space_membership(Some(membership.clone())),
+            Some(membership)
+        );
+    }
+
+    /// ACCOUNT ROUTING SURVIVES A RESTART — the receipt's core clause, asserted end to end
+    /// through the real capture/parse/restore path.
+    ///
+    /// The incident: a staged update rebuilt every pane from the snapshot, the selected
+    /// account was not persisted, and eleven agents came back on the DEFAULT account and
+    /// appended to the primary transcript. The owner experienced that as one to two hours
+    /// of history disappearing.
+    ///
+    /// Deliberately not asserted here: pane count, session-id presence, or that a process
+    /// exists. All three passed during the incident and are disqualified as evidence.
+    #[tokio::test]
+    async fn a_secondary_account_survives_snapshot_and_restore() {
+        let cwd = std::env::temp_dir();
+        let snapshot = SessionSnapshot {
+            version: crate::persist::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("w1".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Pane(0),
+                    panes: HashMap::from([(
+                        0,
+                        super::super::snapshot::PaneSnapshot {
+                            cwd: cwd.clone(),
+                            label: Some("herdr-app".into()),
+                            agent_name: Some("herdr-app".into()),
+                            managed_agent_kind: Some("claude".into()),
+                            agent_session: Some(super::super::snapshot::PaneAgentSessionSnapshot {
+                                source: "herdr:claude".into(),
+                                agent: "claude".into(),
+                                kind: crate::agent_resume::AgentSessionRefKind::Id,
+                                value: "sess-crazy".into(),
+                            }),
+                            agent_resume: None,
+                            launch_argv: None,
+                            terminal_id: None,
+                            occupant_generation: 0,
+                            agent_account: Some("claudecrazy".into()),
+                        },
+                    )]),
+                    zoomed: false,
+                    focused: Some(0),
+                    root_pane: Some(0),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+            archived_agents: Vec::new(),
+        };
+
+        // Through the real wire, not the in-memory struct: a snapshot that cannot survive
+        // serialization is a snapshot that cannot survive a restart.
+        let json = serde_json::to_string(&snapshot).expect("serialize");
+        let reparsed = crate::persist::snapshot::parse_snapshot(&json).expect("parse");
+
+        let (events, _event_rx) = mpsc::channel(4);
+        let (_workspaces, terminals, _runtimes) = restore(
+            &reparsed,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+
+        let terminal = terminals.values().next().expect("restored terminal");
+        assert_eq!(
+            terminal.agent_account.as_deref(),
+            Some("claudecrazy"),
+            "the restored pane lost its account; it would resume on the default and append \
+             to the WRONG transcript, which is what reads as lost history"
+        );
+        // The receipt also requires names and labels to survive, by assertion rather than
+        // by the eventual re-registration that happened to rescue us during the incident.
+        assert_eq!(terminal.manual_label.as_deref(), Some("herdr-app"));
     }
 
     #[test]
@@ -1374,6 +1718,14 @@ mod tests {
                     }
                 }
             }
+            let membership = crate::workspace::WorktreeSpaceMembership {
+                key: "saved-repo-key".into(),
+                label: "saved-repo".into(),
+                repo_root: cwd.clone(),
+                checkout_path: missing.clone(),
+                is_linked_worktree: true,
+            };
+            snapshot.workspaces[0].worktree_space = Some(membership.clone());
             let failed = snapshot.workspaces[0].tabs[0].panes.get_mut(&1).unwrap();
             failed.cwd = missing.clone();
             failed.label = Some("keep my pane".into());
@@ -1402,13 +1754,19 @@ mod tests {
                 Arc::new(RenderSignal::new()),
             );
             let runtimes = crate::terminal::TerminalRuntimeRegistry::from(runtimes);
-            let captured = crate::persist::capture(&workspaces, &terminals, &runtimes, Some(0), 0);
+            let captured =
+                crate::persist::capture(&workspaces, &terminals, &runtimes, Some(0), 0, &[]);
             assert_eq!(
                 captured.workspaces.len(),
                 2,
                 "a launch failure must not delete a workspace"
             );
             assert_eq!(captured.workspaces[0].tabs.len(), 2);
+            assert_eq!(
+                captured.workspaces[0].worktree_space,
+                Some(membership),
+                "an unavailable checkout must retain its saved repository group across restart"
+            );
             let pane = captured.workspaces[0].tabs[0]
                 .panes
                 .values()
@@ -1474,6 +1832,9 @@ mod tests {
                             }),
                             agent_resume: None,
                             launch_argv: None,
+                            terminal_id: None,
+                            occupant_generation: 0,
+                            agent_account: None,
                         },
                     )]),
                     zoomed: false,
@@ -1487,6 +1848,7 @@ mod tests {
             sidebar_width: None,
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
+            archived_agents: Vec::new(),
         };
         let (events, _event_rx) = mpsc::channel(4);
 
@@ -1524,6 +1886,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restore_reuses_persisted_terminal_id_and_occupant_generation() {
+        let cwd = std::env::current_dir().unwrap();
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("w1".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Pane(0),
+                    panes: HashMap::from([(
+                        0,
+                        super::super::snapshot::PaneSnapshot {
+                            cwd,
+                            label: None,
+                            agent_name: None,
+                            managed_agent_kind: None,
+                            agent_session: None,
+                            agent_resume: None,
+                            launch_argv: None,
+                            terminal_id: Some("term_persisted_boot1".into()),
+                            occupant_generation: 7,
+                            agent_account: None,
+                        },
+                    )]),
+                    zoomed: false,
+                    focused: Some(0),
+                    root_pane: Some(0),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+            archived_agents: Vec::new(),
+        };
+        let (events, _event_rx) = mpsc::channel(4);
+
+        let (_workspaces, terminals, _runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+
+        let terminal = terminals
+            .values()
+            .next()
+            .expect("restored terminal should exist");
+        assert_eq!(
+            terminal.id.to_string(),
+            "term_persisted_boot1",
+            "the persisted terminal id must be reused verbatim across restart"
+        );
+        assert_eq!(
+            terminal.occupant_generation, 7,
+            "occupant_generation must survive capture -> restore"
+        );
+        assert!(
+            terminals.contains_key(&crate::terminal::TerminalId::from_persisted(
+                "term_persisted_boot1".into()
+            )),
+            "the terminal must be keyed by its persisted id"
+        );
+    }
+
+    #[tokio::test]
     async fn restore_preserves_public_id_mapping_after_pane_id_remap() {
         let cwd = std::env::current_dir().unwrap();
         let snapshot = SessionSnapshot {
@@ -1556,6 +2000,9 @@ mod tests {
                                 agent_session: None,
                                 agent_resume: None,
                                 launch_argv: None,
+                                terminal_id: None,
+                                occupant_generation: 0,
+                                agent_account: None,
                             },
                         ),
                         (
@@ -1568,6 +2015,9 @@ mod tests {
                                 agent_session: None,
                                 agent_resume: None,
                                 launch_argv: None,
+                                terminal_id: None,
+                                occupant_generation: 0,
+                                agent_account: None,
                             },
                         ),
                     ]),
@@ -1582,6 +2032,7 @@ mod tests {
             sidebar_width: None,
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
+            archived_agents: Vec::new(),
         };
         let (events, _event_rx) = mpsc::channel(4);
 
@@ -1609,7 +2060,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cold_restore_with_gapped_public_tab_numbers_drops_unmanaged_agent_name() {
+    async fn cold_restore_with_gapped_public_tab_numbers_retains_unmanaged_agent_name() {
         let cwd = std::env::current_dir().unwrap();
         let pane_snap = |id: &str| {
             (
@@ -1622,6 +2073,9 @@ mod tests {
                     agent_session: None,
                     agent_resume: None,
                     launch_argv: None,
+                    terminal_id: None,
+                    occupant_generation: 0,
+                    agent_account: None,
                 },
             )
         };
@@ -1638,6 +2092,9 @@ mod tests {
             }),
             agent_resume: None,
             launch_argv: None,
+            terminal_id: None,
+            occupant_generation: 0,
+            agent_account: None,
         };
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
@@ -1691,6 +2148,7 @@ mod tests {
             sidebar_width: None,
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
+            archived_agents: Vec::new(),
         };
         let (events, _event_rx) = mpsc::channel(4);
 
@@ -1713,12 +2171,20 @@ mod tests {
         assert_eq!(workspace.tabs[3].number, 5);
         let agent_pane = workspace.tabs[3].root_pane;
         let terminal_id = &workspace.tabs[3].panes[&agent_pane].attached_terminal_id;
-        assert!(terminals[terminal_id].agent_name.is_none());
+        // An unmanaged (renamed) agent name now SURVIVES restore instead of being dropped,
+        // so a restart no longer returns the pane nameless. managed_agent stays None — the
+        // name is restored without fabricating a managed agent.
+        assert_eq!(
+            terminals[terminal_id].agent_name.as_deref(),
+            Some("planner")
+        );
         assert_eq!(terminals[terminal_id].managed_agent_kind(), None);
+        // With its name restored, the pane now surfaces as an agent in pane_details —
+        // where, nameless, it was previously absent.
         assert!(workspace
             .pane_details(&terminals)
             .into_iter()
-            .all(|detail| detail.pane_id != agent_pane));
+            .any(|detail| detail.pane_id == agent_pane));
     }
 
     #[test]
@@ -1790,6 +2256,9 @@ mod tests {
                             }),
                             agent_resume: None,
                             launch_argv: None,
+                            terminal_id: None,
+                            occupant_generation: 0,
+                            agent_account: None,
                         },
                     )]),
                     zoomed: false,
@@ -1803,6 +2272,7 @@ mod tests {
             sidebar_width: None,
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
+            archived_agents: Vec::new(),
         };
         let (events, _event_rx) = mpsc::channel(4);
 
@@ -1905,7 +2375,8 @@ mod tests {
             );
             assert_eq!(terminal.state, state_before_handoff);
             let runtimes = crate::terminal::TerminalRuntimeRegistry::from(runtimes);
-            let snapshot = crate::persist::capture(&workspaces, &terminals, &runtimes, Some(0), 0);
+            let snapshot =
+                crate::persist::capture(&workspaces, &terminals, &runtimes, Some(0), 0, &[]);
             let pane_id = workspaces[0].tabs[0].panes.keys().next().copied().unwrap();
             let runtime = runtimes.values().next().unwrap();
             runtime
@@ -2096,6 +2567,9 @@ mod tests {
                 agent_session: None,
                 agent_resume: None,
                 launch_argv: None,
+                terminal_id: None,
+                occupant_generation: 0,
+                agent_account: None,
             },
         );
         let mut history = SessionHistorySnapshot {
@@ -2143,6 +2617,7 @@ mod tests {
             sidebar_width: Some(26),
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: Default::default(),
+            archived_agents: Vec::new(),
         };
         history.layout_fingerprint = super::super::snapshot::layout_fingerprint(&snapshot);
         (snapshot, history)

@@ -172,6 +172,14 @@ pub(crate) fn interactive_shell_command(_argv: &[String], _shell_name: &str) -> 
     None
 }
 
+pub(crate) fn managed_resume_shell_command(
+    _argv: &[String],
+    _shell_name: &str,
+    _replace_shell: bool,
+) -> Option<String> {
+    None
+}
+
 /// Unsupported platform stub.
 pub(crate) fn scrollback_editor_argv(_path: &std::path::Path) -> std::io::Result<Vec<String>> {
     Err(std::io::Error::new(
@@ -236,11 +244,42 @@ pub fn read_clipboard_text() -> Option<String> {
 }
 
 /// Unsupported platform stub.
+pub fn clipboard_text_matches(_bytes: &[u8]) -> Option<bool> {
+    None
+}
+
+/// Unsupported platform stub.
 pub fn open_url(_url: &str) -> std::io::Result<Option<std::process::Child>> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "opening URLs is not supported on this platform",
     ))
+}
+
+pub(crate) fn open_path(_path: &std::path::Path) -> std::io::Result<Option<std::process::Child>> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "opening files is not supported on this platform",
+    ))
+}
+
+pub(crate) fn tailscale_cli_candidates() -> Vec<super::TailscaleCliCandidate> {
+    vec![super::TailscaleCliCandidate::new("tailscale")]
+}
+
+pub(crate) fn private_lan_ipv4() -> std::io::Result<Option<std::net::Ipv4Addr>> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "LAN pairing is not available on this platform in this build.",
+    ))
+}
+
+pub(crate) fn lan_pairing_help() -> &'static str {
+    "Pair over a private local network instead of Tailscale (unavailable on this platform)"
+}
+
+pub(crate) fn ssh_pairing_setup_hint() -> &'static str {
+    "Enable the SSH server, then run `herdr pair` again."
 }
 
 /// Unsupported platform stub.

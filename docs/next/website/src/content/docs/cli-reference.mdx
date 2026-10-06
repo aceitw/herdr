@@ -63,7 +63,7 @@ In an interactive terminal, `machine add` discovers running sessions and lets yo
 
 `machine add` checks the remote installation's capabilities, installs or updates with approval only when needed, and starts the requested session's background server before saving. Compatible release versions do not need to match. Run setup in an interactive terminal when installation or restart approval is required; failed or cancelled setup does not save a profile. Replacing a running server requires explicit approval with a default answer of No, and stops its pane processes. `machine add` never enables experimental handoff implicitly.
 
-Changes apply automatically to open local Herdr clients, normally within a second. Added or enabled machines connect in the background; renaming does not reconnect. Removing or disabling disconnects only that machine and leaves its remote sessions running. Removing the machine you are viewing returns to Local, or shows Local as unavailable until it reconnects. Each profile stores an opaque ID, label, SSH target, explicit remote session, and enabled state in client state. Herdr does not store passwords, private keys, or other SSH credentials.
+Changes apply automatically to open local Herdr clients, normally within a second. Added or enabled machines connect in the background; renaming does not reconnect. Removing or disabling disconnects only that machine and leaves its remote sessions running. Removing the machine you are viewing returns to Local, or shows Local as unavailable until it reconnects. Each profile stores an opaque ID, label, SSH target, explicit remote session, and enabled state in client state. Herdr does not store passwords, private keys, or other SSH credentials. When federation trust policy exists for a profile, `machine list --json` also reports its non-secret `federation_expected_machine_id`; labels remain display-only and never select that policy.
 
 Use `herdr machine status [<label-or-id>] [--json]` for fresh, noninteractive SSH and remote Herdr checks. `reachable` describes this check, not a TUI's current connection. Use `herdr machine reconnect <label-or-id>` in a terminal for SSH authentication and verification; it does not install or update Herdr. Open clients retry failed connections within 30 seconds. Clicking `! auth` or `! error` shows the latest error and CLI guidance; collapsed sidebars show `!`. See [Recovering SSH authentication](/docs/connecting-machines/#recovering-ssh-authentication) for platform limits. For remote setup, use `herdr --remote workbox`, adding `--session <name>` only for a named session.
 
@@ -130,6 +130,7 @@ herdr server reload-agent-manifests
 ```
 
 `herdr server` runs the headless server explicitly. Use it for supervised or service-style setups. `reload-config` applies reloadable settings without restarting panes. `agent-manifests` shows the active agent detection manifest sources, cached remote versions, and last remote update results. `update-agent-manifests` fetches remote manifest updates immediately, reloads them into the running server, and prints the updated manifest status; pass `--json` for the raw status response. `reload-agent-manifests` reloads agent detection manifests into the running server after local override edits.
+The `submit-verify` column (and `submission_verification_supported` in `--json`) reports whether each active manifest declares `[composer]`. It does not guarantee that a particular pane is observable at runtime.
 
 ## Notifications
 
@@ -138,6 +139,43 @@ herdr notification show <title> [--body TEXT] [--position top-left|top-right|bot
 ```
 
 `notification show` uses the configured `[ui.toast]` delivery. `--position` only affects in-app Herdr toasts. `--sound` defaults to `none`; `done` and `request` play the existing finished and needs-attention sounds only when the notification is shown.
+
+## Gram
+
+Gram is the owner↔agent message channel surfaced in the Herdr app.
+
+```bash
+herdr gram send "<text>" [--from LABEL] [--file PATH]  # message the owner (push-notified)
+herdr gram list [--queue] [--unread] [--owner] [--limit N]  # --owner reads as the owner; --limit: newest N only
+herdr gram grab <id> [--as LABEL]               # claim a shared queue item (first-wins)
+herdr gram get-file <id> -o PATH                # download a message's attached file
+herdr gram post "<text>" [--to AGENT]           # owner: shared queue, or one agent
+herdr gram mark-read <id>                        # owner: mark a message read
+herdr gram delete <id> [--owner]                # delete a message (and any file) for good
+herdr gram relay-status [--json]                # relay consent, source, errors, and gateway/socket state
+```
+
+An agent's identity comes from `HERDR_PANE_ID` and resolves to its agent name (or the pane id if it has no name). The name is durable across a restart or deploy handoff, but it is a name: renaming, clearing, or reusing it changes which items show as "mine" in `gram list`. The grab itself is always first-wins atomic regardless of identity — two agents can never claim the same item. Attribution (`from`, and owner-posted messages) is advisory, not authenticated.
+
+`send --file` attaches a file (with optional caption text), uploaded in chunks so it fits the request-size limits; `get-file` downloads one. `delete` removes a message and any attached bytes for good — useful for a short-lived secret you send once and then discard. You can delete a message you sent, grabbed, or that is addressed to you; `--owner` deletes any message.
+
+## Guest access
+
+Share one named, running agent with one outside person, who uses it from the HerdrUp app with no SSH access and no open ports. The guest's app reaches this machine through the HerdrUp guest relay (`[guest] relay_url`), and the connection is end-to-end encrypted with Noise IK, so the relay only forwards ciphertext. Unix only.
+
+```bash
+herdr guest invite <agent> --name <name> [--owner-name NAME] [--machine-label LABEL] [--ttl SECS] [--share-gram]
+herdr guest list                                  # guests, invites and relay link state (no secrets or keys)
+herdr guest share-gram <guest-id> on|off          # share the agent's Gram with an accepted guest, or stop
+herdr guest revoke <guest-or-invite-id>           # closes the guest's live sessions immediately
+herdr guest log [<guest-id>] [--limit N]          # activity, newest first
+```
+
+Every command accepts `--machine ALIAS` to run on that saved SSH machine. The agent must have a name and a stable harness session. An invite works once, expires after 24 hours by default, and is bound to one guest name and that agent. The guest can prompt the agent, labeled `<name> (via HerdrUp): `, attach files to it, and watch its terminal, including up to 1,000 lines of its scrollback. While watching, the guest can also resize the terminal. Everyone watching it, including you, sees that size until the guest stops watching; the guest's app renews the size while it is open, and a size that is not renewed lapses within a minute. The guest cannot type into the terminal or reach any other pane. Access pauses while the agent is not the pane's foreground process, and comes back when an agent with the same name and kind runs in that terminal again, for example after a restart. Activity is written to `guest/audit.jsonl` in the config directory, not sent as notifications. Watching the agent, reading its scrollback, resizing its terminal and reading the shared Gram are not recorded.
+
+With `--share-gram`, or `herdr guest share-gram <guest-id> on` for a guest who already accepted, the guest also gets a Gram tab for the agent. It shows every Gram the agent sends you from its own terminal from the moment the guest accepted, with its files, plus the guest's own posts to the agent. It never shows your posts to the agent, older Grams, other agents' Grams, or Grams that only carry the agent's name, such as ones sent from another pane or relayed from another machine. The guest keeps separate read marks and cannot claim, delete or mark your messages read. Sharing is off by default and takes effect at once, even for a guest who is connected. `herdr guest list` shows it per guest and invite, and file opens are audited. Any guest can also register their phone for the agent's push notifications: needs you, finished and died, plus its new Grams while sharing is on. These notifications go through the same direct APNs or HerdrUp push relay path as yours, and a revoke deletes the guest's registrations.
+
+While at least one guest or unexpired invite exists, the server keeps one outbound TLS WebSocket to the relay, reconnecting with backoff from 2 to 60 seconds, and closes it once no guests or invites remain. It is the only TLS connection Herdr opens in-process; update checks and push delivery run `curl` instead. `herdr guest list` shows its state (`off`, `connecting`, `up` or `retrying`) and last error.
 
 ## Sessions
 
@@ -287,6 +325,8 @@ herdr pane report-agent-session <pane_id> \
   [--seq N] \
   [--agent-session-id ID] \
   [--agent-session-path PATH] \
+  [--agent-session-cursor ID] \
+  [--agent-process-pid PID] \
   [--session-start-source SOURCE] \
   [-- RESUME_COMMAND...]
 
@@ -296,13 +336,15 @@ herdr pane release-agent <pane_id> \
   [--seq N]
 ```
 
-`report-agent-session` updates native session identity without reporting lifecycle state. `release-agent` ends that source's lifecycle authority when its agent process exits.
+`report-agent-session` updates native session identity without reporting lifecycle state. Integrations for tree-shaped session logs can also report the selected leaf with `--agent-session-cursor`; `--agent-process-pid` binds that report to the exact harness process. `release-agent` ends that source's lifecycle authority when its agent process exits.
 
 Arguments after `--` are the command Herdr runs to resume this session after a server restart. The first argument must be a plain command name on `PATH`, and no argument may contain an apostrophe.
 
 `pane get`, `pane list`, `agent get`, and `agent list` include a read-only `agent_session` object when an official integration has reported a native session reference. If no native session reference is stored, the field is omitted.
 
-Those commands include `foreground_cwd` when Herdr can resolve the cwd of the foreground process controlling the pane. The `cwd` field remains the pane/workspace cwd used for labels and follow-cwd behavior.
+`pane get`, `pane list`, `agent get`, and `agent list` also expose a live modal input request independently of lifecycle status. While a modal is present they include `"input_pending": true` and `input_prompt_kind` as `confirm`, `select`, `free_text`, or `unknown`; both fields are omitted otherwise. `agent_status` is not changed by this signal.
+
+Those commands include `foreground_cwd` when Herdr can resolve the cwd of the foreground process controlling the pane. The existing `cwd` field remains the pane/workspace cwd used for labels and follow-cwd behavior.
 
 `pane get` and `pane list` include `scroll` when terminal scroll metrics are available. `scroll.offset_from_bottom == 0` means the pane is at the bottom of its scrollback.
 
@@ -356,7 +398,15 @@ Agent targets are either a unique live agent name or the pane ID that currently 
 
 A successful start returns only after the expected agent owns the same terminal and is ready for interactive input. If detection reports `blocked` during startup, the command returns `agent_not_ready` immediately. The name remains available for `agent read` and `agent send-keys`, and becomes ready for prompts after detection reports `idle`. The default startup timeout is 30000 milliseconds; explicit values must be greater than 3000 and no more than 300000.
 
-`agent prompt` honors live bracketed-paste mode and writes text followed by delayed Enter as one ordered submission, including while the agent is working. Success without `--wait` acknowledges the writes, not the start of a turn. On Windows, Codex receives a paste boundary before Enter so submission does not depend on prompt size; the caller timeout includes submission time. If the agent is already `blocked`, it returns `agent_blocked` without sending input. With `--wait`, a prompt sent from another non-working state has up to five seconds after submission to produce an observed `working` or `blocked` state or Herdr returns `agent_prompt_stalled`; if the caller timeout expires first, Herdr returns the normal `timeout` error. This prevents unrelated `idle`, `done`, or session changes from completing the wait. After activity is observed, it waits for the first requested settled status. It does not track individual turns. If the agent is already working, completion of that active turn may satisfy the wait. `--until` narrows the matching states and is rejected unless `--wait` is also present. Standalone `agent wait` returns immediately when the current status matches. Both default to `idle`, `done`, or `blocked`; use `--until unknown` explicitly when needed.
+`agent prompt` honors live bracketed-paste mode and sends text followed by encoded Enter after a short delay, including while the agent is working. Herdr acknowledges only after the complete batch reaches the pane PTY; non-wait success reports `delivery: "written_to_pty"`. If the agent is already `blocked`, it returns `agent_blocked` without sending input. If a modal `input_pending` request is already visible, it returns `agent_input_pending` and writes zero bytes.
+
+With `--wait`, Herdr checks the result of the acknowledged PTY write before waiting for the requested status. If submission is verified, it waits for the first matching settled status. If submission cannot be verified, it returns `result.type: "agent_prompted"` with `delivery: "written_to_pty"` and exit code 0 without claiming the agent began a turn. An agent whose manifest has no composer coverage can return that receipt promptly. A visible same-attempt draft returns `agent_prompt_unsubmitted` as an error; failures before the write remain errors. `--until` requires `--wait`. Standalone `agent wait` returns immediately when the current status matches. Both commands default to `idle`, `done`, or `blocked`; request `unknown` explicitly.
+
+After confirmed submission, a requested status may still miss the deadline. That returns `agent_status_unobserved_after_submit` (exit 1); it does not mean the prompt was undelivered. A fast transition straight to a requested settled state is accepted without a sampled `working` state.
+
+`delivery: "submitted"` requires evidence attributable to this send: a lifecycle-sequence advance from an initially settled agent, or an observed writer-attributed composer attempt that subsequently clears. An unrelated completion on an already-working agent does not count. Bracketed paste uses writer provenance rather than rendered paste-token text. Without submission evidence, `written_to_pty` confirms the bytes reached the pane, not that the agent accepted a new turn. Inspect the pane before resending to avoid duplicates.
+
+`pane get` reports `composer.state` as `empty`, `draft_present`, or `unknown`, plus provenance and corroborating evidence. Missing regions, repainting frames, conflicts, and older-daemon responses are `unknown`; suggestion text that Herdr never wrote is not a draft. After verified submission, `--wait` waits for the requested settled status. When submission is unverified, use a separate `agent wait` to observe status without attributing that transition to the prompt.
 
 `idle` and `done` both mean ready for input. The CLI/API uses the server's seen state: `done` is idle but not yet marked seen, explicit `pane focus` / `agent focus` commands mark the target seen, and reads do not. Each TUI client tracks viewed completions independently, so its Done badge can differ from the CLI or another client. `blocked` means Herdr recognized an approval or question UI. `unknown` means an agent is present but Herdr cannot classify it confidently, not that its work succeeded.
 
@@ -414,9 +464,9 @@ Use `pane wait-output` for normal commands and servers. Use `agent wait` for cod
 
 `pane wait-output` checks the selected snapshot immediately, including output that already exists, then polls until it matches. The default source name is `recent`; matching treats it as unwrapped recent output from the latest 80 rendered terminal rows. `--lines` changes that row limit. `--match` finds a literal substring on one line, and `--regex` uses Rust regular-expression syntax and also matches one line at a time.
 
-A timeout or `agent_prompt_stalled` does not prove the prompt was never delivered. Inspect the agent before retrying.
+A timeout can occur before a PTY write; `written_to_pty` confirms the write but not agent submission. Inspect the pane before retrying.
 
-`pane wait-output` and `agent wait` wait indefinitely when `--timeout` is omitted. For `agent prompt --wait`, the settled-state wait is indefinite after activity is observed or when the prompt starts in `working`; a non-working prompt still returns `agent_prompt_stalled` after five seconds without observed activity. A timeout or server error is emitted as JSON on stderr with exit status 1. CLI usage errors exit with status 2.
+`pane wait-output` and standalone `agent wait` wait indefinitely when `--timeout` is omitted. For `agent prompt --wait`, a verified submission can continue waiting for a requested settled status without a timeout; an unverified write returns the PTY receipt instead. A timeout before PTY write confirmation remains an error. Genuine delivery and server errors appear as JSON on stderr with exit status 1; CLI usage errors exit with status 2.
 
 ## Integrations
 

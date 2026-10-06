@@ -56,6 +56,18 @@ herdr agent get w1:p2
 herdr agent rename w1:p2 reviewer
 ```
 
+`agent get` and `agent list` expose modal input separately from lifecycle status:
+
+```json
+{
+  "agent_status": "working",
+  "input_pending": true,
+  "input_prompt_kind": "select"
+}
+```
+
+`input_prompt_kind` is `confirm`, `select`, `free_text`, or `unknown`. The fields are omitted when no input is pending, and `agent_status` remains unchanged.
+
 ## Choose the control surface
 
 | Goal | Command |
@@ -69,17 +81,23 @@ herdr agent rename w1:p2 reviewer
 | Send keys to an agent's interactive UI | `agent send-keys` |
 | Wait for agent lifecycle state | `agent wait` |
 
-`agent prompt` submits text plus encoded Enter and honors the terminal's live bracketed-paste mode. It can prompt an agent that is already working. If the agent is already `blocked`, it returns `agent_blocked` without sending terminal input; inspect the dialog and use `agent send-keys` for a deliberate response. Use `agent send-keys` for interactions such as `esc`, `up`, `enter`, or `ctrl+c`; `escape` is accepted as an alias for `esc`. Use the pane input commands when you deliberately want raw terminal control.
+`agent prompt` submits text plus encoded Enter and honors the terminal's live bracketed-paste mode. Herdr acknowledges only after the complete batch is written to the pane PTY. A non-wait success reports `delivery: "written_to_pty"`. If `input_pending` is already true, Herdr returns `agent_input_pending` with the prompt kind and writes zero bytes; use `agent send-keys` to interact deliberately with modal controls such as `esc`, `up`, or `enter`. `escape` is accepted as an alias for `esc`. Use the pane input commands when you deliberately want raw terminal control.
 
 Pane input addresses the terminal regardless of its current occupant. Agent input resolves the live agent and rejects the operation if that agent no longer controls the pane.
 
-`agent prompt --wait` rejects an agent already `blocked` with `agent_blocked`, without sending input or starting a wait. Otherwise, it writes the prompt and delayed Enter as one ordered submission before waiting. On Windows, Codex receives a paste boundary before Enter so submission does not depend on prompt size. The caller timeout includes submission time. If the prompt started from another non-working state, Herdr waits up to five seconds after submission to observe `working` or `blocked`. Otherwise, it returns `agent_prompt_stalled`; if the caller timeout expires first, it returns the normal `timeout` error. This prevents unrelated `idle`, `done`, or session changes from completing the wait. After Herdr observes activity, it waits for the requested settled status. It does not track individual turns. If the agent is already working, completion of that active turn may satisfy the wait. Standalone `agent wait` observes the current agent and returns immediately if its status already matches. Both commands default to `idle`, `done`, or `blocked`. Repeat `--until` to accept several exact states, for example `--until idle --until done`; use `--until unknown` explicitly when needed. On `agent prompt`, `--until` requires `--wait`.
+`agent prompt --wait` writes the prompt unless the agent is already `blocked`, which returns `agent_blocked` before any write. After an acknowledged PTY write, Herdr checks for submission evidence. If submission is confirmed, it waits for the requested agent status; if submission cannot be verified, it returns `type: "agent_prompted"` with `delivery: "written_to_pty"` and exit code 0 instead of treating the send as a failure. A manifest without composer verification can return this receipt promptly. This receipt does not prove the agent began a turn. A prompt still visible in its own attributed composer returns `agent_prompt_unsubmitted`; a failure before the PTY write remains an error.
+
+`delivery: "submitted"` requires attributable evidence: a lifecycle sequence advance from an initially settled agent, or the same writer-attributed composer attempt being observed and then cleared. An unrelated in-flight completion on an already-working agent is not proof. Without that evidence, `written_to_pty` confirms only that the complete batch reached the terminal. Check the pane before resending to avoid a duplicate prompt. Prompt text is not included in observation errors or logs.
+
+`pane get` includes a `composer` object. Its `state` is `empty`, `draft_present`, or `unknown`; `attempt_id` and the `evidence` fields explain the provenance and visual corroboration. Hosted-CLI suggestion text strictly right of the cursor is not a draft because Herdr did not write it. A missing composer region, a mid-repaint frame, conflicting signals, or a response from an older daemon that lacks `composer` is `unknown`, never silently `empty`. Cursor position only corroborates writer provenance. Style can only downgrade a result to `unknown`; colour alone never establishes `empty` or `draft_present`.
+
+After verified submission, `--wait` waits for the requested settled status. If submission cannot be verified, it returns the PTY receipt without waiting for that status; use a separate `agent wait` if you need to observe it without claiming this prompt caused the transition. Standalone `agent wait` returns immediately if the current agent's status already matches. Both commands default to `idle`, `done`, or `blocked`. Repeat `--until` to accept several exact states, for example `--until idle --until done`; use `--until unknown` explicitly when needed. On `agent prompt`, `--until` requires `--wait`.
+
+If submission is confirmed but the requested status is not observed by the deadline, `--wait` returns `agent_status_unobserved_after_submit` as a status-wait error, not a delivery failure. A fast turn that advances directly to a requested settled state counts without an intermediate working sample. Do not resend on a status-wait error.
 
 `idle` and `done` both mean the agent is ready for input. The CLI/API uses the server's seen state: `done` is idle but not yet marked seen, explicit `pane focus` / `agent focus` commands mark the target seen, and reads do not. Each TUI client tracks viewed completions independently, so a client's Done badge can differ from the CLI or another client's badge. `blocked` means Herdr recognized an approval or question UI. `unknown` means an agent is present but Herdr cannot classify its lifecycle confidently; it does not prove successful completion. Use exact `--until` states when that distinction matters.
 
-Startup readiness, restoring an idle conversation, and switching agent conversations do not count as completed work. An agent that starts working immediately can finish its first task without Herdr first seeing an idle prompt. Agent responses may include `completion_seq`, identifying the current idle transition as completed work independently of who has viewed it. It matches that transition's `state_change_seq`; startup and session changes do not set it. Older servers may omit this field. Clients connected to older servers use observed working states to guard Done badges, so they may miss a turn that starts and finishes between updates.
-
-A timeout or `agent_prompt_stalled` does not prove that no input was sent. Read the agent before retrying to avoid submitting the same prompt twice. IDs and agent names are scoped to one server; selecting another machine in the TUI does not retarget CLI commands running in an existing pane.
+A timeout can occur before the PTY write; `written_to_pty` means the write happened but submission was not confirmed. Check the agent before retrying to avoid submitting the same prompt twice. IDs and agent names are scoped to one server; selecting another machine in the TUI does not retarget CLI commands running in an existing pane.
 
 `pane wait-output` does not interpret agent lifecycle. It polls the selected terminal snapshot and searches it immediately, so text that was already present can match. The default source name is `recent`; matching treats that source as unwrapped recent output from the latest 80 rendered terminal rows. `--lines` changes that row limit, and `--regex` uses Rust regular-expression syntax and matches one line at a time.
 
@@ -93,7 +111,7 @@ Other reads remain passive. Herdr does not move the application viewport for `vi
 
 If a full response is still unavailable, ask the agent to write it as Markdown in a temporary directory and reply only with the file path, then read the file directly.
 
-Successful `agent start`, `agent prompt`, and `agent wait` commands return the current agent at `.result.agent`. `pane wait-output` returns `.result.pane_id`, `.result.matched_line`, and the matched snapshot at `.result.read`.
+Successful `agent start`, `agent prompt`, and `agent wait` commands return the current agent at `.result.agent`. `agent prompt` additionally reports `.result.delivery` as `written_to_pty` or `submitted`. `pane wait-output` returns `.result.pane_id`, `.result.matched_line`, and the matched snapshot at `.result.read`.
 
 Wait commands have no default timeout and can wait indefinitely. On timeout or another server error, CLI commands print a JSON error to stderr and exit with status 1; invalid CLI syntax exits with status 2.
 

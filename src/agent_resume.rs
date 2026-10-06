@@ -132,6 +132,19 @@ pub fn session_ref_from_report(
     agent_session_id.and_then(AgentSessionRef::id)
 }
 
+pub fn session_path_from_report(
+    source: &str,
+    agent: &str,
+    agent_session_path: Option<String>,
+) -> Option<String> {
+    if !is_official_agent_source(source, agent) {
+        return None;
+    }
+    agent_session_path
+        .and_then(AgentSessionRef::path)
+        .map(|session_ref| session_ref.value)
+}
+
 pub fn persisted_session_from_launch_args(
     agent: crate::detect::Agent,
     args: &[String],
@@ -164,7 +177,6 @@ pub fn is_reserved_native_state_source(source: &str, agent: &str) -> bool {
     matches!(
         (source, agent),
         ("herdr:claude", "claude")
-            | ("herdr:codex", "codex")
             | ("herdr:copilot", "copilot")
             | ("herdr:devin", "devin")
             | ("herdr:droid", "droid")
@@ -407,7 +419,7 @@ mod tests {
     #[test]
     fn native_state_reservation_excludes_full_lifecycle_sources() {
         assert!(is_reserved_native_state_source("herdr:claude", "claude"));
-        assert!(is_reserved_native_state_source("herdr:codex", "codex"));
+        assert!(!is_reserved_native_state_source("herdr:codex", "codex"));
         assert!(is_reserved_native_state_source("herdr:devin", "devin"));
         assert!(!is_reserved_native_state_source("herdr:kimi", "kimi"));
         assert!(!is_reserved_native_state_source(

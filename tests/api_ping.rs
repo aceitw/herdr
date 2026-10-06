@@ -671,6 +671,213 @@ fn workspace_list_and_create_round_trip() {
 
 #[cfg(not(target_os = "macos"))]
 #[test]
+fn pane_set_pty_size_round_trips_over_socket() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+
+    let child = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let created = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"pty_ws","method":"workspace.create","params":{{"cwd":"{}","focus":true}}}}"#,
+            base.display()
+        ),
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // lock=true takes a width lease and drives the real winsize; an explicit set
+    // applies immediately and reports the applied size.
+    let locked = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"pty_lock","method":"pane.set_pty_size","params":{{"pane_id":"{}","cols":100,"rows":40,"lock":true}}}}"#,
+            pane_id
+        ),
+    );
+    assert_eq!(locked["result"]["type"], "pane_pty_size");
+    assert_eq!(locked["result"]["pane_id"], pane_id);
+    assert_eq!(locked["result"]["cols"], 100);
+    assert_eq!(locked["result"]["rows"], 40);
+    assert_eq!(locked["result"]["locked"], true);
+
+    // An explicit lock=true set applies its shrink immediately too (no debounce
+    // for an explicit call); zero dimensions clamp to the runtime minimums
+    // (rows >= 2, cols >= 4).
+    let clamped = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"pty_clamp","method":"pane.set_pty_size","params":{{"pane_id":"{}","cols":0,"rows":0,"lock":true}}}}"#,
+            pane_id
+        ),
+    );
+    assert_eq!(clamped["result"]["cols"], 4);
+    assert_eq!(clamped["result"]["rows"], 2);
+    assert_eq!(clamped["result"]["locked"], true);
+
+    // lock=false drops this caller's width lease. With no lease left, the release
+    // applies the caller's requested size once as the parting handoff and reports
+    // it; no lock persists, so the TUI reclaims the layout width via the render
+    // gate on the next frame.
+    let released = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"pty_release","method":"pane.set_pty_size","params":{{"pane_id":"{}","cols":120,"rows":50,"lock":false}}}}"#,
+            pane_id
+        ),
+    );
+    assert_eq!(released["result"]["locked"], false);
+    assert_eq!(released["result"]["cols"], 120);
+    assert_eq!(released["result"]["rows"], 50);
+
+    cleanup_spawned_herdr(child, base);
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn pane_stream_firehose_over_socket() {
+    use base64::Engine;
+
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+
+    let child = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let created = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"stream_ws","method":"workspace.create","params":{{"cwd":"{}","focus":true}}}}"#,
+            base.display()
+        ),
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Open the firehose on its own long-lived connection.
+    let mut stream = open_subscription(
+        &socket_path,
+        &format!(
+            r#"{{"id":"stream_1","method":"pane.stream","params":{{"pane_id":"{}"}}}}"#,
+            pane_id
+        ),
+    );
+
+    // First line: the stream_started ack carrying geometry + epoch + base_seq.
+    let ack = stream.read_json_line(Duration::from_secs(5));
+    assert_eq!(ack["id"], "stream_1");
+    assert_eq!(ack["result"]["type"], "stream_started");
+    assert_eq!(ack["result"]["pane_id"], pane_id);
+    assert_eq!(ack["result"]["resync"], true);
+    let epoch = ack["result"]["epoch"].as_u64().unwrap();
+    assert!(ack["result"]["cols"].as_u64().unwrap() >= 4);
+    assert!(ack["result"]["rows"].as_u64().unwrap() >= 2);
+    let base_seq = ack["result"]["base_seq"].as_u64().unwrap();
+
+    // Second line: the reset seed frame (base64 full-screen ANSI at base_seq).
+    let reset = stream.read_json_line(Duration::from_secs(5));
+    assert_eq!(reset["stream"], "pane.bytes");
+    assert_eq!(reset["frame"], "reset");
+    assert_eq!(reset["epoch"].as_u64().unwrap(), epoch);
+    assert_eq!(reset["seq"].as_u64().unwrap(), base_seq);
+    let seed_b64 = reset["data_b64"].as_str().expect("reset carries data_b64");
+    base64::engine::general_purpose::STANDARD
+        .decode(seed_b64)
+        .expect("reset seed decodes as base64");
+
+    // Drive output on a separate connection so the stream keeps reading. The
+    // shell echoes the typed bytes, so the marker lands in the raw firehose.
+    let marker = "streamtest_marker_9137";
+    send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"txt","method":"pane.send_text","params":{{"pane_id":"{}","text":"echo {}\n"}}}}"#,
+            pane_id, marker
+        ),
+    );
+
+    // Accumulate decoded `data` frames until the marker bytes appear.
+    let mut decoded: Vec<u8> = Vec::new();
+    let mut last_seq = base_seq;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut found = false;
+    while Instant::now() < deadline {
+        let Some(frame) = stream.try_read_json_line(Duration::from_millis(500)) else {
+            continue;
+        };
+        assert_eq!(frame["stream"], "pane.bytes");
+        assert_eq!(frame["epoch"].as_u64().unwrap(), epoch);
+        match frame["frame"].as_str() {
+            Some("data") => {
+                // seq is the absolute byte offset of the frame's first byte and
+                // must be monotonic and gap-free with the running total.
+                assert_eq!(frame["seq"].as_u64().unwrap(), last_seq);
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(frame["data_b64"].as_str().unwrap())
+                    .expect("data frame decodes as base64");
+                last_seq += bytes.len() as u64;
+                decoded.extend_from_slice(&bytes);
+                if decoded
+                    .windows(marker.len())
+                    .any(|window| window == marker.as_bytes())
+                {
+                    found = true;
+                    break;
+                }
+            }
+            Some("reset") => {
+                // A mid-stream resync re-bases the byte cursor.
+                last_seq = frame["seq"].as_u64().unwrap();
+            }
+            Some("resize") | Some("ping") => {}
+            other => panic!("unexpected stream frame: {other:?}"),
+        }
+    }
+    assert!(
+        found,
+        "marker never arrived in a data frame; decoded so far: {:?}",
+        String::from_utf8_lossy(&decoded)
+    );
+
+    // Closing the pane drops the runtime, which must deliver an `exited` frame.
+    send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"close","method":"pane.close","params":{{"pane_id":"{}"}}}}"#,
+            pane_id
+        ),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut exited = false;
+    while Instant::now() < deadline {
+        let Some(frame) = stream.try_read_json_line(Duration::from_millis(500)) else {
+            continue;
+        };
+        if frame["frame"] == "exited" {
+            assert_eq!(frame["stream"], "pane.bytes");
+            exited = true;
+            break;
+        }
+    }
+    assert!(exited, "expected an exited frame after closing the pane");
+
+    cleanup_spawned_herdr(child, base);
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
 fn tab_methods_round_trip_over_socket() {
     let _lock = test_lock();
     let base = unique_test_dir();
@@ -2203,23 +2410,22 @@ fn pane_clear_agent_authority_restores_fallback_state() {
         thread::sleep(Duration::from_millis(100));
     }
 
-    let fallback_before_hook = send_request(
+    let session_path = base.join("clear-session.jsonl");
+    let session = send_request(
         &socket_path,
         &format!(
-            r#"{{"id":"req_clear_fallback","method":"pane.get","params":{{"pane_id":"{}"}}}}"#,
-            pane_id
+            r#"{{"id":"req_clear_session","method":"pane.report_agent_session","params":{{"pane_id":"{}","source":"herdr:pi","agent":"pi","agent_session_path":"{}","session_start_source":"startup","seq":1}}}}"#,
+            pane_id,
+            session_path.display()
         ),
     );
-    let fallback_status = fallback_before_hook["result"]["pane"]["agent_status"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
+    assert_eq!(session["result"]["type"], "ok");
     let hook = send_request(
         &socket_path,
         &format!(
-            r#"{{"id":"req_clear_4","method":"pane.report_agent","params":{{"pane_id":"{}","source":"herdr:pi","agent":"pi","state":"idle"}}}}"#,
-            pane_id
+            r#"{{"id":"req_clear_4","method":"pane.report_agent","params":{{"pane_id":"{}","source":"herdr:pi","agent":"pi","state":"idle","agent_session_path":"{}","seq":2}}}}"#,
+            pane_id,
+            session_path.display()
         ),
     );
     assert_eq!(hook["result"]["type"], "ok");
@@ -2227,7 +2433,7 @@ fn pane_clear_agent_authority_restores_fallback_state() {
     let cleared = send_request(
         &socket_path,
         &format!(
-            r#"{{"id":"req_clear_5","method":"pane.clear_agent_authority","params":{{"pane_id":"{}","source":"herdr:pi"}}}}"#,
+            r#"{{"id":"req_clear_5","method":"pane.clear_agent_authority","params":{{"pane_id":"{}","source":"herdr:pi","seq":3}}}}"#,
             pane_id
         ),
     );
@@ -2240,8 +2446,12 @@ fn pane_clear_agent_authority_restores_fallback_state() {
             pane_id
         ),
     );
+    // Identity survives the authority clear (same live process, detector
+    // resumes ownership) but the stale pre-hook activity status must NOT be
+    // resurrected — that resurrection is the phantom-turn hazard. Status
+    // reads unknown until the detector observes fresh evidence.
     assert_eq!(pane["result"]["pane"]["agent"], "pi");
-    assert_eq!(pane["result"]["pane"]["agent_status"], fallback_status);
+    assert_eq!(pane["result"]["pane"]["agent_status"], "unknown");
 
     cleanup_spawned_herdr(child, base);
 }

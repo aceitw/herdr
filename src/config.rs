@@ -12,9 +12,9 @@ mod write;
 
 pub use self::{
     io::{
-        config_diagnostic_summary, config_dir, config_path, load_live_config,
-        remove_keybinding_config_sections, remove_section_key, state_dir, upsert_section_bool,
-        upsert_section_value,
+        append_accounts_block, config_diagnostic_summary, config_dir, config_path,
+        load_live_config, remove_accounts_block, remove_keybinding_config_sections,
+        remove_section_key, state_dir, upsert_section_bool, upsert_section_value,
     },
     keybinds::{
         format_prefix_combos, normalize_key_combo, terminal_key_matches_combo, ActionKeybinds,
@@ -22,11 +22,14 @@ pub use self::{
         IndexedKeybind, KeyCombo, Keybinds, LiveKeybindConfig,
     },
     model::{
-        validated_sidebar_bounds, AgentPanelSortConfig, Config, ConfigReloadReport,
-        ConfigReloadStatus, HostCursorModeConfig, NewTerminalCwdConfig, PaneBordersConfig,
-        ShellModeConfig, SidebarCollapsedModeConfig, StatusIndicatorStyle, TabBarPositionConfig,
-        ToastClipboardPosition, ToastConfig, ToastDelivery, ToastHerdrPosition,
-        UpdateChannelConfig, MAX_TOAST_DELAY_SECONDS,
+        auth_env_vars_to_clear, default_config_dir, env_var_for_kind, is_default_config_dir,
+        kind_for_config_env_var, validated_sidebar_bounds, AccountConfig, AccountLaunchEnv,
+        AgentPanelSortConfig, CapabilityTier, Config, ConfigReloadReport, ConfigReloadStatus,
+        FederationAgentGrant, FederationConfig, FederationPeer, FederationSavedMachinePolicy,
+        GramRelayConfig, HostCursorModeConfig, NewTerminalCwdConfig, PaneBordersConfig, PushConfig,
+        PushMode, ShellModeConfig, SidebarCollapsedModeConfig, StatusIndicatorStyle,
+        TabBarPositionConfig, ToastClipboardPosition, ToastConfig, ToastDelivery,
+        ToastHerdrPosition, UpdateChannelConfig, MAX_TOAST_DELAY_SECONDS,
     },
     sidebar::{
         AgentSidebarToken, AgentsSidebarConfig, SidebarConfig, SidebarTokenStyle,
@@ -38,10 +41,12 @@ pub use self::{
     window_title::{WindowTitlePart, WindowTitleTemplate, WindowTitleToken},
 };
 
+pub(crate) use self::io::read_optional_config;
 pub(crate) use self::keybinds::parse_key_combo;
-pub(crate) use self::write::{update_file_at, write_edit, ConfigEdit};
+pub(crate) use self::write::{update_file_at, update_file_at_checked, write_edit, ConfigEdit};
 pub(crate) use self::{
     io::upsert_top_level_bool,
+    model::omp_sessions_dir,
     tab_bar::{
         parse_tab_bar_datetime_format, tab_bar_right_diagnostics,
         MAX_TAB_BAR_COMMAND_INTERVAL_SECONDS, MAX_TAB_BAR_COMMAND_TIMEOUT_SECONDS,

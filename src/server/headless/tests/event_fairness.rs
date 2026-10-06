@@ -9,7 +9,9 @@ fn queue_requests(server: &mut HeadlessServer, count: usize) -> std::sync::mpsc:
             .send(api::ApiRequestMessage {
                 request: api::schema::Request {
                     id: index.to_string(),
-                    method: api::schema::Method::WorkspaceList(api::schema::EmptyParams::default()),
+                    method: api::schema::Method::WorkspaceList(
+                        api::schema::WorkspaceListParams::default(),
+                    ),
                 },
                 respond_to: respond_to.clone(),
                 response_write_complete: None,
@@ -109,7 +111,7 @@ async fn server_loop_drains_api_backlog_and_runs_scheduled_work() {
         let method = if index == count {
             api::schema::Method::ServerStop(api::schema::EmptyParams::default())
         } else {
-            api::schema::Method::WorkspaceList(api::schema::EmptyParams::default())
+            api::schema::Method::WorkspaceList(api::schema::WorkspaceListParams::default())
         };
         sender
             .send(api::ApiRequestMessage {

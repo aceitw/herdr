@@ -240,6 +240,10 @@ pub struct HeadlessServer {
     /// Imported panes get one app-safe resize nudge after the first client attaches.
     #[cfg(unix)]
     pending_handoff_repaint_nudge: bool,
+    /// The guest relay link. Runs only while this process owns the panes: a
+    /// live handoff stops it before the replacement starts its own.
+    #[cfg(unix)]
+    guest_link: Option<crate::guest::link::GuestLink>,
     /// Flag set by Ctrl+C or `server stop` signal.
     should_quit: Arc<AtomicBool>,
     host_shutdown_requested: Arc<AtomicBool>,
@@ -371,6 +375,8 @@ impl HeadlessServer {
             handoff_in_progress: false,
             #[cfg(unix)]
             pending_handoff_repaint_nudge: false,
+            #[cfg(unix)]
+            guest_link: None,
             should_quit,
             server_event_rx,
             server_event_tx,
@@ -404,6 +410,14 @@ impl HeadlessServer {
         let mut needs_render = true;
         let mut needs_full_render = true;
         let mut needs_graphics_render = false;
+        // Remote agent changes wake the loop so their push notifications go
+        // out at once (see `sync_remote_agent_notifications`).
+        let federation_changed = self
+            .app
+            .federation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .change_notify();
 
         loop {
             crate::render_prof::event("loop.tick");
@@ -452,6 +466,11 @@ impl HeadlessServer {
                 needs_render = true;
                 needs_full_render = true;
                 crate::render_prof::event("full_render_cause.metadata_expiry");
+            }
+            if self.app.expire_pty_leases_and_apply_shrinks(Instant::now()) {
+                needs_render = true;
+                needs_full_render = true;
+                crate::render_prof::event("full_render_cause.pty_lease_sweep");
             }
 
             // 3. Drain API requests.
@@ -610,6 +629,7 @@ impl HeadlessServer {
                         None => LoopEvent::Timer,
                     },
                     _ = sleep_until_or_pending(next_deadline) => LoopEvent::Timer,
+                    _ = federation_changed.notified() => LoopEvent::Timer,
                     _ = self.app.render_notify.notified() => LoopEvent::RenderRequested,
                 }
             };
@@ -816,11 +836,69 @@ impl HeadlessServer {
         } else {
             &self.server_config_diagnostic
         };
-        if self.app.state.config_diagnostic == self.server_config_diagnostic
-            || self.app.state.config_diagnostic == self.server_config_diagnostic_without_keybindings
-        {
-            self.app.state.config_diagnostic = visible.clone();
+        if self.app.state.config_diagnostic == *visible {
+            return;
         }
+        self.app.state.config_diagnostic = visible.clone();
+    }
+
+    #[cfg(unix)]
+    /// Activates the staged executable through the live-handoff path.
+    fn apply_staged_update(&mut self) -> io::Result<crate::persist::staged_build::ApplyOutcome> {
+        use crate::persist::staged_build::{self, ApplyOutcome};
+
+        // REFUSE BEFORE ANYTHING IS TORN DOWN.
+        //
+        // The handoff below hands the sockets and PTYs to a replacement and then lets THIS
+        // process exit. Under a `Type=simple` systemd unit that exit deactivates the unit,
+        // and the default `KillMode=control-group` kills everything still in the cgroup —
+        // the replacement and every pane it just imported.
+        //
+        // The handoff cannot notice: spawn, import and version validation all succeed, the
+        // API answers `ok`, and the supervisor kills the lot a moment later. On this fleet
+        // that took 30 live panes down and they came back from the snapshot under the wrong
+        // account. So the check must be here, before the first destructive step, and it
+        // must fail closed.
+        if crate::server::supervision::detect().forbids_process_handoff() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "refusing a live handoff: this process is the systemd unit's main process, so \
+                 exiting after the handoff would deactivate the unit and kill the replacement \
+                 and every pane with it. The staged manifest is left in place, but a \
+                 RESTART ALONE WILL NOT PICK IT UP: the live-path swap used to happen inside \
+                 the handoff this refusal prevents, so deploying now means moving \
+                 herdr.staged over the live binary (a rename, not a copy — the running \
+                 image is busy) and then restarting the service.",
+            ));
+        }
+
+        let staged = staged_build::load()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no staged build to apply"))?;
+        let staged_path = std::path::PathBuf::from(&staged.path);
+        staged_build::verify_staged_binary(&staged_path)?;
+        // Capture the live path BEFORE the handoff so this can only fail PRE-commit (current_exe()
+        // does not change across the handoff); every step after the handoff commits is then
+        // uniformly non-fatal, avoiding a post-commit error that would skip the old server's
+        // shutdown while the new server already owns the panes/sockets.
+        let live = std::env::current_exe()?;
+
+        // Validate-before-swap: run the handoff FIRST (spawns + validates the replacement from the
+        // staged binary and commits), with the live path untouched, so a failed handoff leaves the
+        // live binary byte-unchanged. The live path is swapped only AFTER commit (best-effort).
+        let outcome = staged_build::apply_with_handoff(&staged_path, &live, || {
+            self.perform_live_handoff(crate::api::schema::ServerLiveHandoffParams {
+                import_exe: Some(staged_path.to_string_lossy().into_owned()),
+                expected_protocol: None,
+                expected_version: Some(staged.version.clone()),
+            })
+        })?;
+
+        // Stop advertising the update only once it is fully activated on disk; on a partial apply
+        // (disk swap failed) the manifest is left so the owner can retry the swap.
+        if outcome == ApplyOutcome::Activated {
+            staged_build::clear();
+        }
+        Ok(outcome)
     }
 
     fn reload_server_config(&mut self, notify_success: bool) -> crate::config::ConfigReloadReport {
@@ -2042,18 +2120,45 @@ impl HeadlessServer {
                     );
                     return false;
                 }
-                let Some(ClientConnection {
-                    mode: ClientConnectionMode::TerminalAttach { terminal_id },
-                    ..
-                }) = self.clients.get(&client_id)
-                else {
+                debug!(client_id, len = data.len(), "client input received");
+                if let Some(terminal_id) =
+                    self.clients
+                        .get(&client_id)
+                        .and_then(|client| match &client.mode {
+                            ClientConnectionMode::TerminalAttach { terminal_id } => {
+                                Some(terminal_id.clone())
+                            }
+                            _ => None,
+                        })
+                {
+                    let internal_terminal_id = self.terminal_id_by_string(&terminal_id);
+                    let write = self
+                        .runtime_for_terminal_id_string(&terminal_id)
+                        .map(|runtime| {
+                            let baseline = runtime.detection_content_seq();
+                            (baseline, apply_terminal_attach_input(runtime, data))
+                        });
+                    if let Some((baseline, result)) = write {
+                        if let Err(err) = result {
+                            warn!(client_id, terminal_id = %terminal_id, err = %err);
+                        } else if let Some(internal_terminal_id) = internal_terminal_id.as_ref() {
+                            self.app.record_terminal_composer_write(
+                                internal_terminal_id,
+                                crate::terminal::ComposerInputSource::Human,
+                                baseline,
+                                true,
+                                false,
+                            );
+                        }
+                    }
+                    return true;
+                }
+                if matches!(
+                    self.clients.get(&client_id).map(|client| &client.mode),
+                    Some(ClientConnectionMode::TerminalObserve { .. })
+                ) {
                     return false;
                 };
-                if let Some(runtime) = self.runtime_for_terminal_id_string(terminal_id) {
-                    if let Err(err) = apply_terminal_attach_input(runtime, data) {
-                        warn!(client_id, terminal_id = %terminal_id, err = %err);
-                    }
-                }
                 true
             }
             ServerEvent::ClientPasteRejected {
@@ -2567,14 +2672,30 @@ impl HeadlessServer {
                 );
                 navigation_changed | geometry_changed
             }
+            ServerEvent::ClientEndpointStatus { client_id, report } => {
+                use crate::api::schema::MachineEndpointStatus;
+                use crate::protocol::endpoint::EndpointRuntimeStatus;
+                let status = match report.status {
+                    EndpointRuntimeStatus::Connecting => MachineEndpointStatus::Connecting,
+                    EndpointRuntimeStatus::Online => MachineEndpointStatus::Online,
+                    EndpointRuntimeStatus::Reconnecting => MachineEndpointStatus::Reconnecting,
+                    EndpointRuntimeStatus::Attention => MachineEndpointStatus::Attention,
+                    EndpointRuntimeStatus::Disabled => MachineEndpointStatus::Disabled,
+                };
+                self.app
+                    .record_client_endpoint_status(client_id, report.profile_id, status);
+                false
+            }
             ServerEvent::ClientDetach { client_id } => {
                 info!(client_id, "client detached");
+                self.app.remove_client_endpoint_statuses(client_id);
                 self.send_terminal_stream_detach_shutdown(client_id);
                 self.remove_client_and_resize_if_needed(client_id);
                 true
             }
             ServerEvent::ClientDisconnected { client_id } => {
                 info!(client_id, "client disconnected");
+                self.app.remove_client_endpoint_statuses(client_id);
                 self.remove_client_and_resize_if_needed(client_id);
                 true
             }
@@ -2853,7 +2974,8 @@ impl HeadlessServer {
             }
         };
 
-        let metadata_expired = self.app.expire_due_metadata(Instant::now());
+        let metadata_expired = self.app.expire_due_metadata(Instant::now())
+            | self.app.expire_pty_leases_and_apply_shrinks(Instant::now());
         if let api::schema::Method::ServerLiveHandoff(params) = &msg.request.method {
             let handoff_result = self.perform_live_handoff(params.clone());
             let handoff_succeeded = handoff_result.is_ok();
@@ -2862,6 +2984,15 @@ impl HeadlessServer {
                     id: msg.request.id,
                     result: api::schema::ResponseResult::Ok {},
                 }),
+                Err(err) if err.kind() == io::ErrorKind::Unsupported => {
+                    serde_json::to_string(&api::schema::ErrorResponse {
+                        id: msg.request.id,
+                        error: api::schema::ErrorBody {
+                            code: "handoff_refused_supervised".into(),
+                            message: err.to_string(),
+                        },
+                    })
+                }
                 Err(err) => serde_json::to_string(&api::schema::ErrorResponse {
                     id: msg.request.id,
                     error: api::schema::ErrorBody {
@@ -2876,6 +3007,81 @@ impl HeadlessServer {
                 wait_for_live_handoff_response_write(msg.response_write_complete);
                 self.finish_live_handoff_shutdown();
             }
+            return true;
+        }
+
+        #[cfg(unix)]
+        if let api::schema::Method::ServerApplyStagedUpdate(_) = &msg.request.method {
+            use crate::persist::staged_build::ApplyOutcome;
+            let apply_result = self.apply_staged_update();
+            // An Err is PRE-commit (the handoff never committed; the live binary is untouched) — do
+            // NOT shut the old server down, it must keep serving. Any Ok means the handoff committed
+            // and the replacement owns the panes, so the old server hands off regardless of whether
+            // the on-disk swap fully succeeded.
+            let committed = apply_result.is_ok();
+            let response = match apply_result {
+                Ok(ApplyOutcome::Activated) => serde_json::to_string(&api::schema::SuccessResponse {
+                    id: msg.request.id,
+                    result: api::schema::ResponseResult::Ok {},
+                }),
+                // Partial: the new build is LIVE, but the on-disk live path was not updated. Surface
+                // it distinctly (not a clean Ok) so the running-new/disk-old divergence is visible;
+                // the old server still hands off (the update is live) and it was error!-logged.
+                Ok(ApplyOutcome::ActivatedDiskUpdateFailed) => {
+                    serde_json::to_string(&api::schema::ErrorResponse {
+                        id: msg.request.id,
+                        error: api::schema::ErrorBody {
+                            code: "apply_staged_update_disk_stale".into(),
+                            message: "update applied and running, but the on-disk binary path was \
+                                      not updated; a future restart may run the previous build until \
+                                      re-applied"
+                                .into(),
+                        },
+                    })
+                }
+                // A supervision refusal is NOT a failure to distinguish from a broken build —
+                // nothing was attempted and nothing was torn down. Give it its own code so a
+                // caller (and the fleet) can tell "declined for safety, old server still
+                // serving" from "the update itself went wrong".
+                Err(err) if err.kind() == io::ErrorKind::Unsupported => {
+                    serde_json::to_string(&api::schema::ErrorResponse {
+                        id: msg.request.id,
+                        error: api::schema::ErrorBody {
+                            code: "apply_staged_update_refused_supervised".into(),
+                            message: err.to_string(),
+                        },
+                    })
+                }
+                Err(err) => serde_json::to_string(&api::schema::ErrorResponse {
+                    id: msg.request.id,
+                    error: api::schema::ErrorBody {
+                        code: "apply_staged_update_failed".into(),
+                        message: err.to_string(),
+                    },
+                }),
+            }
+            .unwrap_or_else(|_| "{}".to_string());
+            let _ = msg.respond_to.send(response);
+            // Any committed apply (clean or disk-stale) exported the panes to the replacement; shut
+            // the old server down exactly as the plain live-handoff path does.
+            if committed {
+                wait_for_live_handoff_response_write(msg.response_write_complete);
+                self.finish_live_handoff_shutdown();
+            }
+            return true;
+        }
+
+        #[cfg(not(unix))]
+        if let api::schema::Method::ServerApplyStagedUpdate(_) = &msg.request.method {
+            let response = serde_json::to_string(&api::schema::ErrorResponse {
+                id: msg.request.id,
+                error: api::schema::ErrorBody {
+                    code: "apply_staged_update_unsupported_platform".into(),
+                    message: "applying a staged build is unsupported on this platform".into(),
+                },
+            })
+            .unwrap_or_else(|_| "{}".to_string());
+            let _ = msg.respond_to.send(response);
             return true;
         }
 
@@ -3200,6 +3406,10 @@ impl HeadlessServer {
         // No resize polling needed — server has no terminal.
         // Client resize messages drive size changes instead.
 
+        // Remote agent transitions push without a render; a no-op unless the
+        // federation store changed or a held finish is due.
+        self.app.sync_remote_agent_notifications(now);
+
         if self
             .app
             .config_diagnostic_deadline
@@ -3277,6 +3487,7 @@ impl HeadlessServer {
         }
 
         changed |= self.app.handle_tab_bar_status_tasks(now);
+        changed |= self.app.expire_session_transfer_deadlines(now);
 
         if geometry_dirty {
             self.app.pending_agent_resume_deadline = None;
@@ -3385,6 +3596,7 @@ fn server_config_diagnostic_summaries(diagnostics: &[String]) -> (Option<String>
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
+
 // Tests
 // ---------------------------------------------------------------------------
 

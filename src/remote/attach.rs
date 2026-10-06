@@ -1,6 +1,11 @@
 //! Remote thin-client launcher over SSH command stdio.
 
-use super::{args::*, process::wait_with_output_timeout, restart_policy::*, shell_quote};
+use super::{
+    args::*,
+    process::{configure_child_tree, wait_with_output_timeout, wait_with_output_timeout_or_cancel},
+    restart_policy::*,
+    shell_quote,
+};
 use base64::Engine as _;
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -30,14 +35,32 @@ const NONINTERACTIVE_SSH_STDERR_LIMIT: usize = 16 * 1024;
 const BRIDGE_FAILURE_REPORT_TIMEOUT: Duration = Duration::from_secs(1);
 const REMOTE_SERVER_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CURRENT_PROTOCOL: u32 = crate::protocol::PROTOCOL_VERSION;
-const STABLE_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
-const PREVIEW_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/preview.json";
 const REMOTE_BINARY_ENV_VAR: &str = "HERDR_REMOTE_BINARY";
 const REMOTE_OUTPUT_READY_MARKER: &str = "herdr-remote-output-ready:1";
 const WINDOWS_REMOTE_PATH_MARKER: &str = "herdr-remote-path:1:";
 const WINDOWS_REMOTE_INSTALL_DIR_MARKER: &str = "herdr-remote-install-dir:1:";
 const WINDOWS_REMOTE_INSTALL_RESULT_MARKER: &str = "herdr-remote-install-result:1:";
 const SSH_CONTROL_SOCKET_NAME: &str = "ctl";
+/// Apply non-interactive authentication, bounded connect, and keepalive options
+/// to a saved-machine SSH command.
+pub(super) fn apply_noninteractive_ssh_options(command: &mut Command) {
+    command
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("NumberOfPasswordPrompts=0")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg("-o")
+        .arg("ConnectionAttempts=1")
+        .arg("-o")
+        .arg("ServerAliveInterval=15")
+        .arg("-o")
+        .arg("ServerAliveCountMax=4");
+}
+
 pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
     let session_name = crate::session::active_name()
         .unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_string());
@@ -138,7 +161,8 @@ impl SavedSshSetup {
             manage,
             crate::session::DEFAULT_SESSION_NAME.to_owned(),
         );
-        let remote_herdr = RemoteHerdr::for_platform(detect_remote_platform(&ssh)?);
+        let remote_herdr =
+            RemoteHerdr::for_platform(detect_remote_platform(&ssh)?.into_setup_platform());
         let candidates = remote_binary_candidates(&ssh, &remote_herdr)?;
         Ok(Self {
             ssh,
@@ -256,6 +280,21 @@ struct RemoteSessionListJson {
 struct RemoteSessionJson {
     name: String,
     running: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct DetectedRemotePlatform {
+    platform: RemotePlatform,
+    setup_note: Option<&'static str>,
+}
+
+impl DetectedRemotePlatform {
+    fn into_setup_platform(self) -> RemotePlatform {
+        if let Some(note) = self.setup_note {
+            eprintln!("note: {note}");
+        }
+        self.platform
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -552,26 +591,6 @@ impl RemoteAssetRef {
 }
 
 #[derive(Deserialize)]
-struct RemoteUpdateManifest {
-    version: String,
-    protocol: Option<u32>,
-    assets: BTreeMap<String, RemoteAssetRef>,
-    #[serde(default)]
-    sha256: BTreeMap<String, String>,
-    #[serde(default, deserialize_with = "deserialize_remote_manifest_releases")]
-    releases: BTreeMap<String, RemoteReleaseMetadata>,
-}
-
-#[derive(Deserialize)]
-struct RemoteReleaseMetadata {
-    protocol: Option<u32>,
-    #[serde(default)]
-    assets: BTreeMap<String, RemoteAssetRef>,
-    #[serde(default)]
-    sha256: BTreeMap<String, String>,
-}
-
-#[derive(Deserialize)]
 struct RemotePreviewManifest {
     build_id: String,
     protocol: u32,
@@ -584,53 +603,6 @@ struct RemotePreviewManifest {
 struct RemotePreviewBuildMetadata {
     protocol: u32,
     assets: BTreeMap<String, RemoteAssetRef>,
-}
-
-fn deserialize_remote_manifest_releases<'de, D>(
-    deserializer: D,
-) -> Result<BTreeMap<String, RemoteReleaseMetadata>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
-    Ok(match value {
-        Some(serde_json::Value::Object(object)) => object
-            .into_iter()
-            .filter_map(|(version, release)| {
-                serde_json::from_value::<RemoteReleaseMetadata>(release)
-                    .ok()
-                    .map(|metadata| (version, metadata))
-            })
-            .collect(),
-        _ => BTreeMap::new(),
-    })
-}
-
-impl RemoteUpdateManifest {
-    fn release_for_version(&self, version: &str) -> Option<RemoteManifestReleaseRef<'_>> {
-        if self.version.trim_start_matches('v') == version {
-            return Some(RemoteManifestReleaseRef {
-                protocol: self.protocol,
-                assets: &self.assets,
-                sha256: &self.sha256,
-            });
-        }
-
-        self.releases.get(version).and_then(|release| {
-            (!release.assets.is_empty()).then_some(RemoteManifestReleaseRef {
-                protocol: release.protocol,
-                assets: &release.assets,
-                sha256: &release.sha256,
-            })
-        })
-    }
-}
-
-#[derive(Clone, Copy)]
-struct RemoteManifestReleaseRef<'a> {
-    protocol: Option<u32>,
-    assets: &'a BTreeMap<String, RemoteAssetRef>,
-    sha256: &'a BTreeMap<String, String>,
 }
 
 fn current_version() -> String {
@@ -657,8 +629,8 @@ pub(super) struct PreparedRemoteHerdr {
 }
 
 #[derive(Clone)]
-pub(super) struct ManagedSshOptions {
-    config_path: PathBuf,
+pub(crate) struct ManagedSshOptions {
+    pub(super) config_path: PathBuf,
     control_path: Option<PathBuf>,
     // Bridge workers may launch SSH after the helper that created this config
     // has gone away. The last options owner removes only the temporary config.
@@ -754,6 +726,7 @@ pub(super) struct RemoteSsh {
     session_name: String,
     managed_config: Option<ManagedSshConfig>,
     noninteractive: bool,
+    cancellation: Option<Arc<AtomicBool>>,
 }
 
 impl RemoteSsh {
@@ -773,6 +746,7 @@ impl RemoteSsh {
             session_name,
             managed_config,
             noninteractive: false,
+            cancellation: None,
         }
     }
 
@@ -784,6 +758,15 @@ impl RemoteSsh {
                 .manage_ssh_config;
         let mut ssh = Self::new(target, manage, crate::session::DEFAULT_SESSION_NAME.into());
         ssh.noninteractive = true;
+        ssh
+    }
+
+    pub(super) fn new_noninteractive_cancellable(
+        target: String,
+        cancellation: Arc<AtomicBool>,
+    ) -> Self {
+        let mut ssh = Self::new_noninteractive(target);
+        ssh.cancellation = Some(cancellation);
         ssh
     }
 
@@ -803,9 +786,20 @@ impl RemoteSsh {
         let mut command = self.base_command();
         if self.noninteractive {
             apply_noninteractive_ssh_options(&mut command);
+            configure_child_tree(&mut command);
         }
         command.arg("-T").arg(&self.target);
         command
+    }
+
+    fn wait_noninteractive(&self, child: Child) -> io::Result<Output> {
+        if let Some(cancellation) = &self.cancellation {
+            wait_with_output_timeout_or_cancel(child, NONINTERACTIVE_SSH_COMMAND_TIMEOUT, || {
+                cancellation.load(Ordering::Acquire)
+            })
+        } else {
+            wait_with_output_timeout(child, NONINTERACTIVE_SSH_COMMAND_TIMEOUT)
+        }
     }
 
     fn base_command(&self) -> Command {
@@ -820,7 +814,7 @@ impl RemoteSsh {
         command
     }
 
-    fn sh_output(&self, script: &str) -> io::Result<Output> {
+    pub(super) fn sh_output(&self, script: &str) -> io::Result<Output> {
         let script = posix_remote_output_command(script);
         let mut child = self
             .command()
@@ -845,7 +839,7 @@ impl RemoteSsh {
                 "ssh bootstrap stdin missing",
             ))
         };
-        let output = wait_with_output_timeout(child, NONINTERACTIVE_SSH_COMMAND_TIMEOUT)?;
+        let output = self.wait_noninteractive(child)?;
         write_result?;
         normalize_remote_output(output)
     }
@@ -860,7 +854,7 @@ impl RemoteSsh {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let output = if self.noninteractive {
-            wait_with_output_timeout(command.spawn()?, NONINTERACTIVE_SSH_COMMAND_TIMEOUT)
+            self.wait_noninteractive(command.spawn()?)
         } else {
             output_with_forwarded_stderr(command.spawn()?, None)
         }?;
@@ -1184,25 +1178,10 @@ fn decode_windows_remote_path(encoded: &str) -> io::Result<String> {
     Ok(path)
 }
 
-fn apply_noninteractive_ssh_options(command: &mut Command) {
-    command
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
-        .arg("NumberOfPasswordPrompts=0")
-        .arg("-o")
-        .arg("StrictHostKeyChecking=yes")
-        .arg("-o")
-        .arg("ConnectTimeout=10")
-        .arg("-o")
-        .arg("ConnectionAttempts=1")
-        .arg("-o")
-        .arg("ServerAliveInterval=15")
-        .arg("-o")
-        .arg("ServerAliveCountMax=4");
-}
-
-fn apply_managed_ssh_options(command: &mut Command, options: Option<&ManagedSshOptions>) {
+pub(crate) fn apply_managed_ssh_options(
+    command: &mut Command,
+    options: Option<&ManagedSshOptions>,
+) {
     // Compress the first connection too: multiplexed bridges inherit the master's transport.
     command.arg("-C");
     let Some(options) = options else {
@@ -1272,7 +1251,7 @@ pub(super) fn prepare_remote_herdr(
     live_handoff_enabled: bool,
     require_surface_interest: bool,
 ) -> io::Result<PreparedRemoteHerdr> {
-    let platform = detect_remote_platform(ssh)?;
+    let platform = detect_remote_platform(ssh)?.into_setup_platform();
     let remote_herdr = RemoteHerdr::for_platform(platform);
     let candidates = remote_binary_candidates(ssh, &remote_herdr)?;
     prepare_discovered_remote_herdr(
@@ -1365,7 +1344,7 @@ fn prepare_discovered_remote_herdr(
 }
 
 pub(super) fn find_installed_remote_herdr(ssh: &RemoteSsh) -> io::Result<RemoteHerdr> {
-    let platform = detect_remote_platform(ssh)?;
+    let platform = detect_remote_platform(ssh)?.platform;
     let remote_herdr = RemoteHerdr::for_platform(platform);
     let candidates = remote_binary_candidates(ssh, &remote_herdr)?;
     for mut candidate in candidates {
@@ -1459,7 +1438,7 @@ pub(super) fn discover_remote_api_metadata(
     ssh: &RemoteSsh,
     session: &str,
 ) -> io::Result<crate::client::endpoint::SshMachineMetadata> {
-    let platform = detect_remote_platform(ssh)?;
+    let platform = detect_remote_platform(ssh)?.platform;
     if !platform.is_windows() {
         let output =
             ssh.framed_user_shell_output(&posix_remote_api_discovery_command(&platform, session))?;
@@ -1501,7 +1480,7 @@ pub(super) fn discover_remote_api_metadata(
     ))
 }
 
-fn detect_remote_platform(ssh: &RemoteSsh) -> io::Result<RemotePlatform> {
+fn detect_remote_platform(ssh: &RemoteSsh) -> io::Result<DetectedRemotePlatform> {
     let output = ssh.sh_output("uname -s\nuname -m\n")?;
     let mut windows_uname_hint = false;
     let posix_error = if output.status.success() {
@@ -1510,7 +1489,10 @@ fn detect_remote_platform(ssh: &RemoteSsh) -> io::Result<RemotePlatform> {
         let os = lines.next().unwrap_or_default();
         let arch = lines.next().unwrap_or_default();
         if let Some(platform) = RemotePlatform::from_uname(os, arch) {
-            return Ok(platform);
+            return Ok(DetectedRemotePlatform {
+                platform,
+                setup_note: None,
+            });
         }
         windows_uname_hint = looks_like_windows_uname(os);
         io::Error::other(format!(
@@ -1561,20 +1543,27 @@ fn windows_platform_probe_command() -> String {
     )
 }
 
-fn parse_windows_platform_probe(stdout: &str) -> Result<Option<RemotePlatform>, String> {
+fn parse_windows_platform_probe(stdout: &str) -> Result<Option<DetectedRemotePlatform>, String> {
     let Some(arch) = stdout
         .lines()
         .find_map(|line| line.trim().strip_prefix("herdr-windows:"))
     else {
         return Ok(None);
     };
-    match arch.trim().to_ascii_uppercase().as_str() {
-        "AMD64" | "X86_64" => Ok(Some(RemotePlatform {
+    let setup_note = match arch.trim().to_ascii_uppercase().as_str() {
+        "AMD64" | "X86_64" => None,
+        "ARM64" => Some(
+            "Windows ARM64 support is best-effort and uses x64 emulation; bugs and issues are expected.",
+        ),
+        arch => return Err(format!("unsupported remote platform: Windows {arch}")),
+    };
+    Ok(Some(DetectedRemotePlatform {
+        platform: RemotePlatform {
             os: "windows",
             arch: "x86_64",
-        })),
-        arch => Err(format!("unsupported remote platform: Windows {arch}")),
-    }
+        },
+        setup_note,
+    }))
 }
 
 fn remote_binary_candidates(
@@ -2478,60 +2467,42 @@ fn preview_assets_for_build<'a>(
     Ok((build.protocol, &build.assets))
 }
 
+/// The published asset that installs this exact build on a remote host.
+///
+/// Only HerdrUp preview builds have one. A stable-stamped build used to resolve
+/// upstream's `herdr.dev/latest.json`, whose release for the same version number
+/// is a herdrdev binary, so connecting to a host this binary could not seed itself
+/// (another OS or architecture, or a package-managed local install) silently
+/// installed upstream Herdr there.
 fn remote_release_asset(asset_key: &str) -> io::Result<RemoteReleaseAsset> {
-    if crate::build_info::is_preview() {
-        let build_id = crate::build_info::build_id().ok_or_else(|| {
-            io::Error::other("preview client has no build id; set HERDR_REMOTE_BINARY or install Herdr on the remote manually")
-        })?;
-        let manifest_bytes = fetch_remote_manifest(PREVIEW_UPDATE_MANIFEST_URL)?;
-        let manifest: RemotePreviewManifest =
-            serde_json::from_slice(&manifest_bytes).map_err(|err| {
-                io::Error::other(format!("failed to parse preview manifest JSON: {err}"))
-            })?;
-        let (protocol, assets) = preview_assets_for_build(&manifest, build_id)?;
-        if protocol != CURRENT_PROTOCOL {
-            return Err(io::Error::other(format!(
-                "preview manifest has build {build_id} protocol {protocol}, but this client needs protocol {CURRENT_PROTOCOL}; set {REMOTE_BINARY_ENV_VAR}=target/release/herdr or install a matching Herdr on the remote host manually"
-            )));
-        }
-        return assets.get(asset_key).map(remote_asset_info).ok_or_else(|| {
+    if !crate::build_info::is_preview() {
+        return Err(io::Error::other(format!(
+            "HerdrUp publishes no stable release of herdr {} for {asset_key}, and upstream's would replace HerdrUp on the remote; set {REMOTE_BINARY_ENV_VAR} to a HerdrUp binary for {asset_key}, or install HerdrUp on the remote with `{}`",
+            current_version(),
+            crate::update::FORK_INSTALL_COMMAND
+        )));
+    }
+    let build_id = crate::build_info::build_id().ok_or_else(|| {
+        io::Error::other("preview client has no build id; set HERDR_REMOTE_BINARY or install Herdr on the remote manually")
+    })?;
+    let manifest_bytes = fetch_remote_manifest(crate::update::PREVIEW_UPDATE_MANIFEST_URL)?;
+    let manifest: RemotePreviewManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|err| io::Error::other(format!("failed to parse preview manifest JSON: {err}")))?;
+    let (protocol, assets) = preview_assets_for_build(&manifest, build_id)?;
+    if protocol != CURRENT_PROTOCOL {
+        return Err(io::Error::other(format!(
+            "preview manifest has build {build_id} protocol {protocol}, but this client needs protocol {CURRENT_PROTOCOL}; set {REMOTE_BINARY_ENV_VAR}=target/release/herdr or install a matching Herdr on the remote host manually"
+        )));
+    }
+    let asset = assets
+        .get(asset_key)
+        .map(remote_asset_info)
+        .ok_or_else(|| {
             io::Error::other(format!(
                 "no {asset_key} binary in the preview manifest for build {build_id}"
             ))
-        });
-    }
-
-    let current_version = current_version();
-    let manifest_bytes = fetch_remote_manifest(STABLE_UPDATE_MANIFEST_URL)?;
-    let manifest: RemoteUpdateManifest = serde_json::from_slice(&manifest_bytes)
-        .map_err(|err| io::Error::other(format!("failed to parse update manifest JSON: {err}")))?;
-    let release = manifest.release_for_version(&current_version).ok_or_else(|| {
-        io::Error::other(format!(
-            "release manifest does not include herdr {current_version}; build herdr for {} or install it there manually",
-            asset_key
-        ))
-    })?;
-    if let Some(protocol) = release.protocol {
-        if protocol != CURRENT_PROTOCOL {
-            return Err(io::Error::other(format!(
-                "release manifest has herdr {current_version} protocol {protocol}, but this client needs protocol {CURRENT_PROTOCOL}; set {REMOTE_BINARY_ENV_VAR}=target/release/herdr or install a matching herdr on the remote host manually"
-            )));
-        }
-    }
-    let asset = release.assets.get(asset_key).ok_or_else(|| {
-        io::Error::other(format!(
-            "no {asset_key} binary in the release manifest for herdr {current_version}"
-        ))
-    })?;
-    let mut asset = remote_asset_info(asset);
-    asset.sha256 = asset
-        .sha256
-        .or_else(|| release.sha256.get(asset_key).cloned());
-    if asset.sha256.is_none() {
-        return Err(io::Error::other(format!(
-            "release manifest asset {asset_key} is missing a SHA-256 checksum"
-        )));
-    }
+        })?;
+    crate::update::ensure_fork_release_asset(&asset.url).map_err(io::Error::other)?;
     Ok(asset)
 }
 
@@ -2784,7 +2755,18 @@ impl SshStdioBridge {
         let thread_ssh_options = ssh_options.cloned();
         let (failure_tx, failure_rx) = mpsc::sync_channel(1);
         let thread = thread::spawn(move || {
+            let mut workers: Vec<thread::JoinHandle<()>> = Vec::new();
             while !thread_stop.load(Ordering::Acquire) {
+                let mut index = 0;
+                while index < workers.len() {
+                    if workers[index].is_finished() {
+                        let worker = workers.swap_remove(index);
+                        let _ = worker.join();
+                    } else {
+                        index += 1;
+                    }
+                }
+
                 match listener.accept() {
                     Ok(stream) => {
                         let stream = match prepare_remote_bridge_stream(stream) {
@@ -2797,27 +2779,35 @@ impl SshStdioBridge {
                                 continue;
                             }
                         };
-                        if let Err(err) = bridge_connection(
-                            stream,
-                            &target,
-                            &remote_command,
-                            thread_ssh_options.as_ref(),
-                            noninteractive,
-                            &thread_stop,
-                        ) {
-                            let _ =
-                                failure_tx.try_send(io::Error::new(err.kind(), err.to_string()));
-                            if noninteractive {
-                                tracing::warn!(error = %err, "saved SSH endpoint bridge failed");
-                            } else {
-                                eprintln!("herdr: remote bridge failed: {err}");
+                        let worker_target = target.clone();
+                        let worker_command = remote_command.clone();
+                        let worker_options = thread_ssh_options.clone();
+                        let worker_stop = Arc::clone(&thread_stop);
+                        let worker_failure = failure_tx.clone();
+                        workers.push(thread::spawn(move || {
+                            if let Err(err) = bridge_connection(
+                                stream,
+                                &worker_target,
+                                &worker_command,
+                                worker_options.as_ref(),
+                                noninteractive,
+                                &worker_stop,
+                            ) {
+                                let _ = worker_failure
+                                    .try_send(io::Error::new(err.kind(), err.to_string()));
+                                if noninteractive {
+                                    tracing::warn!(error = %err, "saved SSH endpoint bridge failed");
+                                } else {
+                                    eprintln!("herdr: remote bridge failed: {err}");
+                                }
                             }
-                        }
+                        }));
                     }
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                         thread::sleep(BRIDGE_ACCEPT_POLL);
                     }
                     Err(err) => {
+                        let _ = failure_tx.try_send(io::Error::new(err.kind(), err.to_string()));
                         if noninteractive {
                             tracing::warn!(error = %err, "saved SSH endpoint listener failed");
                         } else {
@@ -2826,6 +2816,9 @@ impl SshStdioBridge {
                         break;
                     }
                 }
+            }
+            for worker in workers {
+                let _ = worker.join();
             }
         });
 
@@ -2842,6 +2835,17 @@ impl SshStdioBridge {
         self.failure_rx
             .recv_timeout(BRIDGE_FAILURE_REPORT_TIMEOUT)
             .ok()
+    }
+
+    pub(super) fn try_reported_failure(&self) -> io::Result<Option<io::Error>> {
+        match self.failure_rx.try_recv() {
+            Ok(error) => Ok(Some(error)),
+            Err(std::sync::mpsc::TryRecvError::Empty) => Ok(None),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "SSH bridge failure monitor disconnected",
+            )),
+        }
     }
 }
 
@@ -2942,6 +2946,50 @@ fn write_managed_ssh_config(target: &str) -> io::Result<ManagedSshConfig> {
             control_path,
             _directory: Arc::new(ManagedSshConfigDirectory(dir)),
         },
+    })
+}
+
+/// Build the process-wide SSH config used by saved federation bridges. `%C`
+/// gives each destination its own persistent OpenSSH master while all peers
+/// share one config file.
+pub(crate) fn build_federation_ssh_options() -> io::Result<ManagedSshOptions> {
+    const CONTROL_SOCKET_TEMPLATE: &str = "cm-%C";
+    const CONTROL_SOCKET_RESERVATION: &str =
+        "cm-ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+
+    let paths = crate::platform::remote_ssh_config_paths();
+    let dir = crate::platform::create_remote_ssh_config_dir(CONTROL_SOCKET_RESERVATION)?;
+    let path = dir.join("config");
+    let control_path = paths
+        .multiplexing
+        .then(|| dir.join(CONTROL_SOCKET_TEMPLATE));
+
+    let mut contents = String::new();
+    if let Some(include) = ssh_user_config_include(paths.user_config.as_deref()) {
+        contents.push_str(&format!("Include {include}\n"));
+    }
+    if let Some(system_config) = paths.system_config.filter(|path| path.is_file()) {
+        contents.push_str(&format!(
+            "Include {}\n",
+            ssh_config_include_path(&system_config)
+        ));
+    }
+    contents.push_str("Host *\n");
+    contents.push_str("  ServerAliveInterval 15\n");
+    contents.push_str("  ServerAliveCountMax 4\n");
+
+    let write_result = (|| {
+        let mut file = crate::platform::create_remote_ssh_config_file(&path)?;
+        file.write_all(contents.as_bytes())
+    })();
+    if let Err(error) = write_result {
+        let _ = fs::remove_dir_all(&dir);
+        return Err(error);
+    }
+    Ok(ManagedSshOptions {
+        config_path: path,
+        control_path,
+        _directory: Arc::new(ManagedSshConfigDirectory(dir)),
     })
 }
 
@@ -3398,6 +3446,35 @@ fn sanitize_path_component(input: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn disconnected_bridge_failure_monitor_is_terminal() {
+        let (failure_tx, failure_rx) = std::sync::mpsc::channel();
+        drop(failure_tx);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let local_socket = crate::platform::remote_bridge_endpoint_path(
+            &format!("herdr-disconnected-bridge-{nonce}.sock"),
+            &format!("hdb-{nonce}.sock"),
+        );
+        let listener = crate::ipc::bind_local_listener(&local_socket).unwrap();
+        let socket_identity = crate::ipc::socket_file_identity(&local_socket).unwrap();
+        drop(listener);
+        let bridge = SshStdioBridge {
+            local_socket,
+            socket_identity,
+            should_stop: Arc::new(AtomicBool::new(true)),
+            failure_rx,
+            thread: None,
+        };
+
+        let error = bridge
+            .try_reported_failure()
+            .expect_err("disconnected monitor must trigger bridge replacement");
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
+
     fn decode_windows_command(command: &str) -> String {
         let encoded = command
             .strip_prefix("powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand ")
@@ -3777,6 +3854,98 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn saved_bridge_serves_a_second_connection_while_a_stream_is_open() {
+        use std::io::{BufRead as _, Write as _};
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        struct PathRestore(Option<std::ffi::OsString>);
+        impl Drop for PathRestore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(path) => std::env::set_var("PATH", path),
+                    None => std::env::remove_var("PATH"),
+                }
+            }
+        }
+
+        let _env_lock = crate::config::test_config_env_lock().lock().unwrap();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "herdr-bridge-concurrent-{}-{nonce}",
+            std::process::id()
+        ));
+        let bin = base.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let ssh = bin.join("ssh");
+        std::fs::write(
+            &ssh,
+            "#!/bin/sh\nprintf '\\nherdr-remote-output-ready:1\\n'\nexec /bin/cat\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&ssh).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&ssh, permissions).unwrap();
+
+        let _path_restore = PathRestore(std::env::var_os("PATH"));
+        std::env::set_var("PATH", &bin);
+        let socket = crate::platform::remote_bridge_endpoint_path(
+            &format!(
+                "herdr-bridge-concurrent-{}-{nonce}.sock",
+                std::process::id()
+            ),
+            &format!("hb-{}-{nonce}.sock", std::process::id()),
+        );
+        let bridge = SshStdioBridge::start_command(
+            "example".into(),
+            "ignored".into(),
+            socket.clone(),
+            None,
+            true,
+        )
+        .expect("start bridge");
+
+        let first = crate::ipc::connect_local_stream(&socket).expect("connect first stream");
+        let mut first = std::io::BufReader::new(first);
+        first.get_mut().write_all(b"first\n").unwrap();
+        let mut line = String::new();
+        first.read_line(&mut line).unwrap();
+        assert_eq!(line, "first\n");
+
+        let second_socket = socket.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let second = thread::spawn(move || {
+            let stream =
+                crate::ipc::connect_local_stream(&second_socket).expect("connect second stream");
+            let mut stream = std::io::BufReader::new(stream);
+            stream.get_mut().write_all(b"second\n").unwrap();
+            let mut line = String::new();
+            stream.read_line(&mut line).unwrap();
+            done_tx.send(line).unwrap();
+        });
+
+        assert_eq!(
+            done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("second stream must not wait for first"),
+            "second\n"
+        );
+        second.join().unwrap();
+        let started = Instant::now();
+        drop(bridge);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "dropping the bridge must cancel open stream workers"
+        );
+        drop(first);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn shared_ssh_transport_survives_helper_config_drop() {
         let first = write_managed_ssh_config("example").unwrap();
         let second = write_managed_ssh_config("example").unwrap();
@@ -3874,7 +4043,6 @@ mod tests {
         assert!(ssh.options().is_none());
         assert!(!ssh.command().get_args().any(|arg| arg == "-F"));
     }
-
     #[test]
     fn ssh_config_quote_wraps_path_with_spaces() {
         assert_eq!(
@@ -3894,6 +4062,7 @@ mod tests {
             session_name: crate::session::DEFAULT_SESSION_NAME.into(),
             managed_config: Some(managed_config),
             noninteractive: false,
+            cancellation: None,
         };
 
         let command = ssh.command();
@@ -3965,6 +4134,7 @@ mod tests {
             session_name: crate::session::DEFAULT_SESSION_NAME.into(),
             managed_config: Some(managed_config),
             noninteractive: false,
+            cancellation: None,
         };
         let args = ssh
             .command()
@@ -4044,6 +4214,7 @@ mod tests {
             session_name: "probe-options".into(),
             managed_config: Some(managed_config),
             noninteractive: false,
+            cancellation: None,
         };
         let remote = RemoteHerdr::for_platform(RemotePlatform {
             os: "linux",
@@ -4175,6 +4346,7 @@ mod tests {
             session_name: crate::session::DEFAULT_SESSION_NAME.into(),
             managed_config: None,
             noninteractive: false,
+            cancellation: None,
         };
 
         let command = ssh.command();
@@ -4394,19 +4566,39 @@ mod tests {
     }
 
     #[test]
-    fn windows_platform_probe_accepts_only_x86_64() {
-        assert_eq!(
-            parse_windows_platform_probe("profile noise\r\nherdr-windows:AMD64\r\n").unwrap(),
-            Some(RemotePlatform {
-                os: "windows",
-                arch: "x86_64",
-            })
-        );
+    fn windows_platform_probe_preserves_native_and_unsupported_architectures() {
+        for arch in ["AMD64", "x86_64"] {
+            assert_eq!(
+                parse_windows_platform_probe(&format!("profile noise\r\nherdr-windows:{arch}\r\n"))
+                    .unwrap(),
+                Some(DetectedRemotePlatform {
+                    platform: RemotePlatform {
+                        os: "windows",
+                        arch: "x86_64",
+                    },
+                    setup_note: None,
+                })
+            );
+        }
         assert_eq!(parse_windows_platform_probe("other output").unwrap(), None);
         assert_eq!(
-            parse_windows_platform_probe("herdr-windows:ARM64").unwrap_err(),
-            "unsupported remote platform: Windows ARM64"
+            parse_windows_platform_probe("herdr-windows:x86").unwrap_err(),
+            "unsupported remote platform: Windows X86"
         );
+    }
+
+    #[test]
+    fn windows_arm64_probe_selects_x64_package() {
+        let platform = parse_windows_platform_probe("herdr-windows:ARM64")
+            .expect("Windows ARM64 should use the x64 build on a best-effort basis")
+            .expect("the Windows platform marker should be recognized");
+        assert_eq!(platform.platform.asset_key(), "windows-x86_64");
+        let note = platform
+            .setup_note
+            .expect("ARM64 setup must warn about emulation");
+        assert!(note.contains("best-effort"));
+        assert!(note.contains("x64 emulation"));
+        assert!(note.contains("bugs and issues are expected"));
     }
 
     #[test]
@@ -4529,6 +4721,21 @@ mod tests {
                 .executable,
             path
         );
+    }
+
+    #[test]
+    fn cached_posix_api_command_preserves_spaced_path_and_named_session() {
+        let path = "/opt/Herdr Builds/herdr";
+        let command = cached_remote_api_command(
+            &crate::client::endpoint::SshMachineMetadata {
+                os: "linux".into(),
+                executable: path.into(),
+            },
+            "agent work",
+        );
+        assert!(command.contains(path));
+        assert!(command.contains("agent work"));
+        assert!(command.contains("remote-api-bridge"));
     }
 
     #[test]
@@ -5247,123 +5454,24 @@ function Get-Process {
     }
 
     #[test]
-    fn remote_update_manifest_uses_root_assets_for_latest_version() {
-        let manifest: RemoteUpdateManifest = serde_json::from_str(
-            r#"{
-                "version": "1.2.3",
-                "assets": {
-                    "linux-x86_64": "https://example.com/latest"
-                },
-                "sha256": {
-                    "linux-x86_64": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                },
-                "releases": {
-                    "1.2.3": {
-                        "assets": {
-                            "linux-x86_64": "https://example.com/archive"
-                        }
-                    }
-                }
-            }"#,
-        )
-        .unwrap();
-
-        let release = manifest.release_for_version("1.2.3").unwrap();
-        assert_eq!(
-            release.assets.get("linux-x86_64").map(RemoteAssetRef::url),
-            Some("https://example.com/latest")
+    fn stable_stamped_build_refuses_to_seed_a_remote_from_upstream_releases() {
+        // HerdrUp's release assets are stable-stamped (they report `0.9.1 (d79b021)`),
+        // and this path used to install upstream's herdr.dev release of the same
+        // version on any remote the local binary could not seed itself.
+        assert!(
+            !crate::build_info::is_preview(),
+            "this test covers stable-stamped builds; rebuild without HERDR_BUILD_CHANNEL"
         );
-        assert_eq!(
-            release.sha256.get("linux-x86_64").map(String::as_str),
-            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-        );
-    }
-
-    #[test]
-    fn remote_update_manifest_reads_archived_release_assets() {
-        let manifest: RemoteUpdateManifest = serde_json::from_str(
-            r#"{
-                "version": "1.2.4",
-                "assets": {
-                    "linux-x86_64": "https://example.com/latest"
-                },
-                "releases": {
-                    "1.2.3": {
-                        "notes": "ignored",
-                        "assets": {
-                            "linux-x86_64": "https://example.com/archive"
-                        }
-                    }
-                }
-            }"#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            manifest
-                .release_for_version("1.2.3")
-                .and_then(|release| release.assets.get("linux-x86_64"))
-                .map(RemoteAssetRef::url),
-            Some("https://example.com/archive")
-        );
-    }
-
-    #[test]
-    fn remote_update_manifest_uses_archived_release_protocol() {
-        let manifest: RemoteUpdateManifest = serde_json::from_str(
-            r#"{
-                "version": "1.2.4",
-                "protocol": 42,
-                "assets": {
-                    "linux-x86_64": "https://example.com/latest"
-                },
-                "releases": {
-                    "1.2.3": {
-                        "notes": "ignored",
-                        "protocol": 41,
-                        "assets": {
-                            "linux-x86_64": "https://example.com/archive"
-                        }
-                    }
-                }
-            }"#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            manifest
-                .release_for_version("1.2.3")
-                .and_then(|release| release.protocol),
-            Some(41)
-        );
-    }
-
-    #[test]
-    fn remote_update_manifest_does_not_inherit_latest_protocol_for_archived_assets() {
-        let manifest: RemoteUpdateManifest = serde_json::from_str(
-            r#"{
-                "version": "1.2.4",
-                "protocol": 42,
-                "assets": {
-                    "linux-x86_64": "https://example.com/latest"
-                },
-                "releases": {
-                    "1.2.3": {
-                        "notes": "ignored",
-                        "assets": {
-                            "linux-x86_64": "https://example.com/archive"
-                        }
-                    }
-                }
-            }"#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            manifest
-                .release_for_version("1.2.3")
-                .and_then(|release| release.protocol),
-            None
+        let error = match remote_release_asset("linux-x86_64") {
+            Ok(asset) => panic!(
+                "a stable-stamped build resolved a remote asset: {}",
+                asset.url
+            ),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains(crate::update::FORK_INSTALL_COMMAND),
+            "refusal does not name the fork installer: {error}"
         );
     }
 
