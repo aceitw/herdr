@@ -113,6 +113,10 @@ pub struct App {
     pub(crate) config_diagnostic_deadline: Option<Instant>,
     pub(crate) toast_deadline: Option<Instant>,
     pub(crate) last_api_notification_at: Option<Instant>,
+    /// True only for a server context with no persistent SessionStore — gram storage
+    /// requires the shared session/agent registry, so those contexts answer
+    /// `gram_unavailable`. Always `false` in the default TUI/server path.
+    pub(crate) no_session: bool,
     pub(crate) last_git_remote_status_refresh: Instant,
     pub(crate) last_git_repo_discovery_refresh: Instant,
     pub(crate) git_refresh_in_flight: bool,
@@ -569,6 +573,7 @@ impl App {
             config_diagnostic_deadline: None,
             toast_deadline: None,
             last_api_notification_at: None,
+            no_session: false,
             state,
             pixel_mouse_available: false,
             terminal_runtimes: restored_terminal_runtimes,

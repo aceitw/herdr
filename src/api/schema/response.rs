@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use super::agents::AgentInfo;
 use super::common::{ClientWindowTitleReason, NotificationShowReason};
 use super::events::EventEnvelope;
+use super::gram::GramMessageInfo;
 use super::integrations::{
     IntegrationInstallResult, IntegrationTarget, IntegrationUninstallResult,
 };
@@ -276,6 +277,36 @@ pub enum ResponseResult {
     ClientShellSurfaceSet {
         active: bool,
         projection_revision: u64,
+    },
+    GramSent {
+        /// The stored message as clients see it.
+        message: GramMessageInfo,
+        /// Install-stable identity of the store this send landed in.
+        store_id: String,
+    },
+    GramList {
+        messages: Vec<GramMessageInfo>,
+        /// Install-stable identity of the store these messages were read from.
+        /// Present even when `messages` is empty.
+        store_id: String,
+        /// Fingerprint of the whole filtered list this answer was cut from — NOT
+        /// of the page. Send it back as `if_unchanged_digest` to make the next
+        /// HEAD-style poll conditional.
+        digest: String,
+        /// Whether messages older than this page remain. Always `false` for an
+        /// unpaged answer.
+        has_more: bool,
+        /// Unread count over the WHOLE filtered list, never just the page.
+        unread_count: usize,
+    },
+    /// `gram.list` with an `if_unchanged_digest` that still matches: nothing has
+    /// changed, so the messages are omitted entirely.
+    GramListUnchanged {
+        store_id: String,
+        digest: String,
+    },
+    GramGrabbed {
+        message: GramMessageInfo,
     },
     Ok {},
 }

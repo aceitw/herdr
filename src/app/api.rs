@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 mod agent_view;
 mod agents;
 mod env;
+mod gram;
 mod integrations;
 mod layouts;
 mod panes;
@@ -15,6 +16,16 @@ mod worktrees;
 
 use super::{api_helpers::pane_agent_status, App, Mode, OverlayPaneState, ToastKind};
 use crate::events::AppEvent;
+
+/// Wall-clock milliseconds since the Unix epoch, at millisecond resolution —
+/// gram record timestamps and grab stamps.
+pub(super) fn unix_millis_now() -> u64 {
+    use std::time::SystemTime;
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|since_epoch| since_epoch.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 const API_NOTIFICATION_RATE_LIMIT: Duration = Duration::from_secs(1);
 #[cfg(windows)]
@@ -1221,6 +1232,24 @@ impl App {
             }
             Method::PluginPaneClose(params) => {
                 return self.handle_plugin_pane_close(request.id, params);
+            }
+            Method::GramSend(params) => {
+                return self.handle_gram_send(request.id, params);
+            }
+            Method::GramPost(params) => {
+                return self.handle_gram_post(request.id, params);
+            }
+            Method::GramList(params) => {
+                return self.handle_gram_list(request.id, params);
+            }
+            Method::GramGrab(params) => {
+                return self.handle_gram_grab(request.id, params);
+            }
+            Method::GramMarkRead(params) => {
+                return self.handle_gram_mark_read(request.id, params);
+            }
+            Method::GramDelete(params) => {
+                return self.handle_gram_delete(request.id, params);
             }
             _ => {
                 return responses::encode_error(
