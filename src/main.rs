@@ -556,6 +556,15 @@ fn main() -> io::Result<()> {
 
     finish_cli(cli::maybe_run(&args))?;
 
+    // Compatibility entrypoint for the HerdrUp app, which opens one SSH channel
+    // per request and runs `herdr api-bridge <base64(request)>`. Ported from
+    // jerryfane/herdr so their iOS client can drive this daemon's JSON API the
+    // same way it drives theirs. It bridges to the active session's API socket;
+    // `--session <name>` is already consumed by the global flag handling above.
+    if args.get(1).map(String::as_str) == Some("api-bridge") {
+        return remote::run_api_client_bridge(&args[2..]);
+    }
+
     if args.get(1).map(String::as_str) == Some("remote-api-bridge") {
         return remote::run_remote_api_bridge(&args[2..]);
     }
