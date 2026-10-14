@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Added
+- `api-bridge --multi` forwards many requests per SSH process, reducing per-request overhead for federation coordinators. The coordinator opens fewer SSH connections and reuses one bridge process for bursts of requests. (#296)
+
+### Fixed
+- The gram store's 1 GiB attachment budget evicts old files instead of whole messages, preserving conversation history when attachments accumulate. (#298)
+- Remote agents are named by their own name in push alerts and the Live Activity instead of showing a machine label. (#297)
+
+### Changed
+- A coordinator sends one-shot requests to a saved SSH machine over one persistent `api-bridge --multi` channel per machine instead of starting a new SSH channel and remote bridge for each, once the machine advertises `api_bridge_multi`. Relayed requests to a distant machine no longer pay several round trips before they are sent. Streams keep their own channel, and machines without `api-bridge --multi` keep the per-request bridge. (#299)
+
 ## [0.9.5] - 2026-10-14
 
 This is a hotfix release for v0.9.4. See the v0.9.4 notes for the full feature release: https://github.com/herdrdev/herdr/releases/tag/v0.9.4
