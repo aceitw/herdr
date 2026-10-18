@@ -505,7 +505,7 @@
         "linux-aarch64": "3bda3403e03868e8ca0e61e64e92bbefaac4114a90360a558b1628ae1b9e424c",
         "macos-x86_64": "cd45459b45ea5a73fcc39516573c10f403f699836988d4c5459925dda19635cc",
         "macos-aarch64": "dbefbc5dcaf9d59a05601bb1a940689eb044e8f900280174d42d05fedc969c17",
-        "windows-x86_64": "8532d66ab7f0a5847a82b5ee10031f37d7d8814a9de0f67de7615ad1c088d81c"
+        "windows-x86_64": "4e5f7b0d4e27160fdacbae31720886be9f44a9bfdf4c1b8936098a4f3bc9e1df"
       }
     }
   },
@@ -515,6 +515,6 @@
     "linux-aarch64": "3bda3403e03868e8ca0e61e64e92bbefaac4114a90360a558b1628ae1b9e424c",
     "macos-x86_64": "cd45459b45ea5a73fcc39516573c10f403f699836988d4c5459925dda19635cc",
     "macos-aarch64": "dbefbc5dcaf9d59a05601bb1a940689eb044e8f900280174d42d05fedc969c17",
-    "windows-x86_64": "8532d66ab7f0a5847a82b5ee10031f37d7d8814a9de0f67de7615ad1c088d81c"
+    "windows-x86_64": "4e5f7b0d4e27160fdacbae31720886be9f44a9bfdf4c1b8936098a4f3bc9e1df"
   }
 }
