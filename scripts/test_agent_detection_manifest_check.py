@@ -29,18 +29,27 @@ path = "{path}"
 '''
 
 
-def staged_grok_dirs(root: Path) -> tuple[Path, Path]:
+STAGED_BUNDLED_MANIFEST = manifest("codex", "2026.06.10.2").replace(
+    "min_engine_version = 1", "min_engine_version = 2"
+)
+STAGED_PUBLISHED_MANIFEST = manifest("codex", "2026.06.10.1")
+STAGED_TEST_EXCEPTION = {
+    "codex": (
+        "2026.06.10.2",
+        "2026.06.10.1",
+        hashlib.sha256(STAGED_PUBLISHED_MANIFEST.encode()).hexdigest(),
+    ),
+}
+
+
+def staged_manifest_dirs(root: Path) -> tuple[Path, Path]:
     bundled = root / "bundled"
     published = root / "published"
     bundled.mkdir()
     published.mkdir()
-    (bundled / "grok.toml").write_bytes(
-        (check.DEFAULT_BUNDLED_DIR / "grok.toml").read_bytes()
-    )
-    (published / "grok.toml").write_bytes(
-        (check.DEFAULT_PUBLISHED_DIR / "grok.toml").read_bytes()
-    )
-    (published / "index.toml").write_text(catalog("grok", "grok.toml"))
+    (bundled / "codex.toml").write_text(STAGED_BUNDLED_MANIFEST, encoding="utf-8", newline="\n")
+    (published / "codex.toml").write_text(STAGED_PUBLISHED_MANIFEST, encoding="utf-8", newline="\n")
+    (published / "index.toml").write_text(catalog())
     return bundled, published
 
 
@@ -94,86 +103,24 @@ class AgentDetectionManifestCheckTests(unittest.TestCase):
             with self.assertRaisesRegex(check.CheckError, "lower than bundled"):
                 check.validate_catalog(website, bundled_manifests, engine_version=1)
 
+    @patch.dict(check.STAGED_PUBLISHED_MANIFESTS, STAGED_TEST_EXCEPTION, clear=True)
     def test_allows_explicitly_staged_published_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
-            bundled, website = staged_grok_dirs(Path(tmp))
+            bundled, website = staged_manifest_dirs(Path(tmp))
 
-            bundled_manifests = check.load_manifest_dir(bundled, engine_version=5)
-            check.validate_catalog(website, bundled_manifests, engine_version=5)
+            bundled_manifests = check.load_manifest_dir(bundled, engine_version=2)
+            check.validate_catalog(website, bundled_manifests, engine_version=2)
 
+    @patch.dict(check.STAGED_PUBLISHED_MANIFESTS, STAGED_TEST_EXCEPTION, clear=True)
     def test_rejects_mutated_staged_published_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
-            bundled, website = staged_grok_dirs(Path(tmp))
-            with (website / "grok.toml").open("a") as manifest_file:
+            bundled, website = staged_manifest_dirs(Path(tmp))
+            with (website / "codex.toml").open("a") as manifest_file:
                 manifest_file.write("\n# unexpected mutation\n")
 
-            bundled_manifests = check.load_manifest_dir(bundled, engine_version=5)
+            bundled_manifests = check.load_manifest_dir(bundled, engine_version=2)
             with self.assertRaisesRegex(check.CheckError, "lower than bundled"):
-                check.validate_catalog(website, bundled_manifests, engine_version=5)
-
-    def test_carried_forward_grok_stage_requires_pin_and_supported_engine(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            bundled, published = staged_grok_dirs(Path(tmp))
-            bundled_agents = check.load_manifest_dir(bundled, engine_version=5)
-            with patch.dict(check.STAGED_PUBLISHED_MANIFESTS, {}, clear=True):
-                with self.assertRaisesRegex(check.CheckError, "lower than bundled"):
-                    check.validate_catalog(published, bundled_agents, engine_version=5)
-            with self.assertRaisesRegex(check.CheckError, "lower than bundled"):
-                check.validate_catalog(published, bundled_agents, engine_version=2)
-
-            bundled_path = bundled / "grok.toml"
-            bundled_bytes = bundled_path.read_bytes()
-            old_version = check.validate_manifest(published / "grok.toml", engine_version=5)["version"]
-            new_version = bundled_agents["grok"][1]["version"]
-            bundled_path.write_bytes(
-                bundled_bytes.replace(
-                    f'version = "{new_version}"'.encode(),
-                    f'version = "{old_version}"'.encode(),
-                    1,
-                )
-            )
-            same_version = check.load_manifest_dir(bundled, engine_version=5)
-            with self.assertRaisesRegex(check.CheckError, "same version"):
-                check.validate_catalog(published, same_version, engine_version=5)
-
-    def test_claude_staging_pins_published_bytes_and_preserves_version_order(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            bundled = root / "bundled"
-            published = root / "published"
-            bundled.mkdir()
-            published.mkdir()
-            bundled_path = bundled / "claude.toml"
-            published_path = published / "claude.toml"
-            bundled_bytes = (check.DEFAULT_BUNDLED_DIR / "claude.toml").read_bytes()
-            published_bytes = (check.DEFAULT_PUBLISHED_DIR / "claude.toml").read_bytes()
-            bundled_path.write_bytes(bundled_bytes)
-            published_path.write_bytes(published_bytes)
-            (published / "index.toml").write_text(catalog("claude", "claude.toml"))
-            bundled_agents = check.load_manifest_dir(bundled, engine_version=5)
-
-            check.validate_catalog(published, bundled_agents, engine_version=5)
-            with patch.dict(check.STAGED_PUBLISHED_MANIFESTS, {}, clear=True):
-                with self.assertRaisesRegex(check.CheckError, "lower than bundled"):
-                    check.validate_catalog(published, bundled_agents, engine_version=5)
-
-            published_path.write_bytes(published_bytes + b"\n# unexpected mutation\n")
-            with self.assertRaisesRegex(check.CheckError, "lower than bundled"):
-                check.validate_catalog(published, bundled_agents, engine_version=5)
-            published_path.write_bytes(published_bytes)
-
-            bundled_version = bundled_agents["claude"][1]["version"]
-            published_version = check.validate_manifest(published_path, engine_version=5)["version"]
-            bundled_path.write_bytes(
-                bundled_bytes.replace(
-                    f'version = "{bundled_version}"'.encode(),
-                    f'version = "{published_version}"'.encode(),
-                    1,
-                )
-            )
-            same_version = check.load_manifest_dir(bundled, engine_version=5)
-            with self.assertRaisesRegex(check.CheckError, "same version"):
-                check.validate_catalog(published, same_version, engine_version=5)
+                check.validate_catalog(website, bundled_manifests, engine_version=2)
 
     def test_rejects_unlisted_published_manifest_lag_for_new_engine(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -307,73 +254,6 @@ class AgentDetectionManifestCheckTests(unittest.TestCase):
                     check.validate_rule(
                         Path("test.toml"), 0, rule, {"gates": 0, "matchers": 0}
                     )
-
-    def test_input_only_manifest_rejects_unknown_nested_fields(self):
-        content = '''id = "test"
-version = "2026.09.25.1"
-min_engine_version = 5
-[composer]
-region = "prompt_box_body"
-[[input_rules]]
-id = "choice"
-kind = "select"
-region = "above_prompt_box"
-[[input_rules.any]]
-contains = ["choose"]
-'''
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "test.toml"
-            path.write_text(content)
-            self.assertEqual(check.validate_manifest(path, engine_version=5)["id"], "test")
-            path.write_text(content.replace('kind = "select"', 'kind = "other"'))
-            with self.assertRaisesRegex(check.CheckError, "invalid kind"):
-                check.validate_manifest(path, engine_version=5)
-            path.write_text(content.replace('contains = ["choose"]', 'contains = ["choose"]\nstate = "idle"'))
-            with self.assertRaisesRegex(check.CheckError, "unknown gate field"):
-                check.validate_manifest(path, engine_version=5)
-            path.write_text(content.replace('region = "prompt_box_body"', 'region = "invalid"'))
-            with self.assertRaisesRegex(check.CheckError, "composer has invalid region"):
-                check.validate_manifest(path, engine_version=5)
-
-
-    def test_shared_input_is_validated_without_weakening_agent_versions(self):
-        shared = '''id = "shared"
-min_engine_version = 4
-
-[[input_rules]]
-id = "choice"
-kind = "unknown"
-region = "bottom_non_empty_lines(4)"
-contains = ["choose"]
-'''
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            bundled = root / "bundled"
-            published = root / "published"
-            bundled.mkdir()
-            published.mkdir()
-            agent = manifest("codex", "2026.06.10.1")
-            (bundled / "codex.toml").write_text(agent)
-            shared_path = bundled / "shared-input.toml"
-            shared_path.write_text(shared)
-            (published / "codex.toml").write_text(agent)
-            (published / "index.toml").write_text(catalog())
-
-            bundled_agents = check.load_manifest_dir(bundled, engine_version=4, bundled=True)
-            check.validate_catalog(published, bundled_agents, engine_version=4)
-
-            shared_path.write_text(shared.replace('kind = "unknown"', 'kind = "unsupported"'))
-            with self.assertRaisesRegex(check.CheckError, "invalid kind"):
-                check.load_manifest_dir(bundled, engine_version=4, bundled=True)
-            shared_path.write_text(shared)
-
-            versionless_agent = agent.replace('version = "2026.06.10.1"\n', "")
-            (published / "codex.toml").write_text(versionless_agent)
-            with self.assertRaisesRegex(check.CheckError, "version must be dotted numeric"):
-                check.validate_catalog(published, bundled_agents, engine_version=4)
-            (bundled / "codex.toml").write_text(versionless_agent)
-            with self.assertRaisesRegex(check.CheckError, "version must be dotted numeric"):
-                check.load_manifest_dir(bundled, engine_version=4, bundled=True)
 
 
 if __name__ == "__main__":

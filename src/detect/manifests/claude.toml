@@ -1,7 +1,7 @@
 id = "claude"
-version = "2026.09.25.1"
-min_engine_version = 5
-updated_at = "2026-09-25T00:00:00Z"
+version = "2026.10.11.1"
+min_engine_version = 2
+updated_at = "2026-10-11T00:00:00Z"
 aliases = ["claude-code"]
 
 [composer]
@@ -262,3 +262,4 @@ state = "idle"
 priority = 250
 region = "osc_progress"
 regex = ['^4;0']
+

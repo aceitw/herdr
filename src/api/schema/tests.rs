@@ -1896,6 +1896,12 @@ fn pane_link_resolve_round_trips() {
 }
 
 #[test]
+fn read_choices_cover_every_api_value() {
+    crate::cli::projection::assert_choices_cover_api_enum(READ_SOURCES);
+    crate::cli::projection::assert_choices_cover_api_enum(READ_FORMATS);
+}
+
+#[test]
 fn notification_registrations_accept_legacy_and_relay_capability_payloads() {
     let legacy: Request = serde_json::from_value(serde_json::json!({
         "id": "reg",
