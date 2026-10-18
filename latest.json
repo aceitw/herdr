@@ -501,20 +501,20 @@
         "windows-x86_64": "https://github.com/aceitw/herdr/releases/download/v0.9.5/herdr-windows-x86_64.zip"
       },
       "sha256": {
-        "linux-x86_64": "69836afc4c790a09e55d9208bc61ef86ae4f1458604a9963f9d3f66ad1dd362e",
-        "linux-aarch64": "473d41b85f8672409fe89393da5b9aa831b40805df7fd27e85f6cedb94943d57",
-        "macos-x86_64": "783495b69807c3ec23dd209e2726d5d8ed35a1d7976617b32fb0b3a1510a8d8d",
-        "macos-aarch64": "d67dcd46ce9788e67eb8bea68e6f0aecf082bdd54b9fcbda1be588727d8ced9d",
-        "windows-x86_64": "ea9d660f7ba88d403d6ec68e1a7f228032a002595d261ac4dece42bf9b5fa5b6"
+        "linux-x86_64": "96046890add3be6b682999d437ab4420c47263dedc80680bfd02d3a2cda15e05",
+        "linux-aarch64": "0f0b0c47b2f169728549476036b032c6bfe63236fba22e0901dbcc4dbad04666",
+        "macos-x86_64": "56e30df82123877647f51b69b07754956c5168ad4b22f8b961242738c459235a",
+        "macos-aarch64": "4c4cfe5a78703b7d9c1d0c5374b6fe602d213b553897c1917d00d76865864083",
+        "windows-x86_64": "c9becd3bad8ea4b9cc35b89dc768dc94879697842db88a67e52da76f3e1dbea1"
       }
     }
   },
   "endpoint_generation": 1,
   "sha256": {
-    "linux-x86_64": "69836afc4c790a09e55d9208bc61ef86ae4f1458604a9963f9d3f66ad1dd362e",
-    "linux-aarch64": "473d41b85f8672409fe89393da5b9aa831b40805df7fd27e85f6cedb94943d57",
-    "macos-x86_64": "783495b69807c3ec23dd209e2726d5d8ed35a1d7976617b32fb0b3a1510a8d8d",
-    "macos-aarch64": "d67dcd46ce9788e67eb8bea68e6f0aecf082bdd54b9fcbda1be588727d8ced9d",
-    "windows-x86_64": "ea9d660f7ba88d403d6ec68e1a7f228032a002595d261ac4dece42bf9b5fa5b6"
+    "linux-x86_64": "96046890add3be6b682999d437ab4420c47263dedc80680bfd02d3a2cda15e05",
+    "linux-aarch64": "0f0b0c47b2f169728549476036b032c6bfe63236fba22e0901dbcc4dbad04666",
+    "macos-x86_64": "56e30df82123877647f51b69b07754956c5168ad4b22f8b961242738c459235a",
+    "macos-aarch64": "4c4cfe5a78703b7d9c1d0c5374b6fe602d213b553897c1917d00d76865864083",
+    "windows-x86_64": "c9becd3bad8ea4b9cc35b89dc768dc94879697842db88a67e52da76f3e1dbea1"
   }
 }
